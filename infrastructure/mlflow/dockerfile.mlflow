@@ -1,0 +1,14 @@
+# Use a official Python image
+FROM ghcr.io/mlflow/mlflow
+
+# set working directory
+WORKDIR /app
+
+# Install the necessary packages
+RUN pip install psycopg2-binary
+
+# Expose the necessary ports
+EXPOSE ${MLFLOW_UI_PORT}
+
+# Command to run the MLflow server
+CMD ["sh", "-c", "mlflow server --backend-store-uri ${MLFLOW_TRACKING_DB_URI} --host ${MLFLOW_HOST} --port ${MLFLOW_UI_PORT}"]

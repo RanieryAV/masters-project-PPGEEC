@@ -1,0 +1,71 @@
+services:
+
+  flask-app-data-processing:
+    container_name: flask_app_data_processing
+    build:
+      context: ./
+      dockerfile: ./applications/data_processing_api/dockerfile.data_processing_api
+    ports:
+      - ${FLASK_DATA_PROCESSING_PORT_DOCKER}:${FLASK_DATA_PROCESSING_PORT_DOCKER}
+    environment:
+      FLASK_DATA_PROCESSING_HOST: ${FLASK_DATA_PROCESSING_HOST}
+      FLASK_DATA_PROCESSING_PORT: ${FLASK_DATA_PROCESSING_PORT_DOCKER}
+      ELASTICSEARCH_HOST: ${ELASTICSEARCH_CONTAINER_HOST}
+      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT}
+      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ELASTIC_INDEX_NAME: ${ELASTIC_INDEX_NAME}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+    networks:
+      - captaima-network
+
+  flask-app-model-deployment:
+    container_name: flask_app_model_deployment
+    build:
+      context: ./
+      dockerfile: applications/model_deployment_api/dockerfile.model_deployment_api
+    volumes:
+      - ./applications/model_deployment_api/models:/models
+    ports:
+      - ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}:${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
+      - 8502:8502 # Temporary port for the streamlit prototype
+    environment:
+      FLASK_MODEL_DEPLOYMENT_HOST: ${FLASK_MODEL_DEPLOYMENT_HOST}
+      FLASK_MODEL_DEPLOYMENT_PORT: ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
+      MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+    networks:
+      - captaima-network
+
+  flask-app-model-training:
+    container_name: flask_app_model_training
+    build:
+      context: ./
+      dockerfile: applications/model_training_api/dockerfile.model_training_api
+    ports:
+      - ${FLASK_MODEL_TRAINING_PORT_DOCKER}:${FLASK_MODEL_TRAINING_PORT_DOCKER}
+    environment:
+      FLASK_MODEL_TRAINING_HOST: ${FLASK_MODEL_TRAINING_HOST}
+      FLASK_MODEL_TRAINING_PORT: ${FLASK_MODEL_TRAINING_PORT_DOCKER}
+      MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+    networks:
+      - captaima-network
+
+networks:
+  captaima-network:
+    driver: bridge
