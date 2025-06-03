@@ -1,7 +1,7 @@
 services:
 
-  notebooks:
-    container_name: jupyter_notebook_env
+  jupyter-notebooks-app:
+    container_name: jupyter_notebook_env_app
     labels:
       description: Environment for running Jupyter Notebooks
       name: jupyter_notebook_env
@@ -37,9 +37,9 @@ services:
         target: /var/lib/postgresql/15
 
 
-  dbeaver:
+  dbeaver-app:
     image: dbeaver/cloudbeaver:latest
-    container_name: dbeaver
+    container_name: dbeaver_app
     restart: always
     environment:
       CB_INIT_CONNECTIONS: |
@@ -56,7 +56,7 @@ services:
           }
         ]
     ports:
-      - 8082:8978
+      - 8083:8978
     volumes:
       - ./shared/utils/datasets:/home/datasets
     networks:
@@ -64,8 +64,8 @@ services:
     depends_on:
       - postgis-db-app
 
-  mlflow:
-    container_name: mlflow
+  mlflow-app:
+    container_name: mlflow_app
     build:
       context: ./infrastructure/mlflow/
       dockerfile: dockerfile.mlflow
