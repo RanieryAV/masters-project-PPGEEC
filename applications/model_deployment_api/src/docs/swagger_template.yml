@@ -1,0 +1,6 @@
+swagger: "2.0"
+info:
+  title: Model Deployment API.
+  description: This API is used to deploy Machine Learning models (Deep Learning and/or Shallow Learning) to make predictions on AIS data.
+  version: "0.1.0"
+basePath: "/"

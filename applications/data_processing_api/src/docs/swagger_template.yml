@@ -1,0 +1,6 @@
+swagger: "2.0"
+info:
+  title: Data Processing API.
+  description: This API is used to preprocess AIS data in order to feed the training of machine learning models.
+  version: "0.1.0"
+basePath: "/"

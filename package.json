@@ -1,0 +1,19 @@
+{
+  "name": "masters-project-ppgeec",
+  "version": "1.0.0",
+  "description": "Classify And PredicT Abnormal Instances of Maritime Activity - CAPTAIMA ",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RanieryAV/masters-project-PPGEEC.git"
+  },
+  "author": "Raniery Alves Vasconcelos",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/RanieryAV/masters-project-PPGEEC/issues"
+  },
+  "homepage": "https://github.com/RanieryAV/masters-project-PPGEEC#readme"
+}
