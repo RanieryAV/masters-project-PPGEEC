@@ -4,7 +4,7 @@ services:
     container_name: jupyter_notebook_env_app
     labels:
       description: Environment for running Jupyter Notebooks
-      name: jupyter_notebook_env
+      name: jupyter_notebook_env_app
     volumes:
       - ./shared/utils/notebooks:/home/notebooks
       - ./shared/utils/datasets:/home/datasets
