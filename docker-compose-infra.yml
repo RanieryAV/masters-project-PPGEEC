@@ -1,0 +1,87 @@
+services:
+
+  jupyter-notebooks-app:
+    container_name: jupyter_notebook_env_app
+    labels:
+      description: Environment for running Jupyter Notebooks
+      name: jupyter_notebook_env_app
+    volumes:
+      - ./shared/utils/notebooks:/home/notebooks
+      - ./shared/utils/datasets:/home/datasets
+    build:
+      context: shared/utils/jupyter_env/
+      dockerfile: dockerfile.jupyter
+    ports:
+      - "8888:8888"
+  
+  postgis-db-app:
+    image: kartoza/postgis:15-3.3
+    container_name: postgis_db_app
+    ports:
+      - "${POSTGRES_PORT}:${POSTGRES_PORT}"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+    restart: on-failure
+    healthcheck:
+      test: "exit 0"
+    networks:
+      - captaima-network
+    volumes:
+      - ./infrastructure/database/postgis/init.sql:/docker-entrypoint-initdb.d/init.sql:Z
+      - type: bind
+        source: ./infrastructure/database/postgis/data
+        target: /var/lib/postgresql/15
+
+
+  dbeaver-app:
+    image: dbeaver/cloudbeaver:latest
+    container_name: dbeaver_app
+    restart: always
+    environment:
+      CB_INIT_CONNECTIONS: |
+        [
+          {
+            "id": "local-postgis",
+            "name": "PostGIS Database",
+            "driver": "postgresql",
+            "host": "${POSTGRES_CONTAINER_HOST}",
+            "port": 5432,
+            "database": "${POSTGRES_DB}",
+            "user": "${POSTGRES_USER}",
+            "password": "${POSTGRES_PASSWORD}"
+          }
+        ]
+    ports:
+      - 8083:8978
+    volumes:
+      - ./shared/utils/datasets:/home/datasets
+    networks:
+      - captaima-network
+    depends_on:
+      - postgis-db-app
+
+  mlflow-app:
+    container_name: mlflow_app
+    build:
+      context: ./infrastructure/mlflow/
+      dockerfile: dockerfile.mlflow
+    depends_on:
+      - postgis-db-app
+    environment:
+      MLFLOW_TRACKING_DB_URI: ${MLFLOW_TRACKING_DB_URI}
+      MLFLOW_ARTIFACT_ROOT: ${MLFLOW_ARTIFACT_ROOT}
+      MLFLOW_HOST: ${MLFLOW_CONTAINER_HOST}
+      MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
+    ports:
+      - ${MLFLOW_UI_PORT}:${MLFLOW_UI_PORT}
+    networks:
+      - captaima-network
+    
+
+networks:
+  captaima-network:
+    driver: bridge

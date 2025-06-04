@@ -1,3 +1,20 @@
+.vscode
+.ipynb_checkpoints
+infrastructure/database/postgis/data/*
+!infrastructure/database/postgis/data/.gitkeep
+.idea
+__pycache__
+*.pkl
+
+# AIS dataset
+shared/utils/datasets
+
+# Node modules
+node_modules
+
+#Logs
+*.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

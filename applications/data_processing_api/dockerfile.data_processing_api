@@ -1,0 +1,14 @@
+FROM python:3.8.19-slim
+
+WORKDIR /app
+
+COPY ./applications/data_processing_api .
+COPY ./domain/ ./domain/
+
+# Install Python dependencies using pip3.7
+RUN pip install -r ./data-processing-api-requirements.txt
+
+# Expose the port the app runs on
+EXPOSE ${FLASK_DATA_PROCESSING_PORT}
+
+CMD ["python3", "run.py"]

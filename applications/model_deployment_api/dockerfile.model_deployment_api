@@ -1,0 +1,15 @@
+FROM python:3.8.19-slim
+
+WORKDIR /app
+
+COPY ./applications/model_deployment_api .
+COPY ./domain/ ./domain/
+
+# Install Python dependencies
+RUN pip install -r ./model-deployment-api-requirements.txt
+
+# Expose the port the app runs on
+EXPOSE ${FLASK_MODEL_DEPLOYMENT_PORT}
+EXPOSE 8502
+
+CMD ["python3", "run.py"]

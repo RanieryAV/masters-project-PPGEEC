@@ -1,0 +1,29 @@
+# Set the base image using Ubuntu 20.04
+FROM ubuntu:20.04
+
+# Set environmental variable(s)
+ENV ACCEPT_INTEL_PYTHON_EULA=yes
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+# Set working directory
+WORKDIR /home
+
+# Install dependencies
+RUN apt-get update \
+    && apt-get install -y -q --no-install-recommends \
+        openjdk-11-jdk \
+        wget \
+        python3 \
+        python3-pip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Add requirements file 
+    COPY requirements.txt /app/
+    
+    # Install Python dependencies
+    RUN pip3 install --upgrade pip \
+        && pip3 install -r /app/requirements.txt
+
+    # Run shell command for notebook on start
+    CMD ["jupyter", "notebook", "--port=8888", "--no-browser", "--ip=0.0.0.0", "--allow-root"]
