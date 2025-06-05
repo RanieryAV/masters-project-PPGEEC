@@ -1,7 +1,7 @@
 from src import create_app
 from dotenv import load_dotenv
 import os
-from domain.config.db_configuration import DATABASE_URI
+from domain.config.database_config import DATABASE_URI
 
 # Load environment variables
 load_dotenv()
