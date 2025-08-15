@@ -152,6 +152,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+captaima_ml_venv/
 
 # Spyder project settings
 .spyderproject

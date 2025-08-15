@@ -1,0 +1,6 @@
+swagger: "2.0"
+info:
+  title: Model Training API.
+  description: This API is used to train Machine Learning models in order to make them capable of predicting anomalies on AIS data.
+  version: "0.1.0"
+basePath: "/"
