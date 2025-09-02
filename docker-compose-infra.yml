@@ -83,7 +83,9 @@ services:
 
   spark-master:
     container_name: spark-master
-    image: bitnami/spark:3.5.1
+    build:
+      context: .
+      dockerfile: infrastructure/spark/dockerfile.spark
     environment:
       - SPARK_MODE=master
       - ALLOW_EMPTY_PASSWORD=yes
@@ -93,40 +95,83 @@ services:
     - "${SPARK_MASTER_UI_PORT}:${SPARK_MASTER_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
-      - ./domain/config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
     networks:
       - captaima-network
 
-  spark-worker:
-    container_name: spark-worker
-    image: bitnami/spark:3.5.1
+  spark-worker-1:
+    container_name: spark-worker-1
+    build:
+      context: .
+      dockerfile: infrastructure/spark/dockerfile.spark
     environment:
       - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
       - ALLOW_EMPTY_PASSWORD=yes
-      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_MEMORY=3G
       - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_UI_PORT}
+      - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_1_UI_PORT}
     depends_on:
       - spark-master
     ports:
-    - "${SPARK_WORKER_UI_PORT}:${SPARK_WORKER_UI_PORT}"
+    - "${SPARK_WORKER_1_UI_PORT}:${SPARK_WORKER_1_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
-      - ./domain/config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    networks:
+      - captaima-network
+
+  spark-worker-2:
+    container_name: spark-worker-2
+    build:
+      context: .
+      dockerfile: infrastructure/spark/dockerfile.spark
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
+      - ALLOW_EMPTY_PASSWORD=yes
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_2_UI_PORT}
+    depends_on:
+      - spark-master
+    ports:
+    - "${SPARK_WORKER_2_UI_PORT}:${SPARK_WORKER_2_UI_PORT}"
+    volumes:
+      - spark-events:/opt/spark-events
+    networks:
+      - captaima-network
+  
+  spark-worker-3:
+    container_name: spark-worker-3
+    build:
+      context: .
+      dockerfile: infrastructure/spark/dockerfile.spark
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
+      - ALLOW_EMPTY_PASSWORD=yes
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_3_UI_PORT}
+    depends_on:
+      - spark-master
+    ports:
+    - "${SPARK_WORKER_3_UI_PORT}:${SPARK_WORKER_3_UI_PORT}"
+    volumes:
+      - spark-events:/opt/spark-events
     networks:
       - captaima-network
 
   spark-history:
     container_name: spark-history
-    image: bitnami/spark:3.5.1
+    build:
+      context: .
+      dockerfile: infrastructure/spark/dockerfile.spark
     depends_on:
       - spark-master
     ports:
     - "${SPARK_HISTORY_UI_PORT}:${SPARK_HISTORY_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
-      - ./domain/config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
     command: >
       /opt/bitnami/spark/sbin/start-history-server.sh
       --properties-file /opt/bitnami/spark/conf/spark-defaults.conf

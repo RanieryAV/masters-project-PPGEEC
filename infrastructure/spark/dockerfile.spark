@@ -1,0 +1,12 @@
+# Base image
+FROM bitnami/spark:3.5.1
+
+# Copy custom Spark configuration
+COPY domain/config/spark-defaults.conf /opt/bitnami/spark/conf/spark-defaults.conf
+
+# Work around permissions by switching to root
+USER root
+
+# Create directory for Spark events (if not already in volume)
+RUN mkdir -p /opt/spark-events && \
+    chown -R 1001:1001 /opt/spark-events
