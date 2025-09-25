@@ -90,11 +90,15 @@ services:
       - SPARK_MODE=master
       - ALLOW_EMPTY_PASSWORD=yes
       - SPARK_MASTER_WEBUI_PORT=${SPARK_MASTER_UI_PORT}
+      - OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK=${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
     ports:
     - "${SPARK_MASTER_RPC_PORT}:${SPARK_MASTER_RPC_PORT}"
     - "${SPARK_MASTER_UI_PORT}:${SPARK_MASTER_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     networks:
       - captaima-network
 
@@ -107,15 +111,19 @@ services:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
       - ALLOW_EMPTY_PASSWORD=yes
-      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_1_UI_PORT}
+      - OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK=${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
     depends_on:
       - spark-master
     ports:
     - "${SPARK_WORKER_1_UI_PORT}:${SPARK_WORKER_1_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     networks:
       - captaima-network
 
@@ -128,15 +136,19 @@ services:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
       - ALLOW_EMPTY_PASSWORD=yes
-      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_2_UI_PORT}
+      - OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK=${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
     depends_on:
       - spark-master
     ports:
     - "${SPARK_WORKER_2_UI_PORT}:${SPARK_WORKER_2_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     networks:
       - captaima-network
   
@@ -149,15 +161,19 @@ services:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_RPC_PORT}
       - ALLOW_EMPTY_PASSWORD=yes
-      - SPARK_WORKER_MEMORY=3G
+      - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
       - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_3_UI_PORT}
+      - OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK=${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
     depends_on:
       - spark-master
     ports:
     - "${SPARK_WORKER_3_UI_PORT}:${SPARK_WORKER_3_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     networks:
       - captaima-network
 
@@ -166,12 +182,17 @@ services:
     build:
       context: .
       dockerfile: infrastructure/spark/dockerfile.spark
+    environment:
+      - OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK=${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
     depends_on:
       - spark-master
     ports:
     - "${SPARK_HISTORY_UI_PORT}:${SPARK_HISTORY_UI_PORT}"
     volumes:
       - spark-events:/opt/spark-events
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     command: >
       /opt/bitnami/spark/sbin/start-history-server.sh
       --properties-file /opt/bitnami/spark/conf/spark-defaults.conf

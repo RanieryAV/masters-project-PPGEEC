@@ -7,19 +7,29 @@ services:
       dockerfile: ./applications/data_processing_api/dockerfile.data_processing_api
     ports:
       - ${FLASK_DATA_PROCESSING_PORT_DOCKER}:${FLASK_DATA_PROCESSING_PORT_DOCKER}
+    volumes:
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
     environment:
+      # Flask-related env vars
       FLASK_DATA_PROCESSING_HOST: ${FLASK_DATA_PROCESSING_HOST}
       FLASK_DATA_PROCESSING_PORT: ${FLASK_DATA_PROCESSING_PORT_DOCKER}
-      ELASTICSEARCH_HOST: ${ELASTICSEARCH_CONTAINER_HOST}
-      ELASTICSEARCH_PORT: ${ELASTICSEARCH_PORT}
-      ELASTIC_USERNAME: ${ELASTIC_USERNAME}
-      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
-      ELASTIC_INDEX_NAME: ${ELASTIC_INDEX_NAME}
+
+      # Spark-related env vars
+      SPARK_MASTER_RPC_PORT: ${SPARK_MASTER_RPC_PORT}
+      SPARK_MASTER_URL: "spark://spark-master:${SPARK_MASTER_RPC_PORT}"
+      SPARK_EVENTLOG_DIR: ${SPARK_EVENTLOG_DIR}
+
+      # Postgres env vars
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
+
+      # Data processing specific env vars
+      PROCESSED_OUTPUT_DIR: ${PROCESSED_OUTPUT_DIR}
+      OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK: ${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK}
     networks:
       - captaima-network
 
@@ -34,13 +44,18 @@ services:
       - ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}:${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
       - 8502:8502 # Temporary port for the streamlit prototype
     environment:
+      # Flask-related env vars
       FLASK_MODEL_DEPLOYMENT_HOST: ${FLASK_MODEL_DEPLOYMENT_HOST}
       FLASK_MODEL_DEPLOYMENT_PORT: ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
+      
+      # Postgres env vars
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
+
+      # MLFlow env vars
       MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
     networks:
@@ -54,14 +69,19 @@ services:
     ports:
       - ${FLASK_MODEL_TRAINING_PORT_DOCKER}:${FLASK_MODEL_TRAINING_PORT_DOCKER}
     environment:
+      # Flask-related env vars
       FLASK_MODEL_TRAINING_HOST: ${FLASK_MODEL_TRAINING_HOST}
       FLASK_MODEL_TRAINING_PORT: ${FLASK_MODEL_TRAINING_PORT_DOCKER}
-      MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
+      
+      # Postgres env vars
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: ${POSTGRES_CONTAINER_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
+
+      # MLFlow env vars
+      MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
     networks:
       - captaima-network

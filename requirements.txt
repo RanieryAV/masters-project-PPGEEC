@@ -16,3 +16,4 @@ haversine==2.8.1
 streamlit==1.40.0
 streamlit-folium==0.22.1
 matplotlib==3.7.5
+pyspark==3.5.1

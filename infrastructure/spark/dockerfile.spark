@@ -1,12 +1,55 @@
 # Base image
 FROM bitnami/spark:3.5.1
 
-# Copy custom Spark configuration
-COPY domain/config/spark-defaults.conf /opt/bitnami/spark/conf/spark-defaults.conf
+# Make sure the .env variables are available as build artifact (optional)
+# If you don't want to copy .env into the image, remove the COPY line below.
+COPY .env /app/.env
 
-# Work around permissions by switching to root
+# Make build-time args available (keeps parity with your compose .env usage)
+ARG SPARK_MASTER_RPC_PORT
+ARG SPARK_MASTER_UI_PORT
+ARG SPARK_WORKER_1_UI_PORT
+ARG SPARK_WORKER_2_UI_PORT
+ARG SPARK_WORKER_3_UI_PORT
+ARG SPARK_HISTORY_UI_PORT
+
+# Copy custom Spark configuration
+COPY --chmod=755 domain/config/spark-defaults.conf /opt/bitnami/spark/conf/spark-defaults.conf
+
+# Work around permissions by switching to root for build steps that need it
 USER root
 
-# Create directory for Spark events (if not already in volume)
-RUN mkdir -p /opt/spark-events && \
-    chown -R 1001:1001 /opt/spark-events
+# Export minimal environment defaults needed at build time
+ENV SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+ENV OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK="Placeholder_folder_data_processed_by_spark"
+ENV JAVA_HOME=/opt/bitnami/java
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# Create spark user/group with same UID/GID as the data_processing_api image (1001)
+ARG SPARK_UID=1001
+ARG SPARK_GID=1001
+RUN groupadd -g ${SPARK_GID} spark && \
+    useradd --create-home --uid ${SPARK_UID} --gid ${SPARK_GID} spark
+
+# Create application directories and ensure proper ownership/permissions for runtime user (UID 1001)
+# We create directories as root and then chown to UID 1001 so the runtime spark user can use them.
+RUN mkdir -p /app/processed_output /app/datasets /app/shared /app/processed_output/spark_tmp /opt/spark-events && \
+    # Dar permissões totais (leitura, escrita, execução) para todos
+    chmod -R 0777 /app/processed_output /app/datasets /app/shared /app/processed_output/spark_tmp /opt/spark-events && \
+    # Fazer com que spark seja dono desses diretórios
+    chown -R ${SPARK_UID}:${SPARK_GID} /app/processed_output /app/datasets /app/shared /app/processed_output/spark_tmp /opt/spark-events
+
+# Print confirmation that directories were created and permissions set
+RUN echo "--> WARNING: Directories created and permissions set successfully! <--"
+
+# Set working dir (runtime will be /app)
+WORKDIR /app
+
+# Expose Spark ports (kept from your base)
+EXPOSE ${SPARK_MASTER_RPC_PORT} ${SPARK_MASTER_UI_PORT} ${SPARK_WORKER_1_UI_PORT} ${SPARK_WORKER_2_UI_PORT} ${SPARK_WORKER_3_UI_PORT} ${SPARK_HISTORY_UI_PORT}
+
+# Switch to the runtime user used by the bitnami image (UID 1001)
+USER ${SPARK_UID}
+
+# Do NOT override ENTRYPOINT/CMD — inherit Bitnami behavior so master/worker logic and args remain intact
+# Entrypoint / CMD come from the base image (bitnami/spark). This preserves automatic handling of "driver"/"worker" etc.

@@ -1,0 +1,54 @@
+summary: "post_collect_raw_data()"
+description: |
+  "TODO: Implement the logic to collect raw data from external interactive sources"
+tags:
+  - "TODO: Collect raw data from external sources"
+produces:
+  - "application/json"
+consumes:
+  - "application/json"
+parameters:
+  - in: "body"
+    name: "body"
+    description: ""
+    required: false
+    schema:
+      type: "object"
+      properties: {}
+      example: {}
+responses:
+  200:
+    description: ""
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            status:
+              type: "string"
+              example: ""
+            data:
+              type: "object"
+  400:
+    description: ""
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: ""
+  500:
+    description: ""
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: ""
+            traceback:
+              type: "string"
+              example: ""
