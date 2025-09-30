@@ -48,11 +48,11 @@ def process_Pitsikalis_2019_data():#REFACTOR MOVING WHAT IS POSSIBLE TO services
         csv_path = "/app/datasets/Maritime_Composite_Events/CEs/recognised_CEs.csv"
 
 
-        df = Process_Data_Service.load_spark_df_from_Pitsikalis_2019_csv(spark, csv_path, expected_header)
+        df = Process_Data_Service.load_spark_labels_df_from_Pitsikalis_2019_csv(spark, csv_path, expected_header)
 
-        df_processed = Process_Data_Service.filter_and_transform_Pitsikalis_2019_data(df)
+        df_processed = Process_Data_Service.filter_and_transform_Pitsikalis_2019_labels_data(df)
 
-        summary = Process_Data_Service.inspect_spark_dataframe_Pitsikalis_2019(df_processed)
+        summary = Process_Data_Service.inspect_spark_labels_dataframe_Pitsikalis_2019(df_processed)
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default

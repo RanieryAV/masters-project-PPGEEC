@@ -59,7 +59,7 @@ class Process_Data_Service:
                 os.chmod(os.path.join(root, f), 0o777)
 
     @staticmethod
-    def load_spark_df_from_Pitsikalis_2019_csv(spark, relative_path: str, expected_header: list):
+    def load_spark_labels_df_from_Pitsikalis_2019_csv(spark, relative_path: str, expected_header: list):
         """Load CSV via Spark, infer schema, rename columns if header matches expected rows."""
         events_path = relative_path  # relative_path is already joined
         logger.info(f"Loading CSV from path: {events_path}")
@@ -80,7 +80,7 @@ class Process_Data_Service:
         return df
 
     @staticmethod
-    def filter_and_transform_Pitsikalis_2019_data(df):
+    def filter_and_transform_Pitsikalis_2019_labels_data(df):
         fluent_name_categories = {
             'highSpeedNC': 'NORMAL',
             'loitering': 'LOITERING',
@@ -116,7 +116,7 @@ class Process_Data_Service:
         return df_with_index
 
     @staticmethod
-    def inspect_spark_dataframe_Pitsikalis_2019(df):
+    def inspect_spark_labels_dataframe_Pitsikalis_2019(df):
         """Run EDA / summary tasks on the DataFrame, print + log results, and return summary metadata."""
         results = {}
 
