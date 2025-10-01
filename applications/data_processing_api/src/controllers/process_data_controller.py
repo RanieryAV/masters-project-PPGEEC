@@ -6,7 +6,6 @@ from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
 from ..services.process_data_service import Process_Data_Service
-from domain.config.data_processing.spark_services import Spark_Services
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
 
@@ -42,7 +41,7 @@ def process_Pitsikalis_2019_data():#REFACTOR MOVING WHAT IS POSSIBLE TO services
     logger.info("Received request at /process-Pitsikalis-2019-data")
 
     try:
-        spark = Spark_Services.init_spark_session("Pitsikalis2019DataProcessingAPI")
+        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_Labels_Data_Processing_API")
 
         expected_header = ["FluentName", "MMSI", "Argument", "Value", "T_start", "T_end"]
         
@@ -69,20 +68,9 @@ def process_Pitsikalis_2019_data():#REFACTOR MOVING WHAT IS POSSIBLE TO services
 
         new_file_name = os.getenv("OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK", "Placeholder_folder_data_processed_by_spark")
         output_path = f"{output_dir}/{new_file_name}"
-        logger.info(f"Saving processed data to {output_path}")
-        # coalesce to 1 if you want one file, else multiple part-files
-        df_processed.coalesce(1).write.mode("overwrite").option("header", True).csv(output_path)
-
-        moved = Spark_Services.spark_func_promote_csv_from_temporary(spark, output_path)
-        if not moved:
-            logger.warning(f"Could not promote CSV from temporary for output path {output_path}")
-        else:
-            logger.info("CSV file promoted from temporary.")
-
-        # Adjust permissions on moved files
-        Process_Data_Service.adjust_file_permissions(output_path)
-
-        logger.info("ATTENTION: Data saved successfully with correct file permissions!")
+        
+        # Save processed Spark DataFrame as CSV
+        Process_Data_Service.save_spark_df_as_csv(df_processed, output_path, spark)
 
         logger.info("Task finished. Stopping Spark session...")
 
