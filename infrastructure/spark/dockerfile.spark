@@ -1,6 +1,6 @@
 # Base image
-FROM bitnami/spark:3.5.1
-
+FROM bitnamilegacy/spark:3.5.1
+# Note: "bitnami/spark:3.5.1" is deprecated, using "bitnamilegacy/spark:3.5.1" instead.
 # Make sure the .env variables are available as build artifact (optional)
 # If you don't want to copy .env into the image, remove the COPY line below.
 COPY .env /app/.env

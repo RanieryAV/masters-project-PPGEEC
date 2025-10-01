@@ -1,6 +1,9 @@
 import os
 import traceback
 import logging
+import socket
+import subprocess
+from pathlib import Path
 from flask import Blueprint, request, jsonify
 from flasgger import swag_from
 from os import path
@@ -37,6 +40,35 @@ load_dotenv()
 
 class Spark_Services:
     @staticmethod
+    def _is_running_in_container() -> bool:
+        """
+        Heuristic to detect whether code is running inside a container (Docker / containerd / k8s).
+        Checks /.dockerenv, /proc/1/cgroup and an optional environment flag IN_DOCKER.
+        Returns True when running inside a container, False otherwise.
+        """
+        import os
+
+        # Quick check for docker-specific file
+        if os.path.exists("/.dockerenv"):
+            return True
+
+        # Check cgroup info for docker/k8s indicators
+        try:
+            with open("/proc/1/cgroup", "rt") as f:
+                cg = f.read()
+                if any(tok in cg for tok in ("docker", "kubepods", "containerd")):
+                    return True
+        except Exception:
+            # ignore read errors; fall through
+            pass
+
+        # Explicit override via environment variable (useful for tests)
+        if os.environ.get("IN_DOCKER", "").lower() in ("1", "true", "yes"):
+            return True
+
+        return False
+
+    @staticmethod
     def init_spark_session(spark_session_name):
         """Initialize and return a SparkSession using environment vars."""
         spark_master_rpc_port = os.getenv("SPARK_MASTER_RPC_PORT", "7077")
@@ -46,6 +78,15 @@ class Spark_Services:
         logger.info(f"Spark master URL: {spark_master_url}")
         logger.info(f"Event log directory: {eventlog_dir}")
 
+        driver_host = os.getenv("SPARK_DRIVER_HOST")
+        if not driver_host:
+            try:
+                hostname = socket.gethostname()
+                driver_host = socket.gethostbyname(hostname)
+            except Exception:
+                # fallback razoável dentro de container
+                driver_host = "0.0.0.0"
+
         spark = (
             SparkSession.builder
             .appName(spark_session_name)
@@ -53,8 +94,8 @@ class Spark_Services:
             .config("spark.eventLog.enabled", "false")
             .config("spark.eventLog.dir", eventlog_dir)
             .config("spark.sql.shuffle.partitions", "200")
-            # remover spark.executorEnv.USER se estiver causando conflito
-            # .config("spark.executorEnv.USER", "root")
+            .config("spark.driver.host", driver_host)
+            .config("spark.driver.bindAddress", "0.0.0.0")
             .config("spark.local.dir", "/app/processed_output/spark_tmp")
             .config("spark.executorEnv.SPARK_LOCAL_DIRS", "/app/processed_output/spark_tmp")
             .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=/app/processed_output/spark_tmp")

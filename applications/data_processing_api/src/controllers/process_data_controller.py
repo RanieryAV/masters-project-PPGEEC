@@ -45,8 +45,14 @@ def process_Pitsikalis_2019_data():#REFACTOR MOVING WHAT IS POSSIBLE TO services
         spark = Spark_Services.init_spark_session("Pitsikalis2019DataProcessingAPI")
 
         expected_header = ["FluentName", "MMSI", "Argument", "Value", "T_start", "T_end"]
-        csv_path = "/app/datasets/Maritime_Composite_Events/CEs/recognised_CEs.csv"
+        
+        is_container = Process_Data_Service._is_running_in_container()  # log if in container or not
 
+        # Read Spark master URL and event log dir from environment variables or use defaults
+        if is_container:
+            csv_path = "/app/datasets/Maritime_Composite_Events/CEs/recognised_CEs.csv"
+        else:
+            csv_path = "shared/utils/datasets/Maritime_Composite_Events/CEs/recognised_CEs.csv"
 
         df = Process_Data_Service.load_spark_labels_df_from_Pitsikalis_2019_csv(spark, csv_path, expected_header)
 
@@ -56,7 +62,10 @@ def process_Pitsikalis_2019_data():#REFACTOR MOVING WHAT IS POSSIBLE TO services
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default
-        output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        if is_container:
+            output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
 
         new_file_name = os.getenv("OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK", "Placeholder_folder_data_processed_by_spark")
         output_path = f"{output_dir}/{new_file_name}"
