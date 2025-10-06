@@ -1,4 +1,4 @@
-summary: "Process Pitsikalis 2019 data for recognised composite events"
+summary: "Process Pitsikalis 2019 labels data for recognised composite events"
 description: |
   Load the Maritime Composite Events CSV (recognized_CEs.csv),
   filter and transform the data:
@@ -28,7 +28,7 @@ parameters:
 
 responses:
   200:
-    description: "Pitsikalis 2019 data processing completed successfully."
+    description: "Pitsikalis 2019 labels data processing completed successfully."
     content:
       application/json:
         schema:
@@ -75,7 +75,7 @@ responses:
               type: "string"
               example: "Invalid input"
   500:
-    description: "Server error during Pitsikalis 2019 data processing."
+    description: "Server error during Pitsikalis 2019 labels data processing."
     content:
       application/json:
         schema:
@@ -83,7 +83,7 @@ responses:
           properties:
             message:
               type: "string"
-              example: "An error occurred while processing the Pitsikalis 2019 data."
+              example: "An error occurred while processing the Pitsikalis 2019 labels data."
             traceback:
               type: "string"
               example: "Detailed error stacktrace here"

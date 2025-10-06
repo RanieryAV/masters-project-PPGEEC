@@ -9,11 +9,12 @@ from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
 from pathlib import Path
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, TimestampType
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from typing import Tuple, List, Dict
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
 
@@ -39,6 +40,7 @@ logger = get_logger()
 load_dotenv()#move to services
 
 class Process_Data_Service:
+    ######################## DOCKER DETECTION FUNCTIONS ########################
     @staticmethod
     def _is_running_in_container() -> bool:
         """
@@ -93,6 +95,10 @@ class Process_Data_Service:
         except Exception as e:
             logger.warning(f"Could not auto-detect Spark UID/GID, using defaults {default_uid}:{default_gid} ({e})")
         return uid, gid
+    
+    ######################################## END ########################################
+
+    ########################### FILESYSTEM PERMISSIONS HELPERS ##########################
 
     @staticmethod
     def ensure_local_processed_dirs(target_uid: int = 1001, target_gid: int = 1001):
@@ -283,6 +289,10 @@ class Process_Data_Service:
                 os.chmod(os.path.join(root, d), 0o777)
             for f in files:
                 os.chmod(os.path.join(root, f), 0o777)
+    
+    ############################### END ##############################
+
+    ############### SPARK DATAFRAME PROCESSING HELPERS ###############
 
     @staticmethod
     def save_spark_df_as_csv(spark_df, output_path: str, spark: SparkSession):
@@ -307,42 +317,7 @@ class Process_Data_Service:
         Process_Data_Service.adjust_file_permissions(output_path)
 
         logger.info("ATTENTION: Data saved successfully with correct file permissions!")
-
-    @staticmethod
-    def init_spark_session(spark_session_name):
-        """Initialize and return a SparkSession using environment vars."""
-        spark_master_rpc_port = os.getenv("SPARK_MASTER_RPC_PORT", "7077")
-        spark_master_url = os.getenv("SPARK_MASTER_URL", f"spark://spark-master:{spark_master_rpc_port}")
-        eventlog_dir = os.getenv("SPARK_EVENTLOG_DIR", "/opt/spark-events")
-
-        logger.info(f"Spark master URL: {spark_master_url}")
-        logger.info(f"Event log directory: {eventlog_dir}")
-
-        driver_host = os.getenv("SPARK_DRIVER_HOST")
-        if not driver_host:
-            try:
-                hostname = socket.gethostname()
-                driver_host = socket.gethostbyname(hostname)
-            except Exception:
-                # fallback razoável dentro de container
-                driver_host = "0.0.0.0"
-
-        spark = (
-            SparkSession.builder
-            .appName(spark_session_name)
-            .master(spark_master_url)
-            .config("spark.eventLog.enabled", "false")
-            .config("spark.eventLog.dir", eventlog_dir)
-            .config("spark.sql.shuffle.partitions", "200")
-            .config("spark.driver.host", driver_host)
-            .config("spark.driver.bindAddress", "0.0.0.0")
-            .config("spark.local.dir", "/app/processed_output/spark_tmp")
-            .config("spark.executorEnv.SPARK_LOCAL_DIRS", "/app/processed_output/spark_tmp")
-            .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=/app/processed_output/spark_tmp")
-            .getOrCreate()
-        )
-        return spark
-
+    
     @staticmethod
     def spark_func_promote_csv_from_temporary(spark, output_path: str) -> bool:
         """
@@ -487,7 +462,63 @@ class Process_Data_Service:
 
         spark._jvm.scala.Predef.println(f"[promote_csv] no part-*.csv found to promote in {output_path}")
         return False
+    
+    ######################## END ########################
 
+    ############### SPARK SESSION HELPERS ###############
+    @staticmethod
+    def init_spark_session(spark_session_name):
+        """Initialize and return a SparkSession using environment vars."""
+        spark_master_rpc_port = os.getenv("SPARK_MASTER_RPC_PORT", "7077")
+        spark_master_url = os.getenv("SPARK_MASTER_URL", f"spark://spark-master:{spark_master_rpc_port}")
+        eventlog_dir = os.getenv("SPARK_EVENTLOG_DIR", "/opt/spark-events")
+
+        logger.info(f"Spark master URL: {spark_master_url}")
+        logger.info(f"Event log directory: {eventlog_dir}")
+
+        driver_host = os.getenv("SPARK_DRIVER_HOST")
+        if not driver_host:
+            try:
+                hostname = socket.gethostname()
+                driver_host = socket.gethostbyname(hostname)
+            except Exception:
+                # fallback razoável dentro de container
+                driver_host = "0.0.0.0"
+
+        # --- executor/driver resource tuning (read from env with sane defaults) ---
+        # These values allow the master/workers to allocate larger executors instead of the
+        # Spark default of 1g per executor. They are read from environment variables so
+        # you can override them in docker-compose/.env without changing code.
+        spark_cores_max = os.getenv("SPARK_CORES_MAX", "4")                 # total cores allowed for this app
+        spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor
+        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
+        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
+
+        spark = (
+            SparkSession.builder
+            .appName(spark_session_name)
+            .master(spark_master_url)
+            .config("spark.eventLog.enabled", "false")
+            .config("spark.eventLog.dir", eventlog_dir)
+            .config("spark.sql.shuffle.partitions", "12")  # adjust as needed
+            # resource-related configs (minimal additions)
+            .config("spark.cores.max", spark_cores_max)
+            .config("spark.executor.cores", spark_executor_cores)
+            .config("spark.executor.memory", spark_executor_memory)
+            .config("spark.driver.memory", spark_driver_memory)
+            .config("spark.driver.host", driver_host)
+            .config("spark.driver.bindAddress", "0.0.0.0")
+            .config("spark.local.dir", "/app/processed_output/spark_tmp")
+            .config("spark.executorEnv.SPARK_LOCAL_DIRS", "/app/processed_output/spark_tmp")
+            .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=/app/processed_output/spark_tmp")
+            .getOrCreate()
+        )
+        return spark
+
+    ######################## END ########################
+
+    ############### PITSIKALIS 2019 DATA HELPERS  ###############
+        ########### (RECOGNIZED COMPOSITE EVENTS) ###########
     @staticmethod
     def load_spark_labels_df_from_Pitsikalis_2019_csv(spark, relative_path: str, expected_header: list):
         """Load CSV via Spark, infer schema, rename columns if header matches expected rows."""
@@ -614,210 +645,269 @@ class Process_Data_Service:
 
         return results
 
-    ##### ===> ALL FUNCTIONS BELOW ARE UNTESTED!!!!! <=== ######
-    @staticmethod
-    def load_ais_spark_df_Pitsikalis_2019(spark, ais_path: str):
+        #### END OF (RECOGNIZED COMPOSITE EVENTS) ####
+
+        ## CROSS-REFERENCE RAW AIS WITH (RECOGNIZED COMPOSITE EVENTS) ##
+                    #### WARNING: UNTESTED!!! ####
+    def load_events_Pitsikalis_2019(spark: SparkSession, events_path: str) -> DataFrame:
         """
-        Load AIS CSV into a Spark DataFrame and normalize/convert the timestamp column.
-        - ais_path: path to AIS CSV (can be local path or HDFS path)
-        Returns a Spark DataFrame with columns including: id, timestamp (TimestampType), longitude, latitude, annotation, speed, heading, turn, course
+        Load the events CSV into a Spark DataFrame and normalize column names.
+
+        - reads CSV from `events_path` (expects header)
+        - strips whitespace from column names
+        - renames 'Argument' -> 'MMSI_2' if present
+        - converts 'T_start' and 'T_end' to timestamp columns
+        Returns the Spark DataFrame.
         """
-        logger.info(f"Loading AIS CSV from: {ais_path}")
-        df = (
-            spark.read
-            .option("header", True)
-            .option("sep", ",")
-            .option("inferSchema", True)
-            .csv(ais_path)
-        )
+        # read CSV (let Spark infer schema)
+        events_df = spark.read.option("header", True).option("inferSchema", True).csv(events_path)
 
-        # normalize column names (strip whitespace) and rename Id -> id if present
-        for colname in df.columns:
-            if colname.strip() != colname:
-                df = df.withColumnRenamed(colname, colname.strip())
-        if "Id" in df.columns and "id" not in df.columns:
-            df = df.withColumnRenamed("Id", "id")
+        # normalize column names (strip)
+        new_cols = [c.strip() for c in events_df.columns]
+        events_df = events_df.toDF(*new_cols)
 
-        # Convert timestamp that may be in milliseconds (numeric) or ISO strings into TimestampType
-        # We attempt: if numeric epoch in ms -> from_unixtime(col/1000), else try parsing string via to_timestamp
-        ts_col = F.col("timestamp")
-        df = df.withColumn("timestamp_str", ts_col.cast("string"))
-
-        df = df.withColumn(
-            "timestamp",
-            F.when(
-                F.regexp_extract(F.col("timestamp_str"), r"^\d{10,}$", 0) != "",
-                F.to_timestamp(F.from_unixtime((F.col("timestamp_str").cast("double") / 1000.0)))
-            ).otherwise(
-                F.to_timestamp(F.col("timestamp_str"))
-            )
-        ).drop("timestamp_str")
-
-        # Ensure required columns exist (create if missing to keep schema stable)
-        required_cols = ["id", "timestamp", "longitude", "latitude", "annotation", "speed", "heading", "turn", "course"]
-        for c in required_cols:
-            if c not in df.columns:
-                df = df.withColumn(c, F.lit(None))
-
-        return df.select(*required_cols)
-
-    @staticmethod
-    def split_events_Pitsikalis_2019(events_df):
-        """
-        Split events DataFrame into transshipment and non-transshipment DataFrames.
-        - events_df: DataFrame containing at least columns FluentName, MMSI, Argument (or MMSI_2), T_start, T_end, EventIndex
-        Returns a tuple: (transshipment_df, non_transshipment_df, relevant_transship_mmsi_list)
-        where relevant_transship_mmsi_list is a list of dicts {'MMSI': <>, 'MMSI_2': <>}
-        """
-        logger.info("Splitting events into transshipment and non-transshipment categories")
-
-        # Normalize columns: if 'Argument' exists rename to 'MMSI_2'
-        cols = [c for c in events_df.columns]
-        if "Argument" in cols and "MMSI_2" not in cols:
+        # rename 'Argument' to 'MMSI_2' if exists
+        if "Argument" in events_df.columns and "MMSI_2" not in events_df.columns:
             events_df = events_df.withColumnRenamed("Argument", "MMSI_2")
 
-        # Ensure T_start/T_end are timestamps; attempt string/epoch parsing
-        # If they are numeric epoch (ms), convert accordingly
-        events_df = events_df.withColumn("T_start_str", F.col("T_start").cast("string"))
-        events_df = events_df.withColumn("T_end_str", F.col("T_end").cast("string"))
+        # ensure T_start and T_end are timestamps
+        if "T_start" in events_df.columns:
+            events_df = events_df.withColumn("T_start", F.to_timestamp(F.col("T_start")))
+        if "T_end" in events_df.columns:
+            events_df = events_df.withColumn("T_end", F.to_timestamp(F.col("T_end")))
 
-        events_df = events_df.withColumn(
-            "T_start",
-            F.when(
-                F.regexp_extract(F.col("T_start_str"), r"^\d{10,}$", 0) != "",
-                F.to_timestamp(F.from_unixtime(F.col("T_start_str").cast("double") / 1000.0))
-            ).otherwise(F.to_timestamp(F.col("T_start_str")))
-        ).withColumn(
-            "T_end",
-            F.when(
-                F.regexp_extract(F.col("T_end_str"), r"^\d{10,}$", 0) != "",
-                F.to_timestamp(F.from_unixtime(F.col("T_end_str").cast("double") / 1000.0))
-            ).otherwise(F.to_timestamp(F.col("T_end_str")))
-        ).drop("T_start_str", "T_end_str")
+        return events_df
 
-        # Map FluentName to Category if Category not present (attempt to reuse your earlier mapping)
-        if "Category" not in events_df.columns:
-            fluent_name_categories = {
-                'highSpeedNC': 'NORMAL',
-                'loitering': 'LOITERING',
-                'tuggingSpeed': 'LOITERING',
-                'stopped': 'STOPPING',
-                'anchoredOrMoored': 'STOPPING',
-                'rendezVous': 'TRANSSHIPMENT',
-            }
-            mapping_expr = F.create_map(
-                *sum(([F.lit(k), F.lit(v)] for k, v in fluent_name_categories.items()), [])
-            )
-            events_df = events_df.withColumn("Category", mapping_expr.getItem(F.col("FluentName")))
 
-        # Split
-        transshipment_df = events_df.filter(F.col("Category") == "TRANSSHIPMENT")
+    def split_events_Pitsikalis_2019(events_df: DataFrame) -> Tuple[DataFrame, DataFrame]:
+        """
+        Split events DataFrame into:
+        - transshipment_df: rows where Category == 'TRANSSHIPMENT'
+        - non_transshipment_df: rows where Category in ('LOITERING', 'NORMAL', 'STOPPING')
+
+        Returns (transshipment_df, non_transshipment_df) as Spark DataFrames.
+        """
+        transshipment_df = events_df.filter(F.col("Category") == F.lit("TRANSSHIPMENT"))
         non_transshipment_df = events_df.filter(F.col("Category").isin("LOITERING", "NORMAL", "STOPPING"))
+        return transshipment_df, non_transshipment_df
 
-        # Collect relevant transshipment MMSIs to Python list of dicts
-        trans_pairs = []
-        if "MMSI" in transshipment_df.columns and "MMSI_2" in transshipment_df.columns:
-            rows = transshipment_df.select("MMSI", "MMSI_2").collect()
-            for r in rows:
-                trans_pairs.append({"MMSI": r["MMSI"], "MMSI_2": r["MMSI_2"]})
 
-        return transshipment_df, non_transshipment_df, trans_pairs
-
-    @staticmethod
-    def save_transshipment_Pitsikalis_2019(spark, transshipment_df, target_dir: str):
+    def get_relevant_transship_mmsi_Pitsikalis_2019(transshipment_df: DataFrame) -> List[Dict]:
         """
-        Save transshipment events DataFrame to a single CSV file.
-        - transshipment_df: Spark DataFrame of transshipment events
-        - target_dir: directory path where temporary part-file will be written; the promotion function will produce the single CSV file.
-        Returns True if promotion succeeded (via spark_func_promote_csv_from_temporary), False otherwise.
+        Build a list of dicts [{'MMSI': ..., 'MMSI_2': ...}, ...] for transshipment pairs.
+
+        Collects the pairs into Python memory (like the original code's relevant_transship_mmsi).
         """
-        logger.info(f"Writing transshipment DataFrame to temporary dir: {target_dir}")
-        # write to directory as Spark expects; coalesce to 1 for a single part file
-        transshipment_df.coalesce(1).write.mode("overwrite").option("header", True).csv(target_dir)
-        # promote to single CSV using existing helper
-        try:
-            promoted = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, target_dir)
-            if promoted:
-                logger.info(f"Transshipment CSV promoted for target_dir: {target_dir}")
+        # select only necessary columns and collect
+        cols = []
+        if "MMSI" in transshipment_df.columns:
+            cols.append("MMSI")
+        if "MMSI_2" in transshipment_df.columns:
+            cols.append("MMSI_2")
+
+        if not cols:
+            return []
+
+        rows = transshipment_df.select(*cols).collect()
+        result = []
+        for r in rows:
+            entry = {}
+            if "MMSI" in r.__fields__:
+                entry["MMSI"] = r["MMSI"]
             else:
-                logger.warning(f"Transshipment CSV promotion returned False for target_dir: {target_dir}")
-            return promoted
-        except Exception as e:
-            logger.exception(f"Error while promoting transshipment CSV: {e}")
-            return False
+                entry["MMSI"] = r[0] if len(r) > 0 else None
+            # prefer named access for MMSI_2
+            if len(r) > 1:
+                entry["MMSI_2"] = r[1]
+            else:
+                entry["MMSI_2"] = r["MMSI_2"] if "MMSI_2" in r.__fields__ else None
+            result.append(entry)
+        return result
 
-    @staticmethod
-    def process_non_transshipment_ais_Pitsikalis_2019(spark, ais_df, non_transshipment_df, target_dir: str):
+
+    # def save_transshipment_Pitsikalis_2019(transshipment_df: DataFrame, spark: SparkSession, output_path: str):
+    #     """
+    #     Save transshipment_df as a single CSV file (coalesced). Uses Process_Data_Service.save_spark_df_as_csv
+    #     to preserve your CSV promotion and permission handling.
+
+    #     - output_path: full path to output directory (not base dir)
+    #     Returns the output path (directory) used for writing.
+    #     """
+    #     out_dir = os.path.join(output_path, "ais_transshipment_events")
+    #     # ensure parent exists
+    #     Path(out_dir).mkdir(parents=True, exist_ok=True)
+        
+    #     # save using helper
+    #     Process_Data_Service.save_spark_df_as_csv(transshipment_df, out_dir, spark)
+
+
+    def process_ais_events_Pitsikalis_2019(
+        spark: SparkSession,
+        ais_path: str,
+        non_transshipment_df: DataFrame,
+        output_base_dir: str = os.path.join("..", "datasets"),
+    ) -> str:
         """
-        For non-transshipment events:
-        - filter AIS data to MMSIs present in non_transshipment_df and within the global min/max event timestamps,
-        - join AIS rows to events by matching id==MMSI and timestamp in [T_start, T_end],
-        - attach EventIndex and Category to the AIS rows,
-        - write output to target_dir (as CSV via Spark) and promote to single CSV using the existing promote helper.
-        Returns True if data was written and promoted successfully, False otherwise.
+        Process AIS CSV with Spark and join with non-transshipment events to produce
+        loitering/non-loitering/stopping annotated AIS records.
+
+        Steps:
+        - load AIS csv into Spark DataFrame
+        - normalize columns and rename 'Id' -> 'id'
+        - convert AIS 'timestamp' (ms) into a proper timestamp column named 'timestamp' (timestamp type)
+        - filter AIS rows by relevant MMSI set and global min/max event times to reduce data scanned
+        - perform a join where (ais.id == events.MMSI) AND (ais.timestamp between events.T_start and events.T_end)
+        - select and order the output columns:
+        ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','EventIndex','Category']
+        - write a single CSV (coalesced) to an output dir under output_base_dir and call promotion helper
+        Returns the output directory path used for writing.
         """
-        logger.info("Processing non-transshipment AIS data and joining to event ranges")
+        # read AIS CSV
+        ais_df = spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
 
-        # Guard: if no non-trans events, nothing to do
-        if non_transshipment_df.rdd.isEmpty():
-            logger.info("No non-transshipment events found; skipping processing.")
-            return False
+        # normalize column names
+        ais_df = ais_df.toDF(*[c.strip() for c in ais_df.columns])
 
-        # compute global min/max timestamps of events to limit AIS search range
-        min_ts_row = non_transshipment_df.agg(F.min("T_start").alias("min_ts")).collect()[0]
-        max_ts_row = non_transshipment_df.agg(F.max("T_end").alias("max_ts")).collect()[0]
-        min_ts = min_ts_row["min_ts"]
-        max_ts = max_ts_row["max_ts"]
+        # rename 'Id' -> 'id' if required
+        if "Id" in ais_df.columns and "id" not in ais_df.columns:
+            ais_df = ais_df.withColumnRenamed("Id", "id")
 
-        logger.info(f"Filtering AIS data between {min_ts} and {max_ts}")
+        # Convert timestamp in ms to timestamp type called 'timestamp'
+        # If incoming timestamp already looks like epoch ms number, do conversion, otherwise try to cast to timestamp
+        if "timestamp" in ais_df.columns:
+            # create numeric_ts = timestamp / 1000 and then from_unixtime
+            ais_df = ais_df.withColumn("timestamp_ms", F.col("timestamp"))
+            # if timestamp is numeric (integer/long), convert from ms
+            ais_df = ais_df.withColumn(
+                "timestamp",
+                F.when(
+                    F.col("timestamp_ms").cast("long").isNotNull(),
+                    F.from_unixtime((F.col("timestamp_ms").cast("double") / 1000.0)).cast(TimestampType()),
+                ).otherwise(F.to_timestamp(F.col("timestamp_ms"))),
+            ).drop("timestamp_ms")
 
-        # Semi-join: only keep AIS rows where id appears in non_transshipment_df.MMSI
-        distinct_mmsi_df = non_transshipment_df.select(F.col("MMSI").alias("MMSI")).distinct()
-        # prepare ais_df: ensure id column exists, timestamp as timestamp (assume load_ais does that)
-        ais_filtered = ais_df.join(distinct_mmsi_df, ais_df.id == distinct_mmsi_df.MMSI, "semi") \
-                            .filter((F.col("timestamp") >= F.lit(min_ts)) & (F.col("timestamp") <= F.lit(max_ts)))
+        # Ensure required AIS columns exist; create null columns if absent so schema is consistent
+        required_ais_cols = ["id", "timestamp", "longitude", "latitude", "annotation", "speed", "heading", "turn", "course"]
+        for col in required_ais_cols:
+            if col not in ais_df.columns:
+                ais_df = ais_df.withColumn(col, F.lit(None))
 
-        # perform range join: ais.timestamp between event T_start and T_end for same MMSI
-        a = ais_filtered.alias("a")
-        e = non_transshipment_df.alias("e")
+        # Reduce events time window first (global min and max) to reduce AIS scanning
+        aggs = non_transshipment_df.agg(F.min("T_start").alias("min_start"), F.max("T_end").alias("max_end")).collect()
+        if aggs and len(aggs) > 0:
+            min_start = aggs[0]["min_start"]
+            max_end = aggs[0]["max_end"]
+        else:
+            min_start = None
+            max_end = None
 
-        join_cond = (F.col("a.id") == F.col("e.MMSI")) & \
-                    (F.col("a.timestamp") >= F.col("e.T_start")) & \
-                    (F.col("a.timestamp") <= F.col("e.T_end"))
+        # build relevant MMSI list (distinct)
+        relevant_mmsi = [r[0] for r in non_transshipment_df.select("MMSI").distinct().rdd.map(lambda r: (r[0],)).collect()]
 
-        joined = a.join(e, join_cond, "inner")
+        # filter AIS by relevant MMSIs and time range (best-effort filter)
+        ais_filtered = ais_df
+        if relevant_mmsi:
+            # to avoid very large IN lists in SQL, broadcast small list; if large list then use join below
+            if len(relevant_mmsi) < 10_000:
+                ais_filtered = ais_filtered.filter(F.col("id").isin(relevant_mmsi))
+            else:
+                # join approach: create df of relevant MMSIs
+                mmsi_df = spark.createDataFrame([(m,) for m in relevant_mmsi], ["MMSI__tmp_"])
+                ais_filtered = ais_filtered.join(mmsi_df, ais_filtered.id == F.col("MMSI__tmp_"), "inner").drop("MMSI__tmp_")
 
-        # select required AIS columns plus EventIndex and Category
-        select_cols = [
-            F.col("a.id").alias("id"),
-            F.col("a.timestamp").alias("timestamp"),
-            F.col("a.longitude").alias("longitude"),
-            F.col("a.latitude").alias("latitude"),
-            F.col("a.annotation").alias("annotation"),
-            F.col("a.speed").alias("speed"),
-            F.col("a.heading").alias("heading"),
-            F.col("a.turn").alias("turn"),
-            F.col("a.course").alias("course"),
-            F.col("e.EventIndex").alias("EventIndex"),
-            F.col("e.Category").alias("Category"),
+        if min_start is not None and max_end is not None:
+            ais_filtered = ais_filtered.filter((F.col("timestamp") >= F.lit(min_start)) & (F.col("timestamp") <= F.lit(max_end)))
+
+        # Join AIS with events using range condition:
+        # condition: ais.id == events.MMSI AND ais.timestamp between events.T_start and events.T_end
+        join_cond = (
+            (ais_filtered.id == non_transshipment_df.MMSI)
+            & (ais_filtered.timestamp >= non_transshipment_df.T_start)
+            & (ais_filtered.timestamp <= non_transshipment_df.T_end)
+        )
+
+        joined = ais_filtered.join(non_transshipment_df, on=join_cond, how="inner")
+
+        # Select output columns in the order expected
+        output_columns = [
+            "id",
+            "timestamp",
+            "longitude",
+            "latitude",
+            "annotation",
+            "speed",
+            "heading",
+            "turn",
+            "course",
+            "EventIndex",
+            "Category",
         ]
 
-        result_df = joined.select(*select_cols)
+        # If EventIndex or Category are not present in events, ensure they exist (avoid exceptions)
+        for c in ["EventIndex", "Category"]:
+            if c not in joined.columns:
+                joined = joined.withColumn(c, F.lit(None))
 
-        # Write to directory (coalesce to 1 part-file to make promotion easier)
-        logger.info(f"Writing joined non-transshipment AIS data to temporary dir: {target_dir}")
-        result_df.coalesce(1).write.mode("overwrite").option("header", True).csv(target_dir)
+        result_df = joined.select(*output_columns)
 
-        # promote to single CSV using existing helper
-        try:
-            promoted = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, target_dir)
-            if promoted:
-                logger.info(f"Non-transshipment AIS CSV promoted for target_dir: {target_dir}")
-            else:
-                logger.warning(f"Non-transshipment AIS CSV promotion returned False for target_dir: {target_dir}")
-            return promoted
-        except Exception as e:
-            logger.exception(f"Error while promoting non-transshipment AIS CSV: {e}")
-            return False
+        # # Write to an output directory (coalesce to 1)
+        # out_dir = os.path.join(output_base_dir, "ais_loitering_non_loitering_stopping_events")
+        # Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    
+        # # Use Process_Data_Service.save_spark_df_as_csv if available, to preserve promotion logic
+        # try:
+        #     # Attempt to leverage your helper (it coalesces and then promotes)
+        #     Process_Data_Service.save_spark_df_as_csv(result_df, out_dir, spark)
+        # except Exception:
+        #     # fallback: basic spark write and then try to promote
+        #     result_df.coalesce(1).write.mode("overwrite").option("header", True).csv(out_dir)
+        #     try:
+        #         Process_Data_Service.spark_func_promote_csv_from_temporary(spark, out_dir)
+        #     except Exception:
+        #         pass
+
+        return result_df
+
+
+    def run_pipeline_Pitsikalis_2019(spark: SparkSession, events_path: str, ais_path: str) -> Dict:
+        """
+        Orchestrate the loading, splitting, and processing pipeline for Pitsikalis 2019.
+
+        - loads events
+        - splits into transshipment and non-transshipment
+        - saves the transshipment events CSV (single coalesced file)
+        - processes AIS and joins with non-transshipment events, saving the annotated AIS CSV (single coalesced file)
+        - returns a small summary dict including paths and the relevant transshipment list
+        """
+        print(f"Loading events from {events_path}")
+        events_df = load_events_Pitsikalis_2019(spark, events_path)
+
+        print("Splitting events into transshipment and non-transshipment")
+        transshipment_df, non_transshipment_df = split_events_Pitsikalis_2019(events_df)
+
+        print("Collecting relevant transshipment MMSI pairs")
+        relevant_transship_mmsi = get_relevant_transship_mmsi_Pitsikalis_2019(transshipment_df)
+
+        print("Saving transshipment events (coalesced single CSV)")
+        trans_out_dir = save_transshipment_Pitsikalis_2019(transshipment_df, spark)
+
+        print("Processing AIS and joining with non-transshipment events")
+        loiter_out_dir = process_ais_events_Pitsikalis_2019(spark, ais_path, non_transshipment_df)
+
+        summary = {
+            "transshipment_output_dir": trans_out_dir,
+            "loitering_output_dir": loiter_out_dir,
+            "relevant_transship_mmsi": relevant_transship_mmsi,
+        }
+        print("Pipeline finished. Summary:", summary)
+        return summary
+
+
+    # Example usage (uncomment when running in real module):
+    # spark = Process_Data_Service.init_spark_session("Pitsikalis2019DataProcessing")
+    # events_path = os.path.join('..', 'datasets', 'filtered_fluentname_data_v2.csv')
+    # ais_path = os.path.join('..', 'datasets', 'ais_brest_synopses_v0.8', 'ais_brest_locations.csv')
+    # run_pipeline_Pitsikalis_2019(spark, events_path, ais_path)
+
+                    #### WARNING: UNTESTED!!! ####
+    ######################## END ########################

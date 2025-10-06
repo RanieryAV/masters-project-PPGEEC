@@ -16,7 +16,10 @@ chmod -R 777 /app/processed_output
 chown -R spark:spark /app/processed_output || true
 
 # If environment variable defines a subfolder
-OUTPUT_SUBFOLDER="${OUTPUT_FOLDER_NAME_FOR_DATA_PROCESSED_BY_SPARK:-Placeholder_folder_data_processed_by_spark}"
+# Data processing specific env vars
+PROCESSED_OUTPUT_DIR=${PROCESSED_OUTPUT_DIR}
+OUTPUT_FOLDER_NAME_FOR_LABELS_DATA_SPARK_PITSIKALIS_2019=${OUTPUT_FOLDER_NAME_FOR_LABELS_DATA_SPARK_PITSIKALIS_2019}
+OUTPUT_FOLDER_NAME_FOR_TRANSSHIP_AIS_DATA_SPARK_PITSIKALIS_2019=${OUTPUT_FOLDER_NAME_FOR_TRANSSHIP_AIS_DATA_SPARK_PITSIKALIS_2019}
 mkdir -p "/app/processed_output/${OUTPUT_SUBFOLDER}"
 chmod -R 777 "/app/processed_output/${OUTPUT_SUBFOLDER}"
 chown -R spark:spark "/app/processed_output/${OUTPUT_SUBFOLDER}" || true

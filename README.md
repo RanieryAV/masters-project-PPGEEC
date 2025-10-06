@@ -37,10 +37,10 @@
     chmod +x scripts/install_dependencies.sh
     ./scripts/install_dependencies.sh
     ```
-3. Run the `launch_data_processing_api.sh` script to start the Data Processing API and configure crucial directories.
+3. Run the `set_up_folder_permissions.sh` script to start the Data Processing API and configure crucial directories.
     ```sh
-    chmod +x scripts/launch_data_processing_api.sh
-    ./scripts/launch_data_processing_api.sh
+    chmod +x scripts/set_up_folder_permissions.sh
+    ./scripts/set_up_folder_permissions.sh
     ```
 4. Place general dataset files into `shared/utils/datasets/`.
  - TODO: Specify dataset files and their sources.
