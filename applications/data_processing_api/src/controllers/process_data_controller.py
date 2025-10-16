@@ -196,20 +196,27 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
 @preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-2', methods=['POST'])
 def process_Pitsikalis_2019_AIS_data_PART_2():
     """
-    Process the Pitsikalis 2019 AIS data (PART 2).
-    Expects a POST request. Loads preprocessed data from predefined CSV paths ("ais_transshipment_events_Pitsikalis_2019",
-    "ais_loitering_events_Pitsikalis_2019", "ais_normal_events_Pitsikalis_2019" and "ais_stopping_events_Pitsikalis_2019"),
-    cross-references them with raw AIS data using Spark, and saves the processed data as new CSV files: one for transshipment events
-    ("agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"), other for loitering events
-    ("agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"), another for normal events
-    ("agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"), and another for stopping events
-    ("agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES").
+    Processes the Pitsikalis 2019 AIS data (PART 2) for *TRANSSHIPMENT* events.
 
-    This variant keeps init_spark_session unchanged and applies:
-      - more aggressive repartitioning (smaller partitions per executor)
-      - reduced chunk_bytes (default 256KB) for chunked streaming writer
-      - driver disk-space pre-check (fail-fast)
-      - logs choices and falls back gracefully if helpers missing
+    This endpoint expects a POST request and performs the following steps:
+    1. Initializes a Spark session with conservative runtime tuning for stability.
+    2. Determines the Spark parallelism level robustly, using environment variables as fallback.
+    3. Selects input and output directories based on whether the code is running in a container.
+    4. Loads preprocessed transshipment event labels from a CSV file.
+    5. Cross-references these labels with raw AIS data using Spark to create an aggregated DataFrame.
+    6. Saves the processed, aggregated transshipment event data to a specified output directory.
+    7. Stops the Spark session and returns a success response with the output path.
+
+    Features:
+    - Aggressive repartitioning and reduced chunk size for efficient Spark writing.
+    - Driver disk-space pre-check and robust logging.
+    - Graceful fallback if helper functions or environment variables are missing.
+
+    Returns:
+        JSON response containing status, message, and output path for the aggregated transshipment events.
+
+    Raises:
+        Returns a JSON error response with traceback if any step fails.
     """
     logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-2-data")
 
@@ -296,7 +303,99 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
         Process_Data_Service.save_spark_df_as_csv(result_df, aggregated_transshipment_output_path, spark)
         logger.info(f"AGGREGATED Transshipment events saved to '{aggregated_transshipment_output_path}'")
 
-        ####
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "Aggregated Transshipment events processed and saved.",
+            "output_path_transshipment": aggregated_transshipment_output_path
+        }), 200
+
+    except Exception as e:
+        logger.error("Error loading or processing events data", exc_info=True)
+        traceback_str = traceback.format_exc()
+        return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
+    
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_3.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-3', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_3():
+    """
+    Processes the Pitsikalis 2019 AIS data (PART 3) for *NORMAL* vessel events.
+
+    This endpoint expects a POST request and performs the following steps:
+    1. Initializes a Spark session with conservative runtime tuning for reliability.
+    2. Determines Spark parallelism settings robustly, using environment variables as fallback.
+    3. Selects input/output directories based on containerized or local environment.
+    4. Loads preprocessed normal event AIS data from CSV files.
+    5. Cross-references preprocessed event labels with raw AIS data using Spark, aggregating vessel-level features.
+    6. Saves the processed, aggregated data to a specified output directory, using hash partitioning and chunked streaming for efficient writing.
+    7. Logs all major steps and configuration choices, gracefully handling missing helpers or configuration issues.
+    8. Stops the Spark session and returns a JSON response indicating success and the output path.
+
+    Returns:
+        Flask Response: JSON object with status, message, and output path for the aggregated normal events data.
+        On error, returns JSON with error details and traceback.
+    """
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-3-data")
+
+    try:
+        # === Create Spark session (unchanged init_spark_session is used) ===
+        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_3_[Data_Processing_API]")
+
+        # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
+        try:
+            spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
+            spark.conf.set("spark.shuffle.io.maxRetries", "8")
+            spark.conf.set("spark.shuffle.io.retryWait", "5s")
+            spark.conf.set("spark.network.timeout", "300s")
+            spark.conf.set("spark.executor.heartbeatInterval", "150s")
+            spark.conf.set("spark.executor.memoryOverhead", "1024")
+            spark.conf.set("spark.shuffle.compress", "true")
+            spark.conf.set("spark.shuffle.spill.compress", "true")
+            logger.info("Applied conservative spark.conf tuning for reducer/fetch/timeout/memoryOverhead")
+        except Exception as _e:
+            logger.warning("Could not set some spark.conf tuning values: %s", _e)
+
+        # === Determine default_parallelism robustly ===
+        try:
+            default_parallelism = spark.sparkContext.defaultParallelism
+            logger.info("Detected spark.sparkContext.defaultParallelism = %s", default_parallelism)
+        except Exception:
+            default_parallelism = None
+            logger.info("Could not read spark.sparkContext.defaultParallelism")
+
+        if not default_parallelism:
+            try:
+                cores_max = int(os.getenv("SPARK_CORES_MAX", "4"))
+                exec_cores = int(os.getenv("SPARK_EXECUTOR_CORES", "2"))
+                inferred_executors = max(1, cores_max // max(1, exec_cores))
+                default_parallelism = inferred_executors * exec_cores
+                logger.info(
+                    "Inferred default_parallelism from env: cores_max=%s exec_cores=%s -> default_parallelism=%s",
+                    cores_max, exec_cores, default_parallelism
+                )
+            except Exception:
+                default_parallelism = 8
+                logger.info("Falling back to default_parallelism=%s", default_parallelism)
+
+        # === Paths / environment choices ===
+        is_container = Process_Data_Service._is_running_in_container()
+
+        if is_container:
+            input_dir = "/app/processed_output"
+        else:
+            input_dir = "shared/utils/processed_output"
+
+        if is_container:
+            ais_csv_path = "/app/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
+        else:
+            ais_csv_path = "shared/utils/datasets/ais_brest_locations.csv"
+
+        if is_container:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
 
         # === Non-transshipment branch (where we apply chunking + repartition) ===        
         # Normal events
@@ -333,6 +432,103 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
 
         logger.info(f"AGGREGATED Normal events saved to '{aggregated_normal_output_path}'")
 
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "Aggregated Normal events processed and saved.",
+            "output_path_normal": aggregated_normal_output_path
+        }), 200
+
+    except Exception as e:
+        logger.error("Error loading or processing events data", exc_info=True)
+        traceback_str = traceback.format_exc()
+        return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
+
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_4.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-4', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_4():
+    """
+    Processes the Pitsikalis 2019 AIS *STOPPING* events data (PART 4).
+
+    This function is designed to be triggered by a POST request. It performs the following steps:
+        - Initializes a Spark session with conservative runtime tuning for reliability.
+        - Determines Spark parallelism settings robustly, using environment variables as fallback.
+        - Selects input/output directories based on containerized or local environment.
+        - Loads preprocessed stopping event labels from a CSV file.
+        - Cross-references these labels with raw AIS data using Spark, aggregating vessel-level features.
+        - Saves the processed, aggregated data to a specified output directory, using hash partitioning and chunked streaming for efficient writing.
+        - Logs all major steps and configuration choices, with graceful fallback if helpers or settings are missing.
+        - Stops the Spark session and returns a JSON response indicating success or failure.
+
+    Returns:
+            Flask Response: JSON object with status, message, and output path on success; error details on failure.
+
+    Raises:
+            FileNotFoundError: If no preprocessed stopping events CSV is found.
+            Exception: For any other errors during processing, with traceback included in the response.
+    """
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-4-data")
+
+    try:
+        # === Create Spark session (unchanged init_spark_session is used) ===
+        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_4_[Data_Processing_API]")
+
+        # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
+        try:
+            spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
+            spark.conf.set("spark.shuffle.io.maxRetries", "8")
+            spark.conf.set("spark.shuffle.io.retryWait", "5s")
+            spark.conf.set("spark.network.timeout", "300s")
+            spark.conf.set("spark.executor.heartbeatInterval", "150s")
+            spark.conf.set("spark.executor.memoryOverhead", "1024")
+            spark.conf.set("spark.shuffle.compress", "true")
+            spark.conf.set("spark.shuffle.spill.compress", "true")
+            logger.info("Applied conservative spark.conf tuning for reducer/fetch/timeout/memoryOverhead")
+        except Exception as _e:
+            logger.warning("Could not set some spark.conf tuning values: %s", _e)
+
+        # === Determine default_parallelism robustly ===
+        try:
+            default_parallelism = spark.sparkContext.defaultParallelism
+            logger.info("Detected spark.sparkContext.defaultParallelism = %s", default_parallelism)
+        except Exception:
+            default_parallelism = None
+            logger.info("Could not read spark.sparkContext.defaultParallelism")
+
+        if not default_parallelism:
+            try:
+                cores_max = int(os.getenv("SPARK_CORES_MAX", "4"))
+                exec_cores = int(os.getenv("SPARK_EXECUTOR_CORES", "2"))
+                inferred_executors = max(1, cores_max // max(1, exec_cores))
+                default_parallelism = inferred_executors * exec_cores
+                logger.info(
+                    "Inferred default_parallelism from env: cores_max=%s exec_cores=%s -> default_parallelism=%s",
+                    cores_max, exec_cores, default_parallelism
+                )
+            except Exception:
+                default_parallelism = 8
+                logger.info("Falling back to default_parallelism=%s", default_parallelism)
+
+        # === Paths / environment choices ===
+        is_container = Process_Data_Service._is_running_in_container()
+
+        if is_container:
+            input_dir = "/app/processed_output"
+        else:
+            input_dir = "shared/utils/processed_output"
+
+        if is_container:
+            ais_csv_path = "/app/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
+        else:
+            ais_csv_path = "shared/utils/datasets/ais_brest_locations.csv"
+
+        if is_container:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
+
         # Stopping events
         preprocessed_stopping_AIS_dir = os.path.join(input_dir, "ais_stopping_events_Pitsikalis_2019")
         csv_files = glob.glob(os.path.join(preprocessed_stopping_AIS_dir, "*.csv"))
@@ -365,6 +561,100 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
             sample_for_bucket_size=False
         )
         logger.info(f"AGGREGATED Stopping events saved to '{aggregated_stopping_output_path}'")
+
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "Aggregated Stopping events processed and saved.",
+            "output_path_stopping": aggregated_stopping_output_path
+        }), 200
+
+    except Exception as e:
+        logger.error("Error loading or processing events data", exc_info=True)
+        traceback_str = traceback.format_exc()
+        return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
+
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_5.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-5', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_5():
+    """
+    Processes the Pitsikalis 2019 AIS data (PART 5) for *LOITERING* events.
+
+    This function is designed to be triggered by a POST request. It performs the following steps:
+        - Initializes a Spark session with conservative runtime tuning for stability.
+        - Determines parallelism settings based on Spark context or environment variables.
+        - Selects input and output directories based on whether the code is running in a container.
+        - Loads preprocessed loitering event labels from a CSV file.
+        - Cross-references these labels with raw AIS data using Spark to create an aggregated DataFrame.
+        - Saves the processed, aggregated loitering event data to a specified output directory, using hash partitioning and chunked streaming for efficient writing.
+        - Logs all major steps and configuration choices, with graceful fallback if helpers or files are missing.
+        - Stops the Spark session and returns a JSON response indicating success or error.
+
+    Returns:
+            A Flask JSON response containing the status, message, and output path for the aggregated loitering events data.
+            On error, returns a JSON response with error details and traceback.
+    """
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-5-data")
+
+    try:
+        # === Create Spark session (unchanged init_spark_session is used) ===
+        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_5_[Data_Processing_API]")
+
+        # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
+        try:
+            spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
+            spark.conf.set("spark.shuffle.io.maxRetries", "8")
+            spark.conf.set("spark.shuffle.io.retryWait", "5s")
+            spark.conf.set("spark.network.timeout", "300s")
+            spark.conf.set("spark.executor.heartbeatInterval", "150s")
+            spark.conf.set("spark.executor.memoryOverhead", "1024")
+            spark.conf.set("spark.shuffle.compress", "true")
+            spark.conf.set("spark.shuffle.spill.compress", "true")
+            logger.info("Applied conservative spark.conf tuning for reducer/fetch/timeout/memoryOverhead")
+        except Exception as _e:
+            logger.warning("Could not set some spark.conf tuning values: %s", _e)
+
+        # === Determine default_parallelism robustly ===
+        try:
+            default_parallelism = spark.sparkContext.defaultParallelism
+            logger.info("Detected spark.sparkContext.defaultParallelism = %s", default_parallelism)
+        except Exception:
+            default_parallelism = None
+            logger.info("Could not read spark.sparkContext.defaultParallelism")
+
+        if not default_parallelism:
+            try:
+                cores_max = int(os.getenv("SPARK_CORES_MAX", "4"))
+                exec_cores = int(os.getenv("SPARK_EXECUTOR_CORES", "2"))
+                inferred_executors = max(1, cores_max // max(1, exec_cores))
+                default_parallelism = inferred_executors * exec_cores
+                logger.info(
+                    "Inferred default_parallelism from env: cores_max=%s exec_cores=%s -> default_parallelism=%s",
+                    cores_max, exec_cores, default_parallelism
+                )
+            except Exception:
+                default_parallelism = 8
+                logger.info("Falling back to default_parallelism=%s", default_parallelism)
+
+        # === Paths / environment choices ===
+        is_container = Process_Data_Service._is_running_in_container()
+
+        if is_container:
+            input_dir = "/app/processed_output"
+        else:
+            input_dir = "shared/utils/processed_output"
+
+        if is_container:
+            ais_csv_path = "/app/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
+        else:
+            ais_csv_path = "shared/utils/datasets/ais_brest_locations.csv"
+
+        if is_container:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
 
         # Loitering events
         preprocessed_loitering_AIS_dir = os.path.join(input_dir, "ais_loitering_events_Pitsikalis_2019")
@@ -404,10 +694,7 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
 
         return jsonify({
             "status": "success",
-            "message": "Aggregated Transshipment, Loitering, non-loitering, and stopping events processed and saved.",
-            "output_path_transshipment": aggregated_transshipment_output_path,
-            "output_path_normal": aggregated_normal_output_path,
-            "output_path_stopping": aggregated_stopping_output_path,
+            "message": "Aggregated Loitering events processed and saved.",
             "output_path_loitering": aggregated_loitering_output_path
         }), 200
 

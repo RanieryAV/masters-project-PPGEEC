@@ -697,13 +697,12 @@ class Process_Data_Service:
         Stream a Spark DataFrame to a single CSV file from the driver, sending partitions as
         moderate-sized byte-chunks to avoid Netty 'Too large frame' errors and to keep driver memory low.
 
-        Optimizations:
-        - Executor-side chunk compression (gzip) using a LOWER compression level (configurable).
-        - Skip compression for tiny chunks to avoid overhead.
-        - If compressed output is larger than raw, send raw bytes instead.
-        - Use bytes (not str) across network and write in binary at driver.
-        - Call gc.collect() after yielding chunks on executors to encourage memory freeing.
-        - Truncate overly large rows to avoid single-row > chunk_bytes situations.
+        Notes / behavior changes:
+        - NO TRUNCATION: every row is preserved in full. If a single row > chunk_bytes, it will be
+          emitted as its own chunk (may be large) but will not be truncated.
+        - Executor-side chunk compression (gzip) remains optional; small chunks are left uncompressed.
+        - Uses bytes across the network and writes binary on the driver.
+        - Calls gc.collect() after yielding chunks on executors.
         """
         import os
         import gzip
@@ -733,6 +732,13 @@ class Process_Data_Service:
 
         cols = spark_df.columns
 
+        # Number of partitions for visibility
+        try:
+            num_partitions = spark_df.rdd.getNumPartitions()
+            logger.info("save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019: input RDD num_partitions=%d", num_partitions)
+        except Exception:
+            num_partitions = None
+
         # Compression-level and thresholds via env
         try:
             gzip_level = int(os.getenv("CHUNK_GZIP_LEVEL", "1"))  # default fast, low memory
@@ -746,29 +752,13 @@ class Process_Data_Service:
         except Exception:
             min_compress_bytes = 1024
 
-        # helper: truncate a UTF-8 bytes sequence to max_bytes preserving char boundaries
-        def _truncate_bytes_safe(s: str, max_bytes: int) -> str:
-            b = s.encode("utf-8", errors="ignore")
-            if len(b) <= max_bytes:
-                return s
-            truncated = b[:max_bytes]
-            try:
-                return truncated.decode("utf-8", errors="ignore")
-            except Exception:
-                cut = max_bytes
-                while cut > 0:
-                    try:
-                        return b[:cut].decode("utf-8", errors="ignore")
-                    except Exception:
-                        cut -= 1
-                return ""
-
         def partition_to_chunk_bytes(iterator):
             """
             Executor-side: build and yield chunk bytes (not strings).
             - Only compress if chunk_raw length >= min_compress_bytes.
             - Use gzip.compress(..., compresslevel=gzip_level) and fallback to raw if compressed bigger.
             - Call gc.collect() after yielding a chunk to free memory quickly on executor.
+            - No truncation: if a single CSV line > chunk_bytes, yield it as its own chunk.
             """
             import gzip as _gzip
             import gc as _gc
@@ -797,6 +787,7 @@ class Process_Data_Service:
                 try:
                     rowd = row.asDict()
                 except Exception:
+                    # fallback for Row object
                     rowd = {c: getattr(row, c) for c in cols}
 
                 cell_strs = [serialize_cell(rowd.get(c)) for c in cols]
@@ -804,40 +795,15 @@ class Process_Data_Service:
                 encoded_line = line_str.encode("utf-8")
                 line_len = len(encoded_line)
 
-                # If a single line itself is larger than chunk_bytes, try truncation
-                if line_len > chunk_bytes:
-                    per_cell_budget = max(64, chunk_bytes // max(1, len(cell_strs)))
-                    new_cell_strs = []
-                    truncated_any = False
-                    for s in cell_strs:
-                        sb = s.encode("utf-8")
-                        if len(sb) > per_cell_budget:
-                            s_trunc = _truncate_bytes_safe(s, per_cell_budget - 20)
-                            s_trunc = s_trunc + "...[TRUNCATED]"
-                            new_cell_strs.append(s_trunc)
-                            truncated_any = True
-                        else:
-                            new_cell_strs.append(s)
-                    if truncated_any:
-                        line_str = ",".join(new_cell_strs) + "\n"
-                        encoded_line = line_str.encode("utf-8")
-                        line_len = len(encoded_line)
-                        _logger.debug("Executor: after truncation single line size ~%d bytes", line_len)
-                    else:
-                        _logger.warning("Executor: could not truncate single line to fit chunk limit; will send it as its own chunk")
-
                 # If adding this line would exceed the chunk_bytes and buffer not empty, yield current buffer
                 if buf_lines and (buf_bytes + line_len > chunk_bytes):
                     chunk_raw = b"".join(buf_lines)
-
                     # Compress only if worth it and large enough
                     if compress and len(chunk_raw) >= min_compress_bytes:
                         try:
                             compressed = _gzip.compress(chunk_raw, compresslevel=gzip_level)
-                            # If compression expanded data, send raw instead
                             if len(compressed) < len(chunk_raw):
                                 chunk_out = compressed
-                                # mark that chunk is compressed by prefixing a tiny header? We don't need to mark; it's concatenated gzip members.
                             else:
                                 chunk_out = chunk_raw
                         except Exception as ce:
@@ -857,8 +823,9 @@ class Process_Data_Service:
                     except Exception:
                         pass
 
-                # If line itself is larger than chunk_bytes and buffer empty, yield it as its own chunk
+                # If single line itself is larger than chunk_bytes and buffer empty -> send it as its own chunk (no truncation)
                 if line_len > chunk_bytes and not buf_lines:
+                    _logger.info("Executor: encountered single row larger than chunk_bytes (%d bytes). Sending as single chunk.", line_len)
                     if compress and line_len >= min_compress_bytes:
                         try:
                             compressed = _gzip.compress(encoded_line, compresslevel=gzip_level)
@@ -867,18 +834,20 @@ class Process_Data_Service:
                             else:
                                 chunk_out = encoded_line
                         except Exception as ce:
-                            _logger.warning("Executor gzip.compress failed for large line, sending raw: %s", ce)
+                            _logger.warning("Executor gzip.compress failed for large single-line chunk, sending raw: %s", ce)
                             chunk_out = encoded_line
                     else:
                         chunk_out = encoded_line
+
                     yield chunk_out
                     try:
                         _gc.collect()
                     except Exception:
                         pass
+                    # continue to next row
                     continue
 
-                # append to buffer
+                # Otherwise append to buffer
                 buf_lines.append(encoded_line)
                 buf_bytes += line_len
 
@@ -1186,34 +1155,10 @@ class Process_Data_Service:
         """
         Write `spark_df` in multiple smaller files by splitting on a stable hash of EventIndex.
 
-        Key behavior:
-        - Break the DataFrame into `num_buckets` hash buckets using hash(EventIndex) % num_buckets.
-        - Process buckets sequentially to keep peak memory low.
-        - For each bucket:
-            1) quick empty-check (limit(1).count())
-            2) attempt bucket_df.coalesce(1).write.csv(tmp_bucket_dir) if bucket_coalesce True
-            3) if that fails (or bucket_coalesce False), try bucket_df.write.csv(tmp_bucket_dir)
-            4) if that fails and allow_bucket_fallback_to_chunked True, call
-                Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019()
-                for that bucket to produce a single part CSV under tmp_bucket_dir
-            5) promote the produced part-*.csv to output_dir/part-{bucket:05d}.csv
-        - ETA estimation: after each finished bucket we update a moving-average bucket duration and estimate remaining time.
-        - Robust: a failing bucket does not abort the whole run — it is skipped after logging (you can change this behavior).
-        - Returns list of produced file paths.
-
-        Parameters:
-        - spark_df: Spark DataFrame (must contain column "EventIndex")
-        - output_dir: directory where final part-*.csv files will appear
-        - spark: SparkSession
-        - num_buckets: number of buckets (higher -> smaller per-bucket work)
-        - bucket_coalesce: attempt coalesce(1) inside each small bucket first (fast when bucket is small)
-        - allow_bucket_fallback_to_chunked: if True, fallback per-bucket to streaming single-file writer
-        - progress_log_every: log aggregate progress every N buckets
-        - sample_for_bucket_size: if True, sample dataframe to estimate bucket sizes and bias ETA (optional)
-        - sample_fraction: sampling fraction if sampling enabled
-
-        Returns:
-        - produced_files: list[str] of moved part file paths (one per successful bucket)
+        Behavior notes:
+        - For each bucket a part CSV is created and then compressed to part-{i:05d}.csv.gz.
+        - Compression uses Python's gzip (streamed) with level from env PART_FILE_GZIP_LEVEL (1-9, default 9).
+        - Returns list of produced compressed file paths.
         """
         import os
         import shutil
@@ -1221,6 +1166,7 @@ class Process_Data_Service:
         import logging
         import traceback
         import time
+        import gzip
         from math import ceil
         from pyspark.sql import functions as _F
 
@@ -1240,26 +1186,28 @@ class Process_Data_Service:
         total_buckets = int(num_buckets)
         produced_files = []
 
+        # Compression settings (streamed gzip)
+        try:
+            gzip_level = int(os.getenv("PART_FILE_GZIP_LEVEL", "9"))
+            if gzip_level < 1 or gzip_level > 9:
+                gzip_level = 9
+        except Exception:
+            gzip_level = 9
+
         # Optional lightweight bucket-size estimation (sample-based)
         bucket_row_estimates = None
         if sample_for_bucket_size:
             try:
                 logger.info("Sampling %s fraction to estimate bucket sizes for ETA weighting", sample_fraction)
                 sample_df = spark_df.sample(withReplacement=False, fraction=float(sample_fraction))
-                # compute distribution of sample per hashed bucket
                 sample_counts = (
                     sample_df.withColumn("_bucket", (hash_col_expr % _F.lit(total_buckets)))
                     .groupBy("_bucket")
                     .count()
                     .collect()
                 )
-                # build dict bucket -> sample_count
                 sample_map = {int(r["_bucket"]): int(r["count"]) for r in sample_counts}
-                # estimate multiplier to scale sample counts to full counts
-                sample_count_total = sum(sample_map.values()) if sample_map else 0
-                if sample_count_total > 0:
-                    scale = max(1.0, (float(sample_fraction) * (spark_df.count() if hasattr(spark_df, 'count') else sample_count_total) ))
-                    # Keep simple: store sample_map for rough ETA hints (not used in strict calculation)
+                if sample_map:
                     bucket_row_estimates = sample_map
                     logger.info("Bucket size sampling collected (%d buckets sampled).", len(sample_map))
                 else:
@@ -1283,6 +1231,39 @@ class Process_Data_Service:
             except Exception:
                 return str(secs)
 
+        # helper: compress a file to .gz using streaming (low memory)
+        def _compress_file_stream(src_path: str, compresslevel: int = 9) -> str:
+            """
+            Compress `src_path` to `src_path + '.gz'` using streaming copy; remove src_path on success.
+            Returns path to compressed file on success; raises on fatal errors.
+            """
+            gz_path = src_path + ".gz"
+            tmp_gz = gz_path + ".part"
+            try:
+                with open(src_path, "rb") as f_in, gzip.open(tmp_gz, "wb", compresslevel=compresslevel) as f_out:
+                    shutil.copyfileobj(f_in, f_out, length=64 * 1024)
+                # atomic replace
+                try:
+                    if os.path.exists(gz_path):
+                        os.remove(gz_path)
+                except Exception:
+                    pass
+                os.replace(tmp_gz, gz_path)
+                # remove original file
+                try:
+                    os.remove(src_path)
+                except Exception as e_rm:
+                    logger.debug("Could not remove original file after compression %s: %s", src_path, e_rm)
+                return gz_path
+            except Exception as ce:
+                # cleanup partial gz
+                try:
+                    if os.path.exists(tmp_gz):
+                        os.remove(tmp_gz)
+                except Exception:
+                    pass
+                raise
+
         # iterate buckets sequentially
         for i in range(total_buckets):
             bucket_num = i
@@ -1298,7 +1279,6 @@ class Process_Data_Service:
                 try:
                     is_empty = bucket_df.limit(1).count() == 0
                 except Exception:
-                    # fallback: try to estimate emptiness differently (treat as non-empty)
                     is_empty = False
 
                 if is_empty:
@@ -1355,7 +1335,6 @@ class Process_Data_Service:
                     write_attempts += 1
                     try:
                         logger.info("Bucket %s: falling back to chunked driver streaming writer", bucket_label)
-                        # Optionally repartition bucket to small count to reduce executor memory pressure
                         try:
                             small_repart = min(max(1, total_buckets // 8), 64)
                             bucket_df = bucket_df.repartition(small_repart)
@@ -1392,12 +1371,14 @@ class Process_Data_Service:
                 # Promote produced part file to canonical name part-{i:05d}.csv in output_dir
                 try:
                     found = glob.glob(os.path.join(tmp_bucket_dir, "part-*.csv")) or glob.glob(os.path.join(tmp_bucket_dir, "**", "part-*.csv"), recursive=True)
+                    promoted_dest = None
                     if not found:
+                        # streaming-produced file scenario
                         streaming_file = os.path.join(tmp_bucket_dir, f"part-{i:05d}.csv")
                         if os.path.exists(streaming_file):
                             dest_path = os.path.join(output_dir, f"part-{i:05d}.csv")
                             shutil.move(streaming_file, dest_path)
-                            produced_files.append(dest_path)
+                            promoted_dest = dest_path
                             logger.info("Bucket %s: moved streaming-produced file -> %s", bucket_label, dest_path)
                         else:
                             logger.warning("Bucket %s: no part-*.csv found in tmp dir %s (listing=%s).", bucket_label, tmp_bucket_dir, os.listdir(tmp_bucket_dir))
@@ -1407,15 +1388,38 @@ class Process_Data_Service:
                         try:
                             if os.path.exists(dest):
                                 os.remove(dest)
+                        except Exception:
+                            pass
+                        try:
                             shutil.move(src, dest)
                         except Exception:
-                            shutil.copy2(src, dest)
+                            # fallback copy & remove
                             try:
-                                os.remove(src)
-                            except Exception:
-                                pass
-                        produced_files.append(dest)
-                        logger.info("Bucket %s: promoted %s -> %s", bucket_label, src, dest)
+                                shutil.copy2(src, dest)
+                                try:
+                                    os.remove(src)
+                                except Exception:
+                                    pass
+                            except Exception as e_copy:
+                                logger.warning("Bucket %s: failed to move/copy part file %s -> %s: %s", bucket_label, src, dest, e_copy)
+                                dest = None
+                        if dest:
+                            promoted_dest = dest
+                            logger.info("Bucket %s: promoted %s -> %s", bucket_label, src, dest)
+
+                    # If a destination was placed, compress it to .gz (streaming copy)
+                    if promoted_dest:
+                        try:
+                            logger.info("Bucket %s: compressing promoted file %s -> %s.gz (gzip_level=%d)", bucket_label, promoted_dest, promoted_dest, gzip_level)
+                            gz_path = _compress_file_stream(promoted_dest, compresslevel=gzip_level)
+                            produced_files.append(gz_path)
+                            logger.info("Bucket %s: compression succeeded -> %s", bucket_label, gz_path)
+                        except Exception as ce:
+                            # If compression fails, keep the uncompressed file and include it in produced_files
+                            logger.exception("Bucket %s: compression failed for %s: %s. Keeping uncompressed file.", bucket_label, promoted_dest, ce)
+                            produced_files.append(promoted_dest)
+                    else:
+                        logger.warning("Bucket %s: nothing promoted for compression step.", bucket_label)
 
                     # cleanup tmp dir
                     try:
@@ -1424,7 +1428,7 @@ class Process_Data_Service:
                         pass
 
                 except Exception as e_prom:
-                    logger.exception("Bucket %s: failed during promotion: %s", bucket_label, e_prom)
+                    logger.exception("Bucket %s: failed during promotion/compression: %s", bucket_label, e_prom)
 
                 # Mark bucket completed and update ETA
                 processed_buckets += 1

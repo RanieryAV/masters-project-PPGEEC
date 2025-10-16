@@ -1,6 +1,6 @@
-summary: "[PART 2] Process Pitsikalis 2019 labels data for recognised composite events"
+summary: "[PART 5] Process Pitsikalis 2019 labels data for recognised composite events"
 description: |
-  Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with *TRANSSHIPMENT* data ("ais_transshipment_events_Pitsikalis_2019"),
+  Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with *LOITERING* data ("ais_loitering_events_Pitsikalis_2019"),
   filter and transform the data:
 
   - Filter by certain FluentName types
