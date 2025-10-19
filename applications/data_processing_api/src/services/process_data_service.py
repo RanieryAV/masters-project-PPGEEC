@@ -1150,7 +1150,9 @@ class Process_Data_Service:
         allow_bucket_fallback_to_chunked: bool = True,
         progress_log_every: int = 10,
         sample_for_bucket_size: bool = False,
-        sample_fraction: float = 0.01
+        sample_fraction: float = 0.01,
+        compress_parts: bool = True,              # NEW: if False, do not gzip promoted part files
+        max_buckets_to_process: int = 0,  # NEW: if >0, limit number of buckets to process then stop
     ):
         """
         Write `spark_df` in multiple smaller files by splitting on a stable hash of EventIndex.
@@ -1159,6 +1161,14 @@ class Process_Data_Service:
         - For each bucket a part CSV is created and then compressed to part-{i:05d}.csv.gz.
         - Compression uses Python's gzip (streamed) with level from env PART_FILE_GZIP_LEVEL (1-9, default 9).
         - Returns list of produced compressed file paths.
+
+        New parameters:
+        - compress_parts: bool = True
+          If False, the function will skip gzip compression and keep promoted part-{i:05d}.csv files as-is.
+        - max_buckets_to_process: int = 0
+          If > 0, only the first `max_buckets_to_process` buckets will be processed
+          (remaining buckets are skipped) and execution will continue after the
+          bucket loop as normal.
         """
         import os
         import shutil
@@ -1171,7 +1181,7 @@ class Process_Data_Service:
         from pyspark.sql import functions as _F
 
         logger = logging.getLogger(__name__)
-        logger.info("save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019: start (num_buckets=%d)", num_buckets)
+        logger.info("save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019: start (num_buckets=%d max_buckets_to_process=%d compress_parts=%s)", num_buckets, max_buckets_to_process, compress_parts)
 
         # ensure output dir exists
         try:
@@ -1294,6 +1304,10 @@ class Process_Data_Service:
                         bucket_label, processed_buckets, total_buckets, (processed_buckets/total_buckets)*100.0,
                         avg, _format_secs(eta)
                     )
+                    # check early-stop limit
+                    if max_buckets_to_process and processed_buckets >= max_buckets_to_process:
+                        logger.info("Reached processing limit %d, stopping early.", max_buckets_to_process)
+                        break
                     continue
 
                 # temp dir for bucket
@@ -1366,6 +1380,10 @@ class Process_Data_Service:
                     avg = sum(bucket_durations) / len(bucket_durations) if bucket_durations else 0.0
                     logger.error("Bucket %s: all write attempts failed (attempts=%d). Skipping bucket.", bucket_label, write_attempts)
                     logger.info("Progress: %d/%d (%.2f%%). Avg bucket=%.2fs ETA=%s", processed_buckets, total_buckets, (processed_buckets/total_buckets)*100.0, avg, _format_secs(avg * remaining))
+                    # check early-stop limit
+                    if max_buckets_to_process and processed_buckets >= max_buckets_to_process:
+                        logger.info("Reached processing limit %d, stopping early.", max_buckets_to_process)
+                        break
                     continue
 
                 # Promote produced part file to canonical name part-{i:05d}.csv in output_dir
@@ -1407,13 +1425,17 @@ class Process_Data_Service:
                             promoted_dest = dest
                             logger.info("Bucket %s: promoted %s -> %s", bucket_label, src, dest)
 
-                    # If a destination was placed, compress it to .gz (streaming copy)
+                    # If a destination was placed, compress it to .gz (streaming copy) unless compression disabled
                     if promoted_dest:
                         try:
-                            logger.info("Bucket %s: compressing promoted file %s -> %s.gz (gzip_level=%d)", bucket_label, promoted_dest, promoted_dest, gzip_level)
-                            gz_path = _compress_file_stream(promoted_dest, compresslevel=gzip_level)
-                            produced_files.append(gz_path)
-                            logger.info("Bucket %s: compression succeeded -> %s", bucket_label, gz_path)
+                            if compress_parts:
+                                logger.info("Bucket %s: compressing promoted file %s -> %s.gz (gzip_level=%d)", bucket_label, promoted_dest, promoted_dest, gzip_level)
+                                gz_path = _compress_file_stream(promoted_dest, compresslevel=gzip_level)
+                                produced_files.append(gz_path)
+                                logger.info("Bucket %s: compression succeeded -> %s", bucket_label, gz_path)
+                            else:
+                                logger.info("Bucket %s: compression disabled, keeping promoted file %s", bucket_label, promoted_dest)
+                                produced_files.append(promoted_dest)
                         except Exception as ce:
                             # If compression fails, keep the uncompressed file and include it in produced_files
                             logger.exception("Bucket %s: compression failed for %s: %s. Keeping uncompressed file.", bucket_label, promoted_dest, ce)
@@ -1446,6 +1468,11 @@ class Process_Data_Service:
                     len(produced_files), bucket_elapsed, avg_bucket, _format_secs(eta_seconds), elapsed_total
                 )
 
+                # check early-stop limit
+                if max_buckets_to_process and processed_buckets >= max_buckets_to_process:
+                    logger.info("Reached processing limit %d, stopping early.", max_buckets_to_process)
+                    break
+
                 if processed_buckets % progress_log_every == 0:
                     logger.info("Overall progress: %d/%d buckets (%.2f%%). Avg bucket=%.2fs ETA=%s. Files produced=%d",
                                 processed_buckets, total_buckets, (processed_buckets/total_buckets)*100.0,
@@ -1459,6 +1486,10 @@ class Process_Data_Service:
                 avg_bucket = sum(bucket_durations) / len(bucket_durations) if bucket_durations else 0.0
                 eta_seconds = avg_bucket * (total_buckets - processed_buckets)
                 logger.info("Progress after exception: %d/%d (%.2f%%). Avg bucket=%.2fs ETA=%s", processed_buckets, total_buckets, (processed_buckets/total_buckets)*100.0, avg_bucket, _format_secs(eta_seconds))
+                # check early-stop limit
+                if max_buckets_to_process and processed_buckets >= max_buckets_to_process:
+                    logger.info("Reached processing limit %d, stopping early.", max_buckets_to_process)
+                    break
                 continue
 
         # final chmod/chown best-effort
@@ -2391,6 +2422,10 @@ class Process_Data_Service:
                     .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
                     .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
+        # NEW: lat/lon arrays for distance computation (haversine)
+        df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+               .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
         # time diffs array (seconds)
         df = df.withColumn(
             "time_diffs",
@@ -2446,6 +2481,25 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
+        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        # Uses element_at(lat_array, i) 1-based indexing and sums distances between consecutive pairs
+        df = df.withColumn(
+            "distance_in_kilometers",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+                "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+            ).cast(DoubleType())
+        )
+
+        # NEW: average_time_diff_between_consecutive_points (seconds)
+        df = df.withColumn(
+            "average_time_diff_between_consecutive_points",
+            F.expr(
+                "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE aggregate(time_diffs, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs) as double) END"
+            ).cast(DoubleType())
+        )
+
         # 8) Stringify array columns so CSV datasource accepts them:
         # timestamp_array -> [YYYY-MM-DD HH:MM:SS, None, ...]  (no quotes around timestamps)
         ts_array_to_str_expr = (
@@ -2479,10 +2533,17 @@ class Process_Data_Service:
             F.col("std_dev_heading"),
             F.col("total_area_time"),
             F.col("low_speed_percentage"),
-            F.col("stagnation_time")
+            F.col("stagnation_time"),
+            # NEW fields included:
+            F.col("distance_in_kilometers"),
+            F.col("average_time_diff_between_consecutive_points"),
+            F.col("min_heading"),
+            F.col("max_heading"),
+            F.col("std_dev_speed")
         )
 
         return result
+
         
     def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
         events_df: DataFrame,
@@ -2586,6 +2647,10 @@ class Process_Data_Service:
                     .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
                     .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
+        # NEW: lat/lon arrays for distance computation (haversine)
+        df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+               .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
         # time_diffs in milliseconds: difference between consecutive ts entries
         df = df.withColumn(
             "time_diffs_ms",
@@ -2677,6 +2742,24 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
+        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        df = df.withColumn(
+            "distance_in_kilometers",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+                "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+            ).cast(DoubleType())
+        )
+
+        # NEW: average_time_diff_between_consecutive_points (seconds) — time_diffs_ms -> /1000.0
+        df = df.withColumn(
+            "average_time_diff_between_consecutive_points",
+            F.expr(
+                "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE (aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double)) / 1000.0 END"
+            ).cast(DoubleType())
+        )
+
         # --- 9) Build trajectory LINESTRING('lon lat', ...) ---
         df = df.withColumn(
             "trajectory",
@@ -2711,11 +2794,18 @@ class Process_Data_Service:
             F.col("total_area_time"),
             F.col("low_speed_percentage"),
             F.col("stagnation_time"),
+            # NEW fields included:
+            F.col("distance_in_kilometers"),
+            F.col("average_time_diff_between_consecutive_points"),
+            F.col("min_heading"),
+            F.col("max_heading"),
+            F.col("std_dev_speed"),
         )
 
         logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
-        
+
         return result
+
     
     
     ######################## END ########################

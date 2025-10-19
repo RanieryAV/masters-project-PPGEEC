@@ -427,7 +427,9 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
             bucket_coalesce=True,
             allow_bucket_fallback_to_chunked=True,
             progress_log_every=int(os.getenv("BUCKET_PROGRESS_LOG_EVERY", "20")),
-            sample_for_bucket_size=False
+            sample_for_bucket_size=False,
+            max_buckets_to_process=10,
+            compress_parts=False
         )
 
         logger.info(f"AGGREGATED Normal events saved to '{aggregated_normal_output_path}'")
@@ -558,7 +560,9 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
             bucket_coalesce=True,
             allow_bucket_fallback_to_chunked=True,
             progress_log_every=int(os.getenv("BUCKET_PROGRESS_LOG_EVERY", "20")),
-            sample_for_bucket_size=False
+            sample_for_bucket_size=False,
+            max_buckets_to_process=10,
+            compress_parts=False
         )
         logger.info(f"AGGREGATED Stopping events saved to '{aggregated_stopping_output_path}'")
 
@@ -685,7 +689,9 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
             bucket_coalesce=True,
             allow_bucket_fallback_to_chunked=True,
             progress_log_every=int(os.getenv("BUCKET_PROGRESS_LOG_EVERY", "20")),
-            sample_for_bucket_size=False
+            sample_for_bucket_size=False,
+            max_buckets_to_process=10,
+            compress_parts=False
         )
         logger.info(f"AGGREGATED Loitering events saved to '{aggregated_loitering_output_path}'")
 
