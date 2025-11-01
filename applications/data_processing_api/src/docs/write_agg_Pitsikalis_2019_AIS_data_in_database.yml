@@ -1,0 +1,109 @@
+summary: "Write aggregated Pitsikalis 2019 AIS data into the database"
+description: |
+  Reads aggregated Pitsikalis 2019 AIS CSV files from the processed output folders and writes them into the database.
+
+  Behavior / steps performed:
+    1. Initialize a Spark session via `Process_Data_Service.init_spark_session`.
+    2. Determine the input base directory depending on whether the service is running in a container:
+       - container: `/app/processed_output`
+       - non-container: `shared/utils/processed_output`
+    3. Iterate through the following aggregated directories (expected to exist under the input base directory):
+       - `agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES`
+       - `agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES`
+       - `agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES`
+       - `agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES`
+    4. For each CSV file found in those directories:
+       - Read it into a Spark DataFrame (`header=True`, `inferSchema=True`).
+       - Strip whitespace from column names.
+       - Call `Process_Data_Service.write_aggregated_Pitsikalis_2019_AIS_data_to_database(ais_spark_df)` to persist the data.
+    5. Stop the Spark session and return a success response.
+
+  Notes:
+    - If any expected directory contains no CSV files, the endpoint raises an error (FileNotFoundError).
+    - This endpoint does not require a request body; it processes files from the server filesystem.
+tags:
+  - "Writing to database - Aggregated Pitsikalis 2019 AIS data"
+produces:
+  - "application/json"
+consumes:
+  - "application/json"
+
+parameters:
+  - in: "body"
+    name: "body"
+    description: "No request body required. Endpoint processes a fixed set of aggregated CSV files found on the server."
+    required: false
+    schema:
+      type: "object"
+      properties: {}
+      example: {}
+
+responses:
+  200:
+    description: "Aggregated AIS CSV files processed and written to database."
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              example: "success"
+            message:
+              type: string
+              example: "Aggregated Pitsikalis 2019 AIS data written to database."
+            processed_directories:
+              type: array
+              items:
+                type: string
+              example:
+                - "agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+                - "agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+                - "agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+                - "agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+            files_written_count:
+              type: integer
+              description: "Total number of CSV files successfully written to database during this run."
+              example: 8
+
+  400:
+    description: "Bad request. Input parameters invalid (if any)."
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Invalid input"
+
+  404:
+    description: "Not Found. One or more expected aggregated directories do not contain CSV files."
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              example: "error"
+            message:
+              type: string
+              example: "No CSV files found in directory: shared/utils/processed_output/agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+
+  500:
+    description: "Server error while writing aggregated Pitsikalis 2019 AIS data to database."
+    content:
+      application/json:
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              example: "error"
+            message:
+              type: string
+              example: "An error occurred while writing aggregated Pitsikalis 2019 AIS data to the database."
+            traceback:
+              type: string
+              example: "Traceback (most recent call last): ..."

@@ -1,14 +1,33 @@
+# Dockerfile.data_processing_api
+
 FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential gcc gfortran libopenblas-dev liblapack-dev \
+        python3-dev pkg-config libssl-dev libffi-dev openjdk-21-jdk && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create spark user/group
+ARG SPARK_UID=1001
+ARG SPARK_GID=1001
+RUN groupadd -g ${SPARK_GID} spark && \
+    useradd --create-home --uid ${SPARK_UID} --gid ${SPARK_GID} spark
 
 WORKDIR /app
 
-COPY ./applications/data_processing_api .
-COPY ./domain/ ./domain/
+# Copy code with ownership to spark
+COPY --chown=spark:spark ./applications/data_processing_api ./
+COPY --chown=spark:spark ./domain ./domain/
 
-# Install Python dependencies using pip
+RUN chmod +x entrypoint.sh
+
 RUN pip install -r ./data-processing-api-requirements.txt
 
-# Expose the port the app runs on
+# Use spark user at runtime
+USER spark
+
 EXPOSE ${FLASK_DATA_PROCESSING_PORT}
 
+ENTRYPOINT ["./entrypoint.sh"]
 CMD ["python3", "run.py"]

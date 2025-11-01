@@ -1,5 +1,18 @@
 FROM python:3.11-slim
 
+# Install system build dependencies (for numpy, pandas, etc.)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        gfortran \
+        libopenblas-dev \
+        liblapack-dev \
+        python3-dev \
+        pkg-config \
+        libssl-dev \
+        libffi-dev 
+
 WORKDIR /app
 
 COPY ./applications/model_training_api .

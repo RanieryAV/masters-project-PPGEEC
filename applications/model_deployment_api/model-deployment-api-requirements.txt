@@ -4,7 +4,8 @@ psycopg2-binary==2.9.9
 flasgger==0.9.7b2
 python-dotenv==1.0.1
 scikit-learn==1.3.0
-numpy==1.22.2
+numpy
+pandas
 mlflow==2.14.2
 folium==0.17.0
 geopy==2.4.1

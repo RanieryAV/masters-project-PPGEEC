@@ -1,0 +1,85 @@
+summary: "[PART 1] Process Pitsikalis 2019 labels data for recognised composite events"
+description: |
+  Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with labels data ("Pitsikalis_2019_filtered_fluentname_data_v2"),
+  filter and transform the data:
+
+  - Filter by certain FluentName types
+  - Convert T_start and T_end from UNIX epoch to timestamps
+  - Map FluentName to categories
+  - Add an EventIndex
+  - Save the processed data in two separate files: one for transshipment events ("ais_transshipment_events") and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events")
+
+tags:
+  - "Data Processing - Maritime Composite Events"
+
+produces:
+  - "application/json"
+consumes:
+  - "application/json"
+
+parameters:
+  - in: "body"
+    name: "body"
+    description: "No request body required for this endpoint. The endpoint processes a fixed dataset (ais_brest_locations.csv) using configuration from environment and server setup."
+    required: false
+    schema:
+      type: "object"
+      properties: {}
+      example: {}
+
+responses:
+  200:
+    content:
+      application/json:
+      schema:
+        type: "object"
+        properties:
+        status:
+          type: "string"
+          example: "success"
+        message:
+          type: "string"
+          example: "Transshipment events processed and saved."
+        relevant_transship_mmsi:
+          type: "array"
+          items:
+          type: "object"
+          properties:
+            MMSI:
+            type: "integer"
+            example: 228843000
+            MMSI_2:
+            type: "integer"
+            example: 228138000
+          example:
+          - MMSI: 228843000
+            MMSI_2: 228138000
+          - MMSI: 227635210
+            MMSI_2: 227705102
+          - MMSI: 227635210
+            MMSI_2: 227705102
+
+  400:
+    description: "Bad request. Input parameters invalid (if any)."
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: "Invalid input"
+
+  500:
+    description: "Server error during Pitsikalis 2019 AIS data processing (PART 1)."
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: "An error occurred while processing the Pitsikalis 2019 AIS data (PART 1)."
+            traceback:
+              type: "string"
+              example: "Detailed error stacktrace here"
