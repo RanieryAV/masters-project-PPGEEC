@@ -2542,6 +2542,9 @@ class Process_Data_Service:
             F.col("std_dev_speed")
         )
 
+        # Rename mmsi to id for consistency with NON-TRANSSHIPMENT
+        result = result.withColumnRenamed("mmsi", "id")
+        
         return result
 
         

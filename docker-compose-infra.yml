@@ -55,6 +55,7 @@ services:
             "password": "${POSTGRES_PASSWORD}"
           }
         ]
+      JAVA_OPTS: "-Xms512m -Xmx6144m -XX:+UseG1GC"
     ports:
       - 8083:8978
     volumes:
@@ -109,6 +110,7 @@ services:
       - spark-events:/opt/spark-events
       - ./shared/utils/datasets:/app/datasets
       - ./shared/utils/processed_output:/app/processed_output
+      - /infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     networks:
       - captaima-network
 
@@ -144,6 +146,7 @@ services:
       - spark-events:/opt/spark-events
       - ./shared/utils/datasets:/app/datasets
       - ./shared/utils/processed_output:/app/processed_output
+      - /infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     networks:
       - captaima-network
 
@@ -179,6 +182,7 @@ services:
       - spark-events:/opt/spark-events
       - ./shared/utils/datasets:/app/datasets
       - ./shared/utils/processed_output:/app/processed_output
+      - /infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     networks:
       - captaima-network
   
@@ -214,6 +218,7 @@ services:
   #     - spark-events:/opt/spark-events
   #     - ./shared/utils/datasets:/app/datasets
   #     - ./shared/utils/processed_output:/app/processed_output
+  #    - /infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
   #   networks:
   #     - captaima-network
 

@@ -6,6 +6,7 @@ from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
 from ..services.process_data_service import Process_Data_Service
+from domain.services.save_ais_data_service import SaveAISDataService
 import glob
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
@@ -556,7 +557,7 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
             spark_df=result_df,
             output_dir=aggregated_stopping_output_path,
             spark=spark,
-            num_buckets=int(os.getenv("BUCKETS_FOR_LARGE_WRITE", "400")),
+            num_buckets=int(os.getenv("BUCKETS_FOR_LARGE_WRITE", "2000")),
             bucket_coalesce=True,
             allow_bucket_fallback_to_chunked=True,
             progress_log_every=int(os.getenv("BUCKET_PROGRESS_LOG_EVERY", "20")),
@@ -685,7 +686,7 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
             spark_df=result_df,
             output_dir=aggregated_loitering_output_path,
             spark=spark,
-            num_buckets=int(os.getenv("BUCKETS_FOR_LARGE_WRITE", "400")),
+            num_buckets=int(os.getenv("BUCKETS_FOR_LARGE_WRITE", "2000")),
             bucket_coalesce=True,
             allow_bucket_fallback_to_chunked=True,
             progress_log_every=int(os.getenv("BUCKET_PROGRESS_LOG_EVERY", "20")),
@@ -776,3 +777,60 @@ def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
         logger.error("Error loading or processing events data", exc_info=True)
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500    
+    
+@swag_from(path.join(path.dirname(__file__), '../docs/write_agg_Pitsikalis_2019_AIS_data_in_database.yml'))
+@preprocess_data_bp.route('/write-agg-Pitsikalis-2019-AIS-data-in-database', methods=['POST'])
+def write_agg_Pitsikalis_2019_AIS_data_in_database():
+    """
+    Writes the aggregated Pitsikalis 2019 AIS data into the database.
+    This endpoint expects a POST request and performs the following steps:
+    1. Initializes a Spark session.
+    2. Determines input directory based on whether the code is running in a container.
+    3. Loads aggregated AIS data CSV files from predefined directories.
+    4. For each CSV file, reads the data into a Spark DataFrame and writes it to the database using a service function.
+    5. Stops the Spark session and returns a success response.
+    """
+    logger.info("Received request at /write-agg-Pitsikalis-2019-AIS-data-in-database")
+
+    try:
+        spark = Process_Data_Service.init_spark_session("Write_Agg_Pitsikalis_2019_AIS_Data_In_Database_[Data_Processing_API]")
+        # === Paths / environment choices ===
+        is_container = Process_Data_Service._is_running_in_container()
+
+        if is_container:
+            input_dir = "/app/processed_output"
+        else:
+            input_dir = "shared/utils/processed_output"
+
+        # Get aggregated events
+        aggregated_AIS_dir_names = [#"agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"]
+        
+        for dir_name in aggregated_AIS_dir_names:
+            aggregated_AIS_dir = os.path.join(input_dir, dir_name)
+            csv_files = glob.glob(os.path.join(aggregated_AIS_dir, "*.csv"))
+            if not csv_files:
+                raise FileNotFoundError(f"No CSV files found in directory: {aggregated_AIS_dir}")
+            
+            for individual_aggregated_AIS_csv_file in csv_files:
+                logger.info(f"Loading aggregated events labels from {individual_aggregated_AIS_csv_file}")
+
+                ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(individual_aggregated_AIS_csv_file)
+                ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
+
+                # Write to database
+                SaveAISDataService.upsert_aggregated_ais_spark_df_to_db(ais_spark_df)
+                logger.info(f"Written aggregated data from '{individual_aggregated_AIS_csv_file}' to database.")
+        
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "Aggregated Pitsikalis 2019 AIS data written to database."
+        }), 200
+    except Exception as e:
+        logger.error("Error processing aggregated Pitsikalis 2019 AIS data", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
