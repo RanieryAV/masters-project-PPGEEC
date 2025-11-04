@@ -2367,13 +2367,13 @@ class Process_Data_Service:
         ais = ais.toDF(*[c.strip() for c in ais.columns])
         ais = ais.withColumn("id", F.col("id").cast(StringType()))
 
-        # timestamp heuristic: numeric => ms => seconds; else unix_timestamp
+        # timestamp heuristic: numeric => already ms; else unix_timestamp * 1000 -> milliseconds
         ais = ais.withColumn(
-            "_ts_seconds",
+            "_ts_millis",
             F.when(
-                F.col("timestamp").cast("double").isNotNull() & F.col("timestamp").rlike("^[0-9]+$"),
-                (F.col("timestamp").cast("double") / F.lit(1000.0)).cast("long"),
-            ).otherwise(F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long"))
+                (F.col("timestamp").cast("double").isNotNull()) & F.col("timestamp").rlike("^[0-9]+$"),
+                F.col("timestamp").cast("long"),
+            ).otherwise((F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000)))
         ).withColumn("latitude", F.col("latitude").cast(DoubleType())) \
         .withColumn("longitude", F.col("longitude").cast(DoubleType())) \
         .withColumn("speed", F.col("speed").cast(DoubleType())) \
@@ -2386,13 +2386,19 @@ class Process_Data_Service:
             logger.debug("could not obtain ais partitions")
 
         # 3) Join AIS → events by mmsi and timestamp window
-        events_bounds = events_exp.withColumn("t_start_s", F.unix_timestamp(F.col("T_start")).cast(LongType())) \
-                                .withColumn("t_end_s", F.unix_timestamp(F.col("T_end")).cast(LongType()))
+        # use milliseconds for event bounds to match AIS _ts_millis
+        events_bounds = events_exp.withColumn(
+            "t_start_ms",
+            (F.unix_timestamp(F.col("T_start")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+        ).withColumn(
+            "t_end_ms",
+            (F.unix_timestamp(F.col("T_end")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+        )
 
         join_cond = (
             (ais.id == events_bounds.mmsi) &
-            (ais._ts_seconds >= events_bounds.t_start_s) &
-            (ais._ts_seconds <= events_bounds.t_end_s)
+            (ais._ts_millis >= events_bounds.t_start_ms) &
+            (ais._ts_millis <= events_bounds.t_end_ms)
         )
 
         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
@@ -2400,7 +2406,7 @@ class Process_Data_Service:
             events_bounds.EventIndex.alias("EventIndex"),
             events_bounds.mmsi.alias("mmsi"),
             events_bounds.Category.alias("Category"),
-            ais._ts_seconds.alias("ts"),
+            ais._ts_millis.alias("ts"),
             ais.longitude.alias("lon"),
             ais.latitude.alias("lat"),
             ais.speed.alias("sog"),
@@ -2418,15 +2424,15 @@ class Process_Data_Service:
 
         # 5) Compute arrays and stats from points
         df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
-                    .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")) \
-                    .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
-                    .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+            .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")) \
+            .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+            .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
         # NEW: lat/lon arrays for distance computation (haversine)
         df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
                .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
 
-        # time diffs array (seconds)
+        # time diffs array (milliseconds)
         df = df.withColumn(
             "time_diffs",
             F.expr(
@@ -2492,7 +2498,7 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (seconds)
+        # NEW: average_time_diff_between_consecutive_points (milliseconds)
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
