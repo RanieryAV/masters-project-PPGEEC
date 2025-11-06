@@ -1,14 +1,18 @@
-from applications.data_processing_api.src.services.process_data_service import Process_Data_Service
 import os
+import socket
 import logging
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 from pyspark.sql import functions as F
 from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
-class Prediction_Service:
+class PredictionService:
 
+    ### BELOW ARE DB QUERYING AND SLIDING WINDOW FUNCTIONS ###
     def query_aggregated_ais_covering_interval(
-        spark: SparkSession,
+        spark,
         mmsi: str,
         start_date_str: str,
         end_date_str: str,
@@ -19,33 +23,31 @@ class Prediction_Service:
         """
         Read aggregated_ais_data rows for a given mmsi from Postgres via JDBC (uses provided spark),
         compute traj_start/traj_end from the (already time-sorted) `timestamp_array` column,
-        and return a Spark DataFrame with only rows where the user's interval is fully contained:
-            traj_start <= start_date  AND  traj_end >= end_date
+        and return either:
+        - The single smallest aggregated trajectory that fully contains the user interval:
+                traj_start <= start_date  AND  traj_end >= end_date
+            (if any rows satisfy containment), OR
+        - Otherwise, ALL aggregated rows (for the mmsi) that are fully WITHIN the user interval:
+                traj_start >= start_date  AND  traj_end <= end_date
 
-        Parameters:
-        - spark: SparkSession (created by your existing init_spark_session; this function won't recreate it)
-        - mmsi: vessel mmsi string to filter on (string)
-        - start_date_str, end_date_str: ISO-like strings, e.g. "2015-10-02 05:06:00" or "2015-10-02T05:06:00"
-        - schema, table: DB schema and table name (defaults to captaima.aggregated_ais_data)
-        - jdbc_jar_path: relative or absolute path to the Postgres JDBC jar (you said it's at infrastructure/jars/...)
-
-        Returns:
-        - Spark DataFrame filtered to rows that fully contain the [start_date, end_date] interval.
+        Returned DataFrame contains original DB columns plus computed:
+        traj_start_ts, traj_end_ts, _duration_s, _ts_size
         """
+        import os
+        from pyspark.sql import functions as F
 
-        # --- 1) Ensure JDBC driver jar is available to executors/drivers ---
+        # 1) Ensure JDBC jar present
         try:
             jar_abspath = os.path.abspath(jdbc_jar_path)
-            # Add jar only if not already added (addJar is idempotent-ish)
             try:
                 spark.sparkContext.addJar(jar_abspath)
                 logger.info("Added JDBC jar to Spark classpath: %s", jar_abspath)
             except Exception as eadd:
-                logger.warning("Could not add JDBC jar via sparkContext.addJar (may already be on classpath): %s", eadd)
+                logger.debug("sparkContext.addJar non-fatal: %s", eadd)
         except Exception as e:
             logger.warning("Could not resolve JDBC jar path (%s): %s", jdbc_jar_path, e)
 
-        # --- 2) Build JDBC connection properties from env --------------------------------
+        # 2) JDBC connection props from env
         pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
         pg_port = os.getenv("POSTGRES_PORT", "5432")
         pg_db = os.getenv("POSTGRES_DB")
@@ -59,12 +61,12 @@ class Prediction_Service:
         jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
         mmsi_raw = "" if mmsi is None else str(mmsi)
         mmsi_escaped = mmsi_raw.replace("'", "''")
+        # mmsi is varchar -> keep quoted
         dbtable_subquery = f"(select * from {schema}.{table} where mmsi = '{mmsi_escaped}') as subq"
 
+        logger.info("Reading aggregated ais data for mmsi=%s from %s.%s via JDBC (looking for covering row or fallback within-rows)", mmsi, schema, table)
 
-        logger.info("Reading aggregated ais data for mmsi=%s from %s.%s via JDBC", mmsi, schema, table)
-
-        # --- 3) Read only the rows with the given mmsi (reduce network transfer) -----------
+        # 3) Read only rows for mmsi
         try:
             df = (
                 spark.read
@@ -74,24 +76,19 @@ class Prediction_Service:
                 .option("user", pg_user)
                 .option("password", pg_pass)
                 .option("driver", "org.postgresql.Driver")
-                # optional tuning: fetch size / pushdown (comment/uncomment if needed)
-                # .option("fetchsize", "1000")
                 .load()
             )
         except Exception as e:
             logger.exception("Failed to read aggregated_ais_data via JDBC: %s", e)
             raise
 
-        # Quick counts/log (avoid expensive count if DF is huge — still useful)
+        # quick partition hint
         try:
-            approx_count = df.rdd.getNumPartitions()  # cheap hint
-            logger.info("Read DataFrame with %d partitions (rows unknown until action).", approx_count)
+            logger.info("Read DataFrame for mmsi=%s with %d partitions", mmsi, df.rdd.getNumPartitions())
         except Exception:
             pass
 
-        # --- 4) Normalize timestamp_array: remove surrounding brackets and split by commas ---
-        # Assumption: timestamp_array is a string like: "[2015-10-02 05:06:37, 2015-10-02 05:06:58, ...]"
-        # And you said it's already time-sorted. We'll use element_at(..., 1) and last element (size).
+        # 4) Normalize timestamp_array -> array and compute first/last elements
         df2 = df.withColumn(
             "_ts_array_str",
             F.regexp_replace(F.col("timestamp_array").cast("string"), r"^\s*\[|\]\s*$", "")
@@ -103,86 +100,125 @@ class Prediction_Service:
             F.size(F.col("_ts_split"))
         )
 
-        # Convert first and last elements to timestamp type (assumes format 'yyyy-MM-dd HH:mm:ss')
-        # We'll be tolerant: try with provided format; fallback if parsing returns null (we keep simple here).
-        df2 = df2.withColumn(
-            "traj_start_ts",
-            F.to_timestamp(F.element_at(F.col("_ts_split"), F.lit(1)), "yyyy-MM-dd HH:mm:ss")
-        ).withColumn(
-            "traj_end_ts",
-            # element_at with size -> last element
-            F.to_timestamp(F.element_at(F.col("_ts_split"), F.col("_ts_size")), "yyyy-MM-dd HH:mm:ss")
+        # elements and normalization
+        first_elem = F.element_at(F.col("_ts_split"), F.lit(1))
+        last_elem = F.element_at(F.col("_ts_split"), F.col("_ts_size"))
+        first_norm = F.regexp_replace(first_elem, r"T", " ")
+        last_norm = F.regexp_replace(last_elem, r"T", " ")
+
+        traj_start_ts = F.coalesce(
+            F.to_timestamp(first_norm, "yyyy-MM-dd HH:mm:ss"),
+            F.to_timestamp(first_norm, "yyyy-MM-dd'T'HH:mm:ss"),
+            F.to_timestamp(first_norm)
+        )
+        traj_end_ts = F.coalesce(
+            F.to_timestamp(last_norm, "yyyy-MM-dd HH:mm:ss"),
+            F.to_timestamp(last_norm, "yyyy-MM-dd'T'HH:mm:ss"),
+            F.to_timestamp(last_norm)
         )
 
-        # If your timestamps use a different format (e.g. ISO with 'T'), normalize the input first:
-        # e.g. replace("T", " ") before to_timestamp. For now we attempt the common format above.
+        df2 = df2.withColumn("traj_start_ts", traj_start_ts).withColumn("traj_end_ts", traj_end_ts)
 
-        # --- 5) Build filter literals for user-provided start/end (make them timestamps) ---
-        # Accept both "YYYY-MM-DDTHH:MM:SS" and "YYYY-MM-DD HH:MM:SS"
+        # 5) prepare user-provided timestamp literals
         start_in = start_date_str.replace("T", " ")
         end_in = end_date_str.replace("T", " ")
-
-        # Use to_timestamp on literals so comparison is done in TimestampType domain
         start_ts_lit = F.to_timestamp(F.lit(start_in), "yyyy-MM-dd HH:mm:ss")
         end_ts_lit = F.to_timestamp(F.lit(end_in), "yyyy-MM-dd HH:mm:ss")
 
-        # --- 6) Filter for FULL CONTAINMENT: traj_start <= start_date AND traj_end >= end_date ---
-        filtered = df2.filter(
+        # 6) First: try FULL CONTAINMENT (covering rows)
+        contained = df2.filter(
             (F.col("traj_start_ts").isNotNull()) &
             (F.col("traj_end_ts").isNotNull()) &
             (F.col("traj_start_ts") <= start_ts_lit) &
             (F.col("traj_end_ts") >= end_ts_lit)
         )
 
-        # Log before/after counts reasonably: avoid .count() on huge DF unless you want to pay cost.
+        # compute duration and ts_size for ordering
+        contained = contained.withColumn(
+            "_duration_s",
+            (F.unix_timestamp(F.col("traj_end_ts")) - F.unix_timestamp(F.col("traj_start_ts")))
+        ).withColumn(
+            "_ts_size_int",
+            F.col("_ts_size").cast("long")
+        )
+
+        smallest_one = contained.orderBy(F.col("_duration_s").asc_nulls_last(), F.col("_ts_size_int").asc_nulls_last()).limit(1)
+
+        # If we found one covering row -> return it
         try:
-            total_rows = df.count()
-            kept_rows = filtered.count()
-            logger.info("mmsi=%s: rows read=%d, rows covering interval [%s, %s]=%d", mmsi, total_rows, start_in, end_in, kept_rows)
-        except Exception as ecount:
-            logger.info("Counts skipped (too heavy). DataFrame read; you can trigger an action to see sizes: %s", ecount)
+            if smallest_one.take(1):
+                logger.info("Found a covering aggregated row for mmsi=%s; returning the smallest covering trajectory.", mmsi)
+                out_cols = df.columns[:]  # original DB columns
+                final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
+                return smallest_one.select(*final_cols)
+        except Exception:
+            # conservative: ignore take issues and proceed to fallback
+            logger.debug("take(1) on smallest_one failed or not supported; proceeding to fallback if needed.")
 
-        # --- 7) Select & return a compact set of columns (keep as Spark DF for downstream processing) ---
-        # Keep everything but also expose traj_start_ts/traj_end_ts for downstream use
-        out_cols = df.columns[:]  # keep original columns
-        # ensure we also include traj_start_ts and traj_end_ts
-        result_df = filtered.select(*(out_cols + ["traj_start_ts", "traj_end_ts"]))
+        # 7) Fallback: keep rows fully WITHIN the user interval
+        df_within = df2.filter(
+            (F.col("traj_start_ts").isNotNull()) &
+            (F.col("traj_end_ts").isNotNull()) &
+            (F.col("traj_start_ts") >= start_ts_lit) &
+            (F.col("traj_end_ts") <= end_ts_lit)
+        ).withColumn(
+            "_duration_s",
+            (F.unix_timestamp(F.col("traj_end_ts")) - F.unix_timestamp(F.col("traj_start_ts")))
+        )
 
-        return result_df
-    
-    def extract_trajectory_block_for_interval(
+        try:
+            cnt_within = df_within.count()
+            logger.info("Fallback: rows fully within interval for mmsi=%s = %d", mmsi, cnt_within)
+        except Exception:
+            logger.debug("Skipping expensive count() on df_within.")
+
+        if df_within.rdd.isEmpty():
+            # Return an empty DF with expected columns (use original df schema plus computed cols)
+            logger.info("No covering row and no rows fully within interval for mmsi=%s; returning empty DataFrame.", mmsi)
+            out_cols = df.columns[:]
+            final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
+            # safe empty: df.limit(0) -> empty with original schema; add computed cols to avoid select missing
+            empty = df.limit(0)
+            # add missing computed cols as nulls
+            for c in ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]:
+                empty = empty.withColumn(c, F.lit(None))
+            return empty.select(*final_cols)
+
+        # Return all rows fully-within (may be multiple)
+        out_cols = df.columns[:]
+        final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
+        return df_within.select(*final_cols)
+
+
+    def sliding_window_extract_trajectory_block_for_interval(
         spark,
         mmsi: str,
         start_date_str: str,
         end_date_str: str,
+        sliding_window_size: int,
+        step_size_hours: int,
         *,
         schema: str = "captaima",
         table: str = "aggregated_ais_data",
         jdbc_jar_path: str = "infrastructure/jars/postgresql-42.7.3.jar"
     ):
         """
-        Return a Spark DataFrame with ONE row per mmsi containing ALL trajectory data (points)
-        whose timestamps fall inside the user interval [start_date_str, end_date_str].
+        Sliding-window version of extract_trajectory_block_for_interval.
 
-        Requirements:
-        - query_aggregated_ais_covering_interval(...) must exist and return aggregated rows
-            that satisfy traj_start <= start_date AND traj_end >= end_date (so row-level filtering is done).
-        - Spark must support arrays_zip, posexplode_outer, array_sort and higher-order functions (PySpark 2.4+/3.x).
-        Returns:
-        Spark DataFrame with 1 row per mmsi and columns:
-            mmsi,
-            contributing_eventindices (array of ints),
-            n_points,
-            linestring (WKT for the concatenation of included points),
-            timestamp_array (array of timestamp strings "yyyy-MM-dd HH:mm:ss"),
-            sog_array (array double),
-            cog_array (array double),
-            average_sog, min_sog, max_sog, std_dev_sog,
-            average_cog, min_cog, max_cog, std_dev_cog,
-            distance_in_kilometers (sum of contributing rows' distance_in_kilometers where available)
+        - sliding_window_size: window length in hours (int)
+        - step_size_hours: sliding step in hours (int)
+
+        Returns a Spark DataFrame where each row is a trajectory block corresponding to
+        one sliding window (per mmsi). Columns emulate the aggregated_ais_data layout,
+        with `primary_key` renamed to `primary_key_from_aggregated_ais_data`. Additional
+        columns: window_index, window_start_ts, window_end_ts.
         """
+        import os
+        from datetime import datetime
+        from pyspark.sql import functions as F
+        from pyspark.sql import types as T
 
-        # 1) canonicalize input datetimes (accept "T" or space)
+        # --- helper: canonicalize incoming datetimes (accept T or space) ---
         def _canon(s: str) -> str:
             s2 = s.replace("T", " ").strip()
             for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
@@ -191,19 +227,23 @@ class Prediction_Service:
                     return dt.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     pass
-            # last effort
             try:
                 dt = datetime.fromisoformat(s2)
                 return dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 raise ValueError(f"Unrecognized datetime format: {s!r}")
 
+        # validate sliding params
+        if sliding_window_size is None or step_size_hours is None:
+            raise ValueError("Both sliding_window_size and step_size_hours (ints) must be provided.")
+
         start_canon = _canon(start_date_str)
         end_canon = _canon(end_date_str)
-        logger.info("Extracting block for mmsi=%s interval [%s, %s]", mmsi, start_canon, end_canon)
+        logger.info("Sliding-window extract for mmsi=%s interval [%s, %s] window=%dh step=%dh",
+                    mmsi, start_canon, end_canon, sliding_window_size, step_size_hours)
 
-        # 2) read aggregated rows that fully contain the interval (your helper does JDBC + filtering)
-        agg_df = query_aggregated_ais_covering_interval(
+        # --- 1) fetch aggregated rows that either cover or lie within the interval ---
+        agg_df = PredictionService.query_aggregated_ais_covering_interval(
             spark=spark,
             mmsi=mmsi,
             start_date_str=start_canon,
@@ -213,70 +253,81 @@ class Prediction_Service:
             jdbc_jar_path=jdbc_jar_path
         )
 
-        # If nothing returned -> empty DF with expected schema
-        if agg_df.rdd.isEmpty():
-            logger.info("No aggregated rows found that cover the requested interval for mmsi=%s", mmsi)
+        # helper to test emptiness safely
+        def _is_df_empty(df):
+            try:
+                return df is None or df.rdd.isEmpty()
+            except Exception:
+                return df is None or (df.take(1) == [])
+
+        if _is_df_empty(agg_df):
+            logger.info("No aggregated rows found that cover or lie within requested interval for mmsi=%s", mmsi)
+            # return an empty DF with expected schema (DB-like + extras)
             out_schema = T.StructType([
+                T.StructField("primary_key_from_aggregated_ais_data", T.ArrayType(T.LongType()), True),
                 T.StructField("mmsi", T.StringType(), True),
-                T.StructField("contributing_eventindices", T.ArrayType(T.LongType()), True),
-                T.StructField("n_points", T.LongType(), True),
-                T.StructField("linestring", T.StringType(), True),
+                T.StructField("EventIndex", T.ArrayType(T.LongType()), True),
+                T.StructField("trajectory", T.StringType(), True),
                 T.StructField("timestamp_array", T.ArrayType(T.StringType()), True),
                 T.StructField("sog_array", T.ArrayType(T.DoubleType()), True),
                 T.StructField("cog_array", T.ArrayType(T.DoubleType()), True),
-                T.StructField("average_sog", T.DoubleType(), True),
-                T.StructField("min_sog", T.DoubleType(), True),
-                T.StructField("max_sog", T.DoubleType(), True),
-                T.StructField("std_dev_sog", T.DoubleType(), True),
-                T.StructField("average_cog", T.DoubleType(), True),
-                T.StructField("min_cog", T.DoubleType(), True),
-                T.StructField("max_cog", T.DoubleType(), True),
-                T.StructField("std_dev_cog", T.DoubleType(), True),
-                T.StructField("distance_in_kilometers", T.DoubleType(), True)
+                T.StructField("behavior_type_vector", T.ArrayType(T.StringType()), True),
+                T.StructField("average_speed", T.DoubleType(), True),
+                T.StructField("min_speed", T.DoubleType(), True),
+                T.StructField("max_speed", T.DoubleType(), True),
+                T.StructField("average_heading", T.DoubleType(), True),
+                T.StructField("min_heading", T.DoubleType(), True),
+                T.StructField("max_heading", T.DoubleType(), True),
+                T.StructField("std_dev_heading", T.DoubleType(), True),
+                T.StructField("std_dev_speed", T.DoubleType(), True),
+                T.StructField("total_area_time", T.DoubleType(), True),
+                T.StructField("low_speed_percentage", T.DoubleType(), True),
+                T.StructField("stagnation_time", T.DoubleType(), True),
+                T.StructField("distance_in_kilometers", T.DoubleType(), True),
+                T.StructField("average_time_diff_between_consecutive_points", T.DoubleType(), True),
+                T.StructField("n_points", T.LongType(), True),
+                T.StructField("window_index", T.LongType(), True),
+                T.StructField("window_start_ts", T.StringType(), True),
+                T.StructField("window_end_ts", T.StringType(), True)
             ])
             return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=out_schema)
 
-        # 3) Normalize arrays and trajectory into exploded rows (distributed)
+        # --- 2) normalize arrays & WKT into arrays of elements (distributed) ---
         df2 = (
             agg_df
-            # timestamp_array -> array of strings
             .withColumn("_ts_body", F.regexp_replace(F.col("timestamp_array").cast("string"), r"^\s*\[|\]\s*$", ""))
             .withColumn("_ts_arr", F.split(F.col("_ts_body"), r"\s*,\s*"))
-            # sog, cog -> arrays
             .withColumn("_sog_body", F.regexp_replace(F.col("sog_array").cast("string"), r"^\s*\[|\]\s*$", ""))
             .withColumn("_sog_arr", F.split(F.col("_sog_body"), r"\s*,\s*"))
             .withColumn("_cog_body", F.regexp_replace(F.col("cog_array").cast("string"), r"^\s*\[|\]\s*$", ""))
             .withColumn("_cog_arr", F.split(F.col("_cog_body"), r"\s*,\s*"))
-            # trajectory WKT -> inner "lon lat, lon lat, ..." string -> array of "lon lat"
             .withColumn("_traj_body", F.regexp_replace(F.col("trajectory").cast("string"), r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', ""))
             .withColumn("_traj_body", F.regexp_replace(F.col("_traj_body"), r"\s+", " "))
             .withColumn("_pts_arr", F.when(F.col("_traj_body").isNull(), F.array()).otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
-            # Keep EventIndex and mmsi for provenance
+            # select only columns we need downstream (preserve presence checks)
             .select(
-                "mmsi",
-                "EventIndex",
-                "trajectory",
-                "distance_in_kilometers",
-                "_ts_arr",
-                "_sog_arr",
-                "_cog_arr",
-                "_pts_arr"
+                *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
+                            "total_area_time", "low_speed_percentage", "stagnation_time",
+                            "average_time_diff_between_consecutive_points", "behavior_type_vector"]
+                if c in agg_df.columns]),
+                "_ts_arr", "_sog_arr", "_cog_arr", "_pts_arr"
             )
         )
 
-        # arrays_zip to align positions: zipped = array(struct(ts, sog, cog, pt))
+        # arrays_zip to align positional elements and posexplode to produce one-row-per-point (distributed)
         df2 = df2.withColumn("_zipped", F.arrays_zip(F.col("_ts_arr"), F.col("_sog_arr"), F.col("_cog_arr"), F.col("_pts_arr")))
 
-        # posexplode_outer -> distributed rows (one per original point)
         exploded = df2.select(
-            "mmsi",
-            "EventIndex",
-            "distance_in_kilometers",
+            *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
+                        "total_area_time", "low_speed_percentage", "stagnation_time",
+                        "average_time_diff_between_consecutive_points", "behavior_type_vector"]
+            if c in df2.columns]),
             F.posexplode_outer(F.col("_zipped")).alias("pos", "elem")
         ).select(
-            "mmsi",
-            "EventIndex",
-            "distance_in_kilometers",
+            *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
+                        "total_area_time", "low_speed_percentage", "stagnation_time",
+                        "average_time_diff_between_consecutive_points", "behavior_type_vector"]
+            if c in df2.columns]),
             "pos",
             F.col("elem").getItem(0).alias("ts_raw"),
             F.col("elem").getItem(1).alias("sog_raw"),
@@ -284,12 +335,13 @@ class Prediction_Service:
             F.col("elem").getItem(3).alias("pt_raw")
         )
 
-        # parse fields into typed columns
+        # parse typed columns
         exploded = (
             exploded
             .withColumn("ts_str", F.regexp_replace(F.col("ts_raw").cast("string"), r"^\"|\"$", ""))
             .withColumn("ts_str", F.regexp_replace(F.col("ts_str"), r"T", " "))
             .withColumn("ts_ts", F.to_timestamp(F.col("ts_str"), "yyyy-MM-dd HH:mm:ss"))
+            .withColumn("ts_unix", F.unix_timestamp(F.col("ts_ts")))
             .withColumn("sog", F.when(F.col("sog_raw").isNull(), None).otherwise(F.col("sog_raw").cast("double")))
             .withColumn("cog", F.when(F.col("cog_raw").isNull(), None).otherwise(F.col("cog_raw").cast("double")))
             .withColumn("pt_clean", F.regexp_replace(F.col("pt_raw").cast("string"), r"^\s*\"|\"\s*$", ""))
@@ -299,100 +351,105 @@ class Prediction_Service:
             .drop("ts_raw", "sog_raw", "cog_raw", "pt_raw", "pt_clean", "_pt_split", "ts_str")
         )
 
-        # 4) Filter points strictly to the requested interval
-        start_ts_lit = F.to_timestamp(F.lit(start_canon), "yyyy-MM-dd HH:mm:ss")
-        end_ts_lit = F.to_timestamp(F.lit(end_canon), "yyyy-MM-dd HH:mm:ss")
+        # --- 3) restrict points strictly to the overall user interval (avoid windows outside)
+        start_unix_col = F.unix_timestamp(F.lit(start_canon), "yyyy-MM-dd HH:mm:ss")
+        end_unix_col = F.unix_timestamp(F.lit(end_canon), "yyyy-MM-dd HH:mm:ss")
 
         exploded_filtered = exploded.filter(
             (F.col("ts_ts").isNotNull()) &
-            (F.col("ts_ts") >= start_ts_lit) &
-            (F.col("ts_ts") <= end_ts_lit)
+            (F.col("ts_unix") >= start_unix_col) &
+            (F.col("ts_unix") <= end_unix_col)
         )
 
-        # If no points included -> return empty DF same schema
+        # if no points -> empty
         try:
             if exploded_filtered.rdd.isEmpty():
                 logger.info("No points inside interval after exploding and filtering for mmsi=%s", mmsi)
-                out_schema = T.StructType([
-                    T.StructField("mmsi", T.StringType(), True),
-                    T.StructField("contributing_eventindices", T.ArrayType(T.LongType()), True),
-                    T.StructField("n_points", T.LongType(), True),
-                    T.StructField("linestring", T.StringType(), True),
-                    T.StructField("timestamp_array", T.ArrayType(T.StringType()), True),
-                    T.StructField("sog_array", T.ArrayType(T.DoubleType()), True),
-                    T.StructField("cog_array", T.ArrayType(T.DoubleType()), True),
-                    T.StructField("average_sog", T.DoubleType(), True),
-                    T.StructField("min_sog", T.DoubleType(), True),
-                    T.StructField("max_sog", T.DoubleType(), True),
-                    T.StructField("std_dev_sog", T.DoubleType(), True),
-                    T.StructField("average_cog", T.DoubleType(), True),
-                    T.StructField("min_cog", T.DoubleType(), True),
-                    T.StructField("max_cog", T.DoubleType(), True),
-                    T.StructField("std_dev_cog", T.DoubleType(), True),
-                    T.StructField("distance_in_kilometers", T.DoubleType(), True)
-                ])
-                return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=out_schema)
+                return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
         except Exception:
-            # Some Spark versions don't have rdd.isEmpty; fallback to take(1)
             if exploded_filtered.take(1) == []:
                 logger.info("No points inside interval after exploding and filtering for mmsi=%s", mmsi)
-                out_schema = T.StructType([
-                    T.StructField("mmsi", T.StringType(), True),
-                    T.StructField("contributing_eventindices", T.ArrayType(T.LongType()), True),
-                    T.StructField("n_points", T.LongType(), True),
-                    T.StructField("linestring", T.StringType(), True),
-                    T.StructField("timestamp_array", T.ArrayType(T.StringType()), True),
-                    T.StructField("sog_array", T.ArrayType(T.DoubleType()), True),
-                    T.StructField("cog_array", T.ArrayType(T.DoubleType()), True),
-                    T.StructField("average_sog", T.DoubleType(), True),
-                    T.StructField("min_sog", T.DoubleType(), True),
-                    T.StructField("max_sog", T.DoubleType(), True),
-                    T.StructField("std_dev_sog", T.DoubleType(), True),
-                    T.StructField("average_cog", T.DoubleType(), True),
-                    T.StructField("min_cog", T.DoubleType(), True),
-                    T.StructField("max_cog", T.DoubleType(), True),
-                    T.StructField("std_dev_cog", T.DoubleType(), True),
-                    T.StructField("distance_in_kilometers", T.DoubleType(), True)
-                ])
-                return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=out_schema)
+                return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
 
-        # 5) Aggregate into a single row per mmsi:
-        # collect structs where first element is unix timestamp (ts_unix) so array_sort sorts by that
+        # --- 4) For sliding windows: compute k-range for every point and explode to assign point to windows
+        window_size_s = int(sliding_window_size) * 3600
+        step_s = int(step_size_hours) * 3600
+
+        # kmin = ceil((ts_unix - window_size_s - start_unix) / step_s)
+        # kmax = floor((ts_unix - start_unix) / step_s)
+        # clamp kmin to >= 0; if kmin > kmax -> no windows for that point
+        kmin_expr = F.ceil((F.col("ts_unix") - F.lit(window_size_s) - start_unix_col) / F.lit(step_s)).cast("long")
+        kmax_expr = F.floor((F.col("ts_unix") - start_unix_col) / F.lit(step_s)).cast("long")
+        kmin_clamped = F.when(kmin_expr < 0, F.lit(0)).otherwise(kmin_expr)
+
+        # generate integer sequence of window indices for each point (may be empty array)
+        window_idx_arr = F.when(kmin_clamped <= kmax_expr, F.sequence(kmin_clamped, kmax_expr)).otherwise(F.array())
+
+        exploded_windows = exploded_filtered.withColumn("window_idx_arr", window_idx_arr)
+
+        # explode window indices so each row belongs to one window
+        exploded_windows = exploded_windows.withColumn("window_index", F.explode_outer(F.col("window_idx_arr"))).drop("window_idx_arr")
+
+        # compute concrete window start/end unix & timestamps
+        window_start_unix = (start_unix_col + F.col("window_index") * F.lit(step_s)).cast("long")
+        window_end_unix = (window_start_unix + F.lit(window_size_s)).cast("long")
+
+        exploded_windows = exploded_windows.withColumn("window_start_unix", window_start_unix).withColumn("window_end_unix", window_end_unix)
+        exploded_windows = exploded_windows.withColumn("window_start_ts", F.to_timestamp(F.from_unixtime(F.col("window_start_unix"))))
+        exploded_windows = exploded_windows.withColumn("window_end_ts", F.to_timestamp(F.from_unixtime(F.col("window_end_unix"))))
+
+        # drop points that don't actually lie in the computed window range (safety)
+        exploded_windows = exploded_windows.filter(
+            (F.col("ts_unix") >= F.col("window_start_unix")) & (F.col("ts_unix") <= F.col("window_end_unix"))
+        )
+
+        # --- 5) Group by mmsi + window_index -> collect points for each block and compute aggregates ---
         pts_struct = F.struct(
-            F.unix_timestamp(F.col("ts_ts")).alias("ts_unix"),
+            F.col("ts_unix").alias("ts_unix"),
             F.col("ts_ts").alias("ts"),
             F.col("lon").alias("lon"),
             F.col("lat").alias("lat"),
             F.col("sog").alias("sog"),
             F.col("cog").alias("cog"),
             F.col("EventIndex").alias("EventIndex"),
-            F.col("pos").alias("pos")
+            F.col("pos").alias("pos"),
+            F.col("primary_key").alias("primary_key"),
+            F.col("distance_in_kilometers").alias("distance_in_kilometers")
         )
 
-        grouped = exploded_filtered.groupBy("mmsi").agg(
+        grouped = exploded_windows.groupBy("mmsi", "window_index", "window_start_unix", "window_end_unix").agg(
             F.collect_list(pts_struct).alias("pts"),
-            F.collect_set(F.col("EventIndex").cast("long")).alias("contributing_eventindices"),
+            F.collect_set(F.col("EventIndex").cast("long")).alias("EventIndex"),
+            F.collect_set(F.col("primary_key").cast("long")).alias("primary_key_from_aggregated_ais_data"),
             F.count(F.lit(1)).alias("n_points"),
-            F.sum(F.col("distance_in_kilometers")).alias("distance_in_kilometers_sum"),
-            F.avg("sog").alias("average_sog"),
-            F.min("sog").alias("min_sog"),
-            F.max("sog").alias("max_sog"),
-            F.stddev("sog").alias("std_dev_sog"),
-            F.avg("cog").alias("average_cog"),
-            F.min("cog").alias("min_cog"),
-            F.max("cog").alias("max_cog"),
-            F.stddev("cog").alias("std_dev_cog")
+            # sum distances contributed by parent aggregated rows (approximate)
+            F.sum(F.col("distance_in_kilometers")).alias("distance_in_kilometers"),
+            # sog/cog stats
+            F.avg("sog").alias("average_speed"),
+            F.min("sog").alias("min_speed"),
+            F.max("sog").alias("max_speed"),
+            F.stddev("sog").alias("std_dev_speed"),
+            F.avg("cog").alias("average_heading"),
+            F.min("cog").alias("min_heading"),
+            F.max("cog").alias("max_heading"),
+            F.stddev("cog").alias("std_dev_heading"),
+            # aggregate other parent-row metrics in a reasonable way (avg or sum depending on semantics)
+            F.avg(F.col("average_time_diff_between_consecutive_points")).alias("average_time_diff_between_consecutive_points"),
+            F.sum(F.col("total_area_time")).alias("total_area_time"),
+            F.avg(F.col("low_speed_percentage")).alias("low_speed_percentage"),
+            F.sum(F.col("stagnation_time")).alias("stagnation_time"),
+            F.collect_set(F.col("behavior_type_vector")).alias("behavior_type_vector")
         )
 
-        # sort pts by ts_unix (first struct field)
+        # sort pts by ts_unix
         grouped = grouped.withColumn("pts_sorted", F.expr("array_sort(pts)"))
 
-        # build arrays and linestring
+        # build arrays, linestring and proper timestamp arrays
         grouped = grouped.withColumn(
             "lonlat_arr",
             F.expr("transform(pts_sorted, x -> concat(CAST(x.lon AS STRING), ' ', CAST(x.lat AS STRING)))")
         ).withColumn(
-            "linestring",
+            "trajectory",
             F.concat(F.lit("LINESTRING("), F.concat_ws(", ", F.col("lonlat_arr")), F.lit(")"))
         ).withColumn(
             "timestamp_array",
@@ -403,47 +460,56 @@ class Prediction_Service:
         ).withColumn(
             "cog_array",
             F.expr("transform(pts_sorted, x -> x.cog)")
+        ).withColumn(
+            "window_start_ts",
+            F.to_timestamp(F.from_unixtime(F.col("window_start_unix")))
+        ).withColumn(
+            "window_end_ts",
+            F.to_timestamp(F.from_unixtime(F.col("window_end_unix")))
         )
 
-        # final select / rename
+        # ensure final column ordering & names match DB columns (except primary_key renamed) and include window info
         final_cols = [
+            "primary_key_from_aggregated_ais_data",
             "mmsi",
-            "contributing_eventindices",
-            "n_points",
-            "linestring",
+            "EventIndex",
+            "trajectory",
             "timestamp_array",
             "sog_array",
             "cog_array",
-            "average_sog",
-            "min_sog",
-            "max_sog",
-            "std_dev_sog",
-            "average_cog",
-            "min_cog",
-            "max_cog",
-            "std_dev_cog",
-            "distance_in_kilometers_sum"
+            "behavior_type_vector",
+            "average_speed",
+            "min_speed",
+            "max_speed",
+            "average_heading",
+            "min_heading",
+            "max_heading",
+            "std_dev_heading",
+            "std_dev_speed",
+            "total_area_time",
+            "low_speed_percentage",
+            "stagnation_time",
+            "distance_in_kilometers",
+            "average_time_diff_between_consecutive_points",
+            "n_points",
+            # sliding-window metadata
+            "window_index",
+            "window_start_ts",
+            "window_end_ts"
         ]
 
-        final_df = grouped.select(*final_cols).withColumnRenamed("distance_in_kilometers_sum", "distance_in_kilometers")
+        final_df = grouped.select(*final_cols)
 
-        # LOG summary
+        # LOG small stats (best-effort)
         try:
-            stats = final_df.select("mmsi", "n_points", "distance_in_kilometers").collect()
-            if stats:
-                logger.info("Extracted block for mmsi=%s: n_points=%s distance_sum=%s", stats[0]["mmsi"], stats[0]["n_points"], stats[0]["distance_in_kilometers"])
+            sample = final_df.select("mmsi", "n_points", "window_index").limit(5).collect()
+            logger.info("Sliding-window extraction produced %d blocks (sample): %s", final_df.count() if final_df is not None else -1, sample)
         except Exception:
-            logger.debug("Could not collect small stats for logging (non-fatal)")
+            logger.debug("Skipping heavy logging of sliding-window results (non-fatal).")
 
-        # -------------------------------
-        # Placeholder: call your anomaly detection / subdivision function here
-        #
-        # Example:
-        # final_df = apply_anomaly_subdivision(final_df, sliding_window_size=..., step_size_hours=...)
-        #
-        # DO NOT implement apply_anomaly_subdivision here (you said you'll implement it later).
-        # Keep the placeholder so later you can insert the row->subtrajectories decomposition.
-        # -------------------------------
+        # Placeholder for later subdivision/anomaly detection function
+        # e.g. final_df = apply_anomaly_subdivision(final_df, sliding_window_size=sliding_window_size, step_size_hours=step_size_hours)
 
         return final_df
+
 

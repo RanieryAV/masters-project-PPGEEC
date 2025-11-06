@@ -43,7 +43,7 @@ logger = get_logger()
 # Load environment variables#move to services
 load_dotenv()#move to services
 
-class Process_Data_Service:
+class ProcessDataService:
     ######################## DOCKER DETECTION FUNCTIONS ########################
     @staticmethod
     def _is_running_in_container() -> bool:
@@ -329,14 +329,14 @@ class Process_Data_Service:
     #     # coalesce to 1 if you want one file, else multiple part-files
     #     spark_df.coalesce(1).write.mode("overwrite").option("header", True).csv(output_path)
 
-    #     moved = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, output_path)
+    #     moved = ProcessDataService.spark_func_promote_csv_from_temporary(spark, output_path)
     #     if not moved:
     #         logger.warning(f"Could not promote CSV from temporary for output path {output_path}")
     #     else:
     #         logger.info("CSV file promoted from temporary.")
         
     #     # Adjust permissions on moved files
-    #     Process_Data_Service.adjust_file_permissions(output_path)
+    #     ProcessDataService.adjust_file_permissions(output_path)
 
     #     logger.info("ATTENTION: Data saved successfully with correct file permissions!")
 
@@ -352,7 +352,7 @@ class Process_Data_Service:
         This branch now has extra safety: aggressive partitioning, driver disk pre-check, optional repartitioning.
         - If the fast write (either coalesced or multi-file) fails, automatically fall back to a robust
         driver-streaming writer that emits a single CSV by receiving chunked bytes from executors
-        (Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019).
+        (ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019).
         - In all cases we attempt to adjust file permissions before returning.
         """
         import os
@@ -384,7 +384,7 @@ class Process_Data_Service:
                 return None
 
         # Prefer module parser if available
-        parse_size = getattr(Process_Data_Service, "_parse_size_string", None) or _local_parse_size_string
+        parse_size = getattr(ProcessDataService, "_parse_size_string", None) or _local_parse_size_string
 
         # ----------------------------
         #  Determine default_parallelism robustly & target partitions
@@ -592,7 +592,7 @@ class Process_Data_Service:
 
                 # After successful partition writes, adjust permissions
                 try:
-                    Process_Data_Service.adjust_file_permissions(output_path)
+                    ProcessDataService.adjust_file_permissions(output_path)
                 except Exception as e_adj:
                     logger.warning("adjust_file_permissions failed after executor-side multi-file write: %s", e_adj)
 
@@ -606,7 +606,7 @@ class Process_Data_Service:
 
                 # try to promote/move the part-*.csv produced by Spark to the root of output_path
                 try:
-                    moved = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, output_path)
+                    moved = ProcessDataService.spark_func_promote_csv_from_temporary(spark, output_path)
                     if not moved:
                         logger.warning(f"Could not promote CSV from temporary for output path {output_path}")
                     else:
@@ -617,7 +617,7 @@ class Process_Data_Service:
 
                 # Adjust permissions on moved files (best-effort)
                 try:
-                    Process_Data_Service.adjust_file_permissions(output_path)
+                    ProcessDataService.adjust_file_permissions(output_path)
                 except Exception as e_adj:
                     logger.warning("adjust_file_permissions failed after Spark coalesced write: %s", e_adj)
 
@@ -658,7 +658,7 @@ class Process_Data_Service:
                 output_path, chosen_chunk_bytes, compress
             )
 
-            Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
+            ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
                 spark_df=spark_df,
                 output_dir=output_path,
                 spark=spark,
@@ -669,7 +669,7 @@ class Process_Data_Service:
             )
 
             try:
-                Process_Data_Service.adjust_file_permissions(output_path)
+                ProcessDataService.adjust_file_permissions(output_path)
             except Exception as e_adj2:
                 logger.warning("adjust_file_permissions failed after fallback writer: %s", e_adj2)
 
@@ -926,7 +926,7 @@ class Process_Data_Service:
 
             # adjust permissions
             try:
-                Process_Data_Service.adjust_file_permissions(output_dir)
+                ProcessDataService.adjust_file_permissions(output_dir)
             except Exception as e:
                 logger.warning("adjust_file_permissions failed after chunked streaming save: %s", e)
 
@@ -1088,58 +1088,7 @@ class Process_Data_Service:
     
     ######################## END ########################
 
-    ############### SPARK SESSION HELPERS ###############
-    @staticmethod
-    def init_spark_session(spark_session_name):
-        """Initialize and return a SparkSession using environment vars."""
-        spark_master_rpc_port = os.getenv("SPARK_MASTER_RPC_PORT", "7077")
-        spark_master_url = os.getenv("SPARK_MASTER_URL", f"spark://spark-master:{spark_master_rpc_port}")
-        eventlog_dir = os.getenv("SPARK_EVENTLOG_DIR", "/opt/spark-events")
-
-        logger.info(f"Spark master URL: {spark_master_url}")
-        logger.info(f"Event log directory: {eventlog_dir}")
-
-        driver_host = os.getenv("SPARK_DRIVER_HOST")
-        if not driver_host:
-            try:
-                hostname = socket.gethostname()
-                driver_host = socket.gethostbyname(hostname)
-            except Exception:
-                # fallback razoável dentro de container
-                driver_host = "0.0.0.0"
-
-        # --- executor/driver resource tuning (read from env with sane defaults) ---
-        # These values allow the master/workers to allocate larger executors instead of the
-        # Spark default of 1g per executor. They are read from environment variables so
-        # you can override them in docker-compose/.env without changing code.
-        spark_cores_max = os.getenv("SPARK_CORES_MAX", "4")                 # total cores allowed for this app
-        spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor
-        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
-        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
-
-        spark = (
-            SparkSession.builder
-            .appName(spark_session_name)
-            .master(spark_master_url)
-            .config("spark.eventLog.enabled", "false")
-            .config("spark.eventLog.dir", eventlog_dir)
-            .config("spark.sql.shuffle.partitions", "60")  # adjust as needed
-            # resource-related configs (minimal additions)
-            .config("spark.cores.max", spark_cores_max)
-            .config("spark.executor.cores", spark_executor_cores)
-            .config("spark.executor.memory", spark_executor_memory)
-            .config("spark.driver.memory", spark_driver_memory)
-            .config("spark.driver.host", driver_host)
-            .config("spark.driver.bindAddress", "0.0.0.0")
-            .config("spark.local.dir", "/app/processed_output/spark_tmp")
-            .config("spark.executorEnv.SPARK_LOCAL_DIRS", "/app/processed_output/spark_tmp")
-            .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=/app/processed_output/spark_tmp")
-            .config("spark.shuffle.compress", "true")
-            .config("spark.rdd.compress", "true")
-            .config("spark.shuffle.spill.compress", "true")
-            .getOrCreate()
-        )
-        return spark
+    ############### SPARK HELPERS ###############
     
     def save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
         spark_df,
@@ -1356,7 +1305,7 @@ class Process_Data_Service:
                         except Exception:
                             logger.debug("Bucket %s: repartition before streaming fallback failed (non-fatal)", bucket_label)
 
-                        Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
+                        ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
                             spark_df=bucket_df,
                             output_dir=tmp_bucket_dir,
                             spark=spark,
@@ -1494,7 +1443,7 @@ class Process_Data_Service:
 
         # final chmod/chown best-effort
         try:
-            Process_Data_Service.adjust_file_permissions(output_dir)
+            ProcessDataService.adjust_file_permissions(output_dir)
         except Exception as e_adj:
             logger.warning("adjust_file_permissions failed after bucketed writes: %s", e_adj)
 
@@ -2164,7 +2113,7 @@ class Process_Data_Service:
         )
 
         # 8) compute Spark haversine sum (pure Spark; fast on executors)
-        haversine_expr = Process_Data_Service._spark_haversine_distance_expr_for_coord_pairs()
+        haversine_expr = ProcessDataService._spark_haversine_distance_expr_for_coord_pairs()
         grouped2 = grouped2.withColumn("distance_in_kilometers", F.expr(haversine_expr).cast(DoubleType()))
 
         # 9) convert timestamp_array (ARRAY<STRING>) to a STRING that looks exactly like Python's list
@@ -2246,11 +2195,11 @@ class Process_Data_Service:
             logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not get partition count")
 
         # run partition-level logger to emit start/finish for each partition
-        #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(df)
+        #ProcessDataService.log_progress_partitions_Pitsikalis_2019(df)
 
         # aggregate points per EventIndex
         logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per EventIndex")
-        grouped = Process_Data_Service.build_grouped_points_Pitsikalis_2019(df)
+        grouped = ProcessDataService.build_grouped_points_Pitsikalis_2019(df)
 
         # grouped count logging
         try:
@@ -2263,13 +2212,13 @@ class Process_Data_Service:
         try:
             grouped_partitions = grouped.rdd.getNumPartitions()
             logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped DataFrame partitions = {grouped_partitions}")
-            #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(grouped)
+            #ProcessDataService.log_progress_partitions_Pitsikalis_2019(grouped)
         except Exception:
             logger.debug("convert_to_vessel_events_Pitsikalis_2019: failed grouped partition logging")
 
         # compute metrics (pure Spark heavy-lifting)
         logger.info("convert_to_vessel_events_Pitsikalis_2019: computing event metrics (Spark)")
-        metrics_df = Process_Data_Service.compute_event_metrics_spark_Pitsikalis_2019(grouped)
+        metrics_df = ProcessDataService.compute_event_metrics_spark_Pitsikalis_2019(grouped)
 
         # show a sample (safe attempt)
         try:
@@ -2290,7 +2239,7 @@ class Process_Data_Service:
 
         # # optionally log partition counts of final df
         # try:
-        #     #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(metrics_df)
+        #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(metrics_df)
         # except Exception:
         #     logger.debug("convert_to_vessel_events_Pitsikalis_2019: final partition logging failed")
 
@@ -2321,7 +2270,7 @@ class Process_Data_Service:
             cog_array (array[double] -> then stringified),
             average_speed, min_speed, max_speed, average_heading, std_dev_heading,
             total_area_time, low_speed_percentage, stagnation_time
-        - writes the final CSV using Process_Data_Service.save_spark_df_as_csv which performs coalesce(1)
+        - writes the final CSV using ProcessDataService.save_spark_df_as_csv which performs coalesce(1)
             and subsequent promotion/permission adjustments.
 
         Parameters
@@ -2332,7 +2281,7 @@ class Process_Data_Service:
             Path to AIS CSV (accessible by Spark).
         spark : SparkSession
         output_dir : str
-            Directory to write final CSV (passed to Process_Data_Service.save_spark_df_as_csv).
+            Directory to write final CSV (passed to ProcessDataService.save_spark_df_as_csv).
 
         Returns
         -------

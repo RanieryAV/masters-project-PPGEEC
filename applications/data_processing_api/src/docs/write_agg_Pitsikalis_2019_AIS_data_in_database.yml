@@ -3,7 +3,7 @@ description: |
   Reads aggregated Pitsikalis 2019 AIS CSV files from the processed output folders and writes them into the database.
 
   Behavior / steps performed:
-    1. Initialize a Spark session via `Process_Data_Service.init_spark_session`.
+    1. Initialize a Spark session via `SparkSessionInitializer.init_spark_session`.
     2. Determine the input base directory depending on whether the service is running in a container:
        - container: `/app/processed_output`
        - non-container: `shared/utils/processed_output`
@@ -15,7 +15,7 @@ description: |
     4. For each CSV file found in those directories:
        - Read it into a Spark DataFrame (`header=True`, `inferSchema=True`).
        - Strip whitespace from column names.
-       - Call `Process_Data_Service.write_aggregated_Pitsikalis_2019_AIS_data_to_database(ais_spark_df)` to persist the data.
+       - Call `ProcessDataService.write_aggregated_Pitsikalis_2019_AIS_data_to_database(ais_spark_df)` to persist the data.
     5. Stop the Spark session and return a success response.
 
   Notes:

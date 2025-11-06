@@ -1,0 +1,91 @@
+summary: "Endpoint for prediction of loitering voyages"
+description: |
+  This endpoint processes AIS data using a sliding window technique to detect loitering behavior for a specified MMSI. 
+  The results include loitering, non-loitering, and stopping trajectories, which are also saved to the database.
+tags:
+  - "Loitering Behavior Detection"
+produces:
+  - "application/json"
+consumes:
+  - "application/json"
+
+parameters:
+  - in: "body"
+    name: "body"
+    description: |
+      Time interval of raw AIS data to be analyzed, along with the sliding window size, 
+      step size, and MMSI value for ship-specific trajectory detection (use the YYYY-MM-DDTHH:MM:SS format).
+    required: true
+    schema:
+      type: "object"
+      properties:
+        start_date:
+          type: "string"
+          format: "date-time"
+          example: "2016-01-16T00:00:00"
+        end_date:
+          type: "string"
+          format: "date-time"
+          example: "2016-02-12T23:59:59"
+        sliding_window_size:
+          type: "integer"
+          description: "Size of the sliding window in hours"
+          example: 6
+        step_size_hours:
+          type: "integer"
+          description: "Step size in hours for moving the sliding window"
+          example: 1
+        mmsi:
+          type: "string"
+          description: "MMSI (Maritime Mobile Service Identity) of the ship"
+          example: "228186700"
+
+responses:
+  200:
+    description: |
+      Successfully found and classified loitering, non-loitering, and stopping trajectories for the specified MMSI.
+      The results are returned along with a message.
+    content:
+      application/json:
+        example:
+          message: "Loitering and non-loitering data found for the given MMSI value."
+          loitering_trajectories:
+            - mmsi: "123456789"
+              linestring: "LINESTRING(-17.005631666666666 178.67086666666665, -5.67584 11.92436)"
+              start_time: "2024-01-16T00:00:00"
+              end_time: "2024-01-16T12:00:00"
+          non_loitering_trajectories:
+            - mmsi: "123456789"
+              linestring: "LINESTRING(-17.005631666666666 178.67086666666665, -5.67584 11.92436)"
+              start_time: "2024-01-17T00:00:00"
+              end_time: "2024-01-17T12:00:00"
+          stopping_trajectories:
+            - mmsi: "123456789"
+              linestring: "LINESTRING(-17.005631666666666 178.67086666666665)"
+              start_time: "2024-01-16T06:00:00"
+              end_time: "2024-01-16T06:30:00"
+  400:
+    description: |
+      Missing required parameters in the request body.
+    content:
+      application/json:
+        example:
+          error: "Missing required parameters."
+  404:
+    description: |
+      No trajectories found for the specified parameters.
+    content:
+      application/json:
+        example:
+          message: "No trajectories found for the specified parameters."
+          loitering_trajectories: []
+          non_loitering_trajectories: []
+          stopping_trajectories: []
+  500:
+    description: |
+      Internal server error occurred during processing.
+    content:
+      application/json:
+        example:
+          error: "Internal Server Error"
+          details: "An unexpected error occurred while processing the request."

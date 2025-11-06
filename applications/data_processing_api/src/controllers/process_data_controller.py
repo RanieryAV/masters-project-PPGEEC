@@ -5,8 +5,9 @@ from flask import Blueprint, request, jsonify
 from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
-from ..services.process_data_service import Process_Data_Service
+from ..services.process_data_service import ProcessDataService
 from domain.services.save_ais_data_service import SaveAISDataService
+from domain.config.data_processing.spark_session_initializer import SparkSessionInitializer
 import glob
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
@@ -43,11 +44,11 @@ def process_Pitsikalis_2019_labels_data():
     logger.info("Received request at /process-Pitsikalis-2019-labels-data")
 
     try:
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_Labels_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_Labels_[Data_Processing_API]")
 
         expected_header = ["FluentName", "MMSI", "Argument", "Value", "T_start", "T_end"]
         
-        is_container = Process_Data_Service._is_running_in_container()  # log if in container or not
+        is_container = ProcessDataService._is_running_in_container()  # log if in container or not
 
         # Read Spark master URL and event log dir from environment variables or use defaults
         if is_container:
@@ -57,13 +58,13 @@ def process_Pitsikalis_2019_labels_data():
 
         logger.info(f"WARNING: Loading raw labels data from {csv_path}")
 
-        df = Process_Data_Service.load_spark_labels_df_from_Pitsikalis_2019_csv(spark, csv_path, expected_header)
+        df = ProcessDataService.load_spark_labels_df_from_Pitsikalis_2019_csv(spark, csv_path, expected_header)
 
         logger.info("WARNING: Filtering and transforming labels data...")
 
-        df_processed = Process_Data_Service.filter_and_transform_Pitsikalis_2019_labels_data(df)
+        df_processed = ProcessDataService.filter_and_transform_Pitsikalis_2019_labels_data(df)
 
-        summary = Process_Data_Service.inspect_spark_labels_dataframe_Pitsikalis_2019(df_processed)
+        summary = ProcessDataService.inspect_spark_labels_dataframe_Pitsikalis_2019(df_processed)
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default
@@ -76,7 +77,7 @@ def process_Pitsikalis_2019_labels_data():
         output_path = os.path.join(output_dir, new_file_name)
         
         # Save processed Spark DataFrame as CSV
-        Process_Data_Service.save_spark_df_as_csv(df_processed, output_path, spark)
+        ProcessDataService.save_spark_df_as_csv(df_processed, output_path, spark)
 
         logger.info(f"WARNING: Sorted subset of miscellaneous event labels data saved to '{output_path}'")
 
@@ -111,9 +112,9 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
     logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-1-data")
 
     try:
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_1_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_1_[Data_Processing_API]")
 
-        is_container = Process_Data_Service._is_running_in_container()  # log if in container or not
+        is_container = ProcessDataService._is_running_in_container()  # log if in container or not
         
         # input dir from env var or default
         if is_container:
@@ -134,13 +135,13 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
             ais_csv_path = "shared/utils/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
 
         logger.info(f"Loading processed miscellaneous event labels from {events_csv_path}")
-        df_events = Process_Data_Service.load_events_Pitsikalis_2019(spark, events_csv_path)
+        df_events = ProcessDataService.load_events_Pitsikalis_2019(spark, events_csv_path)
 
         logger.info("Splitting events into transshipment and non-transshipment")
-        transshipment_df, loitering_df, normal_df, stopping_df = Process_Data_Service.split_events_Pitsikalis_2019(df_events)
+        transshipment_df, loitering_df, normal_df, stopping_df = ProcessDataService.split_events_Pitsikalis_2019(df_events)
 
         logger.info("Collecting relevant transshipment MMSI pairs")
-        relevant_transship_mmsi = Process_Data_Service.get_relevant_transship_mmsi_Pitsikalis_2019(transshipment_df)
+        relevant_transship_mmsi = ProcessDataService.get_relevant_transship_mmsi_Pitsikalis_2019(transshipment_df)
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default
@@ -153,12 +154,12 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
         transshipment_output_path = os.path.join(base_output_dir, new_file_name_1)
 
         logger.info("Saving transshipment events (coalesced single CSV)")
-        Process_Data_Service.save_spark_df_as_csv(transshipment_df, transshipment_output_path, spark)
+        ProcessDataService.save_spark_df_as_csv(transshipment_df, transshipment_output_path, spark)
         logger.info(f"Transshipment events saved to '{transshipment_output_path}'")
 
         logger.info("WARNING: Transshipment processing done. Now processing non-transshipment AIS data...")
         logger.info("Processing AIS and joining with non-transshipment events...")
-        aggregated_loitering_df, aggregated_normal_df, aggregated_stopping_df = Process_Data_Service.process_ais_events_Pitsikalis_2019(spark, ais_csv_path, loitering_df, normal_df, stopping_df)
+        aggregated_loitering_df, aggregated_normal_df, aggregated_stopping_df = ProcessDataService.process_ais_events_Pitsikalis_2019(spark, ais_csv_path, loitering_df, normal_df, stopping_df)
         
         # Write to an output directory (coalesce to 1)
         new_file_name_2 = os.getenv("OUTPUT_FOLDER_NAME_FOR_LOITERING_AIS_DATA_SPARK_PITSIKALIS_2019", "Placeholder_folder_data_processed_by_spark")
@@ -170,13 +171,13 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
         stopping_output_path = os.path.join(base_output_dir, new_file_name_4)
 
         # Call helper function (it coalesces and then promotes)
-        Process_Data_Service.save_spark_df_as_csv(aggregated_loitering_df, loitering_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_2)
+        ProcessDataService.save_spark_df_as_csv(aggregated_loitering_df, loitering_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_2)
         logger.info(f"Loitering events saved to '{loitering_output_path}'")
 
-        Process_Data_Service.save_spark_df_as_csv(aggregated_normal_df, normal_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_3)
+        ProcessDataService.save_spark_df_as_csv(aggregated_normal_df, normal_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_3)
         logger.info(f"Normal events saved to '{normal_output_path}'")
 
-        Process_Data_Service.save_spark_df_as_csv(aggregated_stopping_df, stopping_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_4)
+        ProcessDataService.save_spark_df_as_csv(aggregated_stopping_df, stopping_output_path, spark, allow_multiple_files=False, original_filename=new_file_name_4)
         logger.info(f"Stopping events saved to '{stopping_output_path}'")
 
         logger.info("Task finished. Stopping Spark session...")
@@ -223,7 +224,7 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_2_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_2_[Data_Processing_API]")
 
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
@@ -262,7 +263,7 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
                 logger.info("Falling back to default_parallelism=%s", default_parallelism)
 
         # === Paths / environment choices ===
-        is_container = Process_Data_Service._is_running_in_container()
+        is_container = ProcessDataService._is_running_in_container()
 
         if is_container:
             input_dir = "/app/processed_output"
@@ -290,7 +291,7 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_transshipment_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = Process_Data_Service.create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+        result_df = ProcessDataService.create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
             ais_spark_df, ais_csv_path, spark
         )
 
@@ -301,7 +302,7 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
         aggregated_transshipment_output_path = os.path.join(base_output_dir, new_file_name_1)
 
         # existing saver (coalesces + promotes) - leave as-is since it works for transshipment
-        Process_Data_Service.save_spark_df_as_csv(result_df, aggregated_transshipment_output_path, spark)
+        ProcessDataService.save_spark_df_as_csv(result_df, aggregated_transshipment_output_path, spark)
         logger.info(f"AGGREGATED Transshipment events saved to '{aggregated_transshipment_output_path}'")
 
         logger.info("Task finished. Stopping Spark session...")
@@ -342,7 +343,7 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_3_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_3_[Data_Processing_API]")
 
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
@@ -381,7 +382,7 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
                 logger.info("Falling back to default_parallelism=%s", default_parallelism)
 
         # === Paths / environment choices ===
-        is_container = Process_Data_Service._is_running_in_container()
+        is_container = ProcessDataService._is_running_in_container()
 
         if is_container:
             input_dir = "/app/processed_output"
@@ -410,7 +411,7 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_normal_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = Process_Data_Service.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+        result_df = ProcessDataService.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
             ais_spark_df, ais_csv_path, spark
         )
 
@@ -420,7 +421,7 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
         )
         aggregated_normal_output_path = os.path.join(base_output_dir, new_file_name_2)
 
-        Process_Data_Service.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
+        ProcessDataService.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
             spark_df=result_df,
             output_dir=aggregated_normal_output_path,
             spark=spark,
@@ -476,7 +477,7 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_4_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_4_[Data_Processing_API]")
 
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
@@ -515,7 +516,7 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
                 logger.info("Falling back to default_parallelism=%s", default_parallelism)
 
         # === Paths / environment choices ===
-        is_container = Process_Data_Service._is_running_in_container()
+        is_container = ProcessDataService._is_running_in_container()
 
         if is_container:
             input_dir = "/app/processed_output"
@@ -543,7 +544,7 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_stopping_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = Process_Data_Service.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+        result_df = ProcessDataService.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
             ais_spark_df, ais_csv_path, spark
         )
 
@@ -553,7 +554,7 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
         )
         aggregated_stopping_output_path = os.path.join(base_output_dir, new_file_name_3)
 
-        Process_Data_Service.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
+        ProcessDataService.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
             spark_df=result_df,
             output_dir=aggregated_stopping_output_path,
             spark=spark,
@@ -605,7 +606,7 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_PART_5_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_5_[Data_Processing_API]")
 
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
@@ -644,7 +645,7 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
                 logger.info("Falling back to default_parallelism=%s", default_parallelism)
 
         # === Paths / environment choices ===
-        is_container = Process_Data_Service._is_running_in_container()
+        is_container = ProcessDataService._is_running_in_container()
 
         if is_container:
             input_dir = "/app/processed_output"
@@ -672,7 +673,7 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_loitering_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = Process_Data_Service.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+        result_df = ProcessDataService.create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
             ais_spark_df, ais_csv_path, spark
         )
 
@@ -682,7 +683,7 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
         )
         aggregated_loitering_output_path = os.path.join(base_output_dir, new_file_name_4)
 
-        Process_Data_Service.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
+        ProcessDataService.save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
             spark_df=result_df,
             output_dir=aggregated_loitering_output_path,
             spark=spark,
@@ -722,9 +723,9 @@ def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
     logger.info("Received request at /process-Pitsikalis-2019-AIS-data-OPTIONAL-MUST-BE-SKIPPED")
 
     try:
-        spark = Process_Data_Service.init_spark_session("Pitsikalis_2019_AIS_OPTIONAL_MUST_BE_SKIPPED_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_OPTIONAL_MUST_BE_SKIPPED_[Data_Processing_API]")
 
-        is_container = Process_Data_Service._is_running_in_container()  # log if in container or not
+        is_container = ProcessDataService._is_running_in_container()  # log if in container or not
         
         # input dir from env var or default
         if is_container:
@@ -748,7 +749,7 @@ def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = Process_Data_Service.OPTIONAL_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
+        result_df = ProcessDataService.OPTIONAL_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default
@@ -762,7 +763,7 @@ def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
         cleaned_non_transshipment_output_path = os.path.join(base_output_dir, new_file_name)
 
         # Call helper function (it coalesces and then promotes)
-        Process_Data_Service.save_spark_df_as_csv(result_df, cleaned_non_transshipment_output_path, spark)
+        ProcessDataService.save_spark_df_as_csv(result_df, cleaned_non_transshipment_output_path, spark)
         logger.info(f"CLEANED Loitering, non-loitering, and stopping events saved to '{cleaned_non_transshipment_output_path}'")
 
         logger.info("Task finished. Stopping Spark session...")
@@ -793,9 +794,9 @@ def write_agg_Pitsikalis_2019_AIS_data_in_database():
     logger.info("Received request at /write-agg-Pitsikalis-2019-AIS-data-in-database")
 
     try:
-        spark = Process_Data_Service.init_spark_session("Write_Agg_Pitsikalis_2019_AIS_Data_In_Database_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Write_Agg_Pitsikalis_2019_AIS_Data_In_Database_[Data_Processing_API]")
         # === Paths / environment choices ===
-        is_container = Process_Data_Service._is_running_in_container()
+        is_container = ProcessDataService._is_running_in_container()
 
         if is_container:
             input_dir = "/app/processed_output"
