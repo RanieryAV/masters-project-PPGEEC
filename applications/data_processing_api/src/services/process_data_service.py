@@ -2710,11 +2710,11 @@ class ProcessDataService:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (seconds) — time_diffs_ms -> /1000.0
+        # NEW: average_time_diff_between_consecutive_points (milliseconds) — keep time_diffs_ms units
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
-                "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE (aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double)) / 1000.0 END"
+                "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double) END"
             ).cast(DoubleType())
         )
 
