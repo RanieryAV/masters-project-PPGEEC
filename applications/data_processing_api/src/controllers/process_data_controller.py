@@ -800,10 +800,10 @@ def write_agg_Pitsikalis_2019_AIS_data_in_database():
             input_dir = "shared/utils/processed_output"
 
         # Get aggregated events
-        aggregated_AIS_dir_names = ["agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"#,
-                                     #"agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
-                                     #"agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
-                                     #"agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+        aggregated_AIS_dir_names = ["agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+                                     "agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
                                      ]
         
         for dir_name in aggregated_AIS_dir_names:
