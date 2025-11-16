@@ -1,4 +1,4 @@
-summary: "[PART 3] Process Pitsikalis 2019 labels data for recognised composite events"
+summary: "[PART 4] Process Pitsikalis 2019 labels data for recognised composite events"
 description: |
   Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with *NORMAL* data ("ais_normal_events_Pitsikalis_2019"),
   filter and transform the data:

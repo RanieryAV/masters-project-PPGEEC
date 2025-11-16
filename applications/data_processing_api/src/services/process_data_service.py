@@ -2166,7 +2166,7 @@ class ProcessDataService:
         return result
 
     # ---------- Top-level orchestrator ----------
-    def OPTIONAL_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
+    def DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
         """
         Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by EventIndex.
 

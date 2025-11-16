@@ -33,18 +33,18 @@ logger = get_logger()
 # Load environment variables
 load_dotenv()
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_labels_data.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-labels-data', methods=['POST'])
-def process_Pitsikalis_2019_labels_data():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_1_select_desired_labels.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-1-select-desired-labels', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_1_select_desired_labels():
     """
-    Process the Pitsikalis 2019 labels data (recognized composite events).
+    Process the Pitsikalis 2019 labels data (recognized composite events - PART 1: Select desired labels).
     Expects a POST request. Loads data from a predefined CSV path, processes it using Spark,
     and saves the processed data as a new CSV file.
     """
-    logger.info("Received request at /process-Pitsikalis-2019-labels-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-1-select-desired-labels")
 
     try:
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_Labels_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_data_PART_1_select_desired_labels_[Data_Processing_API]")
 
         expected_header = ["FluentName", "MMSI", "Argument", "Value", "T_start", "T_end"]
         
@@ -100,19 +100,20 @@ def process_Pitsikalis_2019_labels_data():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_1.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-1', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_PART_1():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_2_pre_process_the_previously_selected_labels.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-2-pre-process-the-previously-selected-labels', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_2_pre_process_the_previously_selected_labels():
     """
-    Process the Pitsikalis 2019 AIS data (PART 1).
+    Process the Pitsikalis 2019 AIS data (PART 2 - Pre-process the previously selected labels).
     Expects a POST request. Loads data from a predefined CSV path ("Pitsikalis_2019_filtered_fluentname_data_v2"),
-    processes it using Spark, and saves the processed data as new CSV files: one for transshipment events ("ais_transshipment_events")
-    and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events").
+    processes it using Spark, and saves the processed data as new CSV files: one for transshipment events
+    ("ais_transshipment_events_Pitsikalis_2019"), other for loitering events ("ais_loitering_events_Pitsikalis_2019"),
+    other for normal events ("ais_normal_events_Pitsikalis_2019"), and another for stopping events ("ais_stopping_events_Pitsikalis_2019").
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-1-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-2-pre-process-the-previously-selected-labels")
 
     try:
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_1_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_data_PART_2_pre_process_the_previously_selected_labels_[Data_Processing_API]")
 
         is_container = ProcessDataService._is_running_in_container()  # log if in container or not
         
@@ -194,11 +195,11 @@ def process_Pitsikalis_2019_AIS_data_PART_1():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
     
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_2.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-2', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_PART_2():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_3_AGG_TRANSSHIPMENT.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-3-AGG-TRANSSHIPMENT', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_3_AGG_TRANSSHIPMENT():
     """
-    Processes the Pitsikalis 2019 AIS data (PART 2) for *TRANSSHIPMENT* events.
+    Processes the Pitsikalis 2019 AIS data (PART 3) for *TRANSSHIPMENT* events.
 
     This endpoint expects a POST request and performs the following steps:
     1. Initializes a Spark session with conservative runtime tuning for stability.
@@ -220,11 +221,11 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
     Raises:
         Returns a JSON error response with traceback if any step fails.
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-2-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-3-AGG-TRANSSHIPMENT")
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_2_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_3_AGG_TRANSSHIPMENT_[Data_Processing_API]")
 
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
@@ -319,12 +320,11 @@ def process_Pitsikalis_2019_AIS_data_PART_2():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
     
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_3.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-3', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_PART_3():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_4_AGG_NORMAL.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-4-AGG-NORMAL', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_4_AGG_NORMAL():
     """
-    Processes the Pitsikalis 2019 AIS data (PART 3) for *NORMAL* vessel events.
-
+    Processes the Pitsikalis 2019 AIS data (PART 4) for *NORMAL* vessel events.
     This endpoint expects a POST request and performs the following steps:
     1. Initializes a Spark session with conservative runtime tuning for reliability.
     2. Determines Spark parallelism settings robustly, using environment variables as fallback.
@@ -339,12 +339,11 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
         Flask Response: JSON object with status, message, and output path for the aggregated normal events data.
         On error, returns JSON with error details and traceback.
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-3-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-4-AGG-NORMAL")
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_3_[Data_Processing_API]")
-
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_4_AGG_NORMAL_[Data_Processing_API]")
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
             spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
@@ -450,12 +449,11 @@ def process_Pitsikalis_2019_AIS_data_PART_3():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_4.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-4', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_PART_4():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_5_AGG_STOPPING.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-5-AGG-STOPPING', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_5_AGG_STOPPING():
     """
-    Processes the Pitsikalis 2019 AIS *STOPPING* events data (PART 4).
-
+    Processes the Pitsikalis 2019 AIS *STOPPING* events data (PART 5).
     This function is designed to be triggered by a POST request. It performs the following steps:
         - Initializes a Spark session with conservative runtime tuning for reliability.
         - Determines Spark parallelism settings robustly, using environment variables as fallback.
@@ -473,12 +471,11 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
             FileNotFoundError: If no preprocessed stopping events CSV is found.
             Exception: For any other errors during processing, with traceback included in the response.
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-4-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-5-AGG-STOPPING")
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_4_[Data_Processing_API]")
-
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_5_AGG_STOPPING_[Data_Processing_API]")
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
             spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
@@ -582,11 +579,11 @@ def process_Pitsikalis_2019_AIS_data_PART_4():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_5.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-5', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_PART_5():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_PART_6_AGG_LOITERING.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-PART-6-AGG-LOITERING', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_PART_6_AGG_LOITERING():
     """
-    Processes the Pitsikalis 2019 AIS data (PART 5) for *LOITERING* events.
+    Processes the Pitsikalis 2019 AIS data (PART 6) for *LOITERING* events.
 
     This function is designed to be triggered by a POST request. It performs the following steps:
         - Initializes a Spark session with conservative runtime tuning for stability.
@@ -602,12 +599,11 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
             A Flask JSON response containing the status, message, and output path for the aggregated loitering events data.
             On error, returns a JSON response with error details and traceback.
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-PART-5-data")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-PART-6-AGG-LOITERING")
 
     try:
         # === Create Spark session (unchanged init_spark_session is used) ===
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_5_[Data_Processing_API]")
-
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_PART_6_AGG_LOITERING_[Data_Processing_API]")
         # === Conservative Spark runtime tuning (keeps the safe settings you used earlier) ===
         try:
             spark.conf.set("spark.reducer.maxSizeInFlight", "8m")
@@ -711,19 +707,19 @@ def process_Pitsikalis_2019_AIS_data_PART_5():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-OPTIONAL-MUST-BE-SKIPPED', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
+@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED.yml'))
+@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED', methods=['POST'])
+def process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED():
     """
-    Process the Pitsikalis 2019 AIS data (OPTIONAL_MUST_BE_SKIPPED).
+    Process the Pitsikalis 2019 AIS data (DEPRECATED_MUST_BE_SKIPPED).
     Expects a POST request. Loads data from a predefined CSV path ("Pitsikalis_2019_filtered_fluentname_data_v2"),
     processes it using Spark, and saves the processed data as new CSV files: one for transshipment events ("ais_transshipment_events")
     and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events").
     """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-OPTIONAL-MUST-BE-SKIPPED")
+    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED")
 
     try:
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_OPTIONAL_MUST_BE_SKIPPED_[Data_Processing_API]")
+        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_DEPRECATED_MUST_BE_SKIPPED_[Data_Processing_API]")
 
         is_container = ProcessDataService._is_running_in_container()  # log if in container or not
         
@@ -749,7 +745,7 @@ def process_Pitsikalis_2019_AIS_data_OPTIONAL_MUST_BE_SKIPPED():
 
         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_AIS_csv_path)
         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = ProcessDataService.OPTIONAL_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
+        result_df = ProcessDataService.DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
 
         # Save the processed dataframe as CSV
         # processed output dir from env var or default
