@@ -49,6 +49,7 @@ services:
       dockerfile: applications/model_deployment_api/dockerfile.model_deployment_api
     volumes:
       - ./applications/model_deployment_api/models:/models
+      - ./infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     ports:
       - ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}:${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
       - 8502:8502 # Temporary port for the streamlit prototype
@@ -67,6 +68,11 @@ services:
       # MLFlow env vars
       MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+
+      # ensure driver JVM and executors see the jar
+      PYSPARK_SUBMIT_ARGS: "--jars /opt/jars/postgresql.jar --driver-class-path /opt/jars/postgresql.jar pyspark-shell"
+      # optional fallback (some spark builds read this)
+      SPARK_CLASSPATH: "/opt/jars/postgresql.jar"
     networks:
       - captaima-network
 

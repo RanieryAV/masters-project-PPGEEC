@@ -7,12 +7,16 @@ import traceback
 import logging
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 prediction_bp = Blueprint('prediction_bp', __name__)
+
+# Load environment variables
+load_dotenv()
 
 @prediction_bp.route('/sliding-window-loitering', methods=['POST'])
 @swag_from(path.join(path.dirname(__file__), '../docs/find_loitering_trajectories.yml'))
@@ -47,7 +51,11 @@ def find_loitering_trajectories():
         logger.info("WARNING: Successfully received response from sliding window extraction!!!")
 
         # Show first rows of the response data (a Spark Dataframe) for debugging
-        response_data.show(5, truncate=False)
+        logger.info("First rows of the response data:")
+        response_data.show(2, truncate=True)
+
+        # Testing only to free RAM, remove later
+        del response_data
 
         # # Parse the JSON response
         # full_response = None

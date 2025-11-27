@@ -36,16 +36,31 @@ class PredictionService:
         import os
         from pyspark.sql import functions as F
 
-        # 1) Ensure JDBC jar present
-        try:
-            jar_abspath = os.path.abspath(jdbc_jar_path)
-            try:
-                spark.sparkContext.addJar(jar_abspath)
-                logger.info("Added JDBC jar to Spark classpath: %s", jar_abspath)
-            except Exception as eadd:
-                logger.debug("sparkContext.addJar non-fatal: %s", eadd)
-        except Exception as e:
-            logger.warning("Could not resolve JDBC jar path (%s): %s", jdbc_jar_path, e)
+        # # 1) Ensure JDBC jar present (try several common candidate paths)
+        # try:
+        #     candidates = [
+        #         os.path.abspath(jdbc_jar_path) if jdbc_jar_path else None,
+        #         "/opt/jars/postgresql.jar",
+        #         "/opt/jars/postgresql-42.7.3.jar",
+        #         "/infrastructure/jars/postgresql-42.7.3.jar",
+        #         os.path.join(os.getcwd(), "infrastructure/jars/postgresql-42.7.3.jar")
+        #     ]
+        #     added = False
+        #     for c in [p for p in candidates if p]:
+        #         if os.path.exists(c):
+        #             try:
+        #                 # use file:// absolute URI to be safe
+        #                 jar_uri = f"file://{os.path.abspath(c)}"
+        #                 spark.sparkContext.addJar(jar_uri)
+        #                 logger.info("Added JDBC jar to Spark classpath: %s", jar_uri)
+        #                 added = True
+        #                 break
+        #             except Exception as eadd:
+        #                 logger.debug("sparkContext.addJar failed for %s (non-fatal): %s", c, eadd)
+        #     if not added:
+        #         logger.warning("No JDBC jar found in candidate paths: %s. JDBC reads may fail with ClassNotFoundException.", candidates)
+        # except Exception as e:
+        #     logger.warning("Could not resolve JDBC jar path(s): %s", e)
 
         # 2) JDBC connection props from env
         pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
@@ -76,6 +91,7 @@ class PredictionService:
                 .option("user", pg_user)
                 .option("password", pg_pass)
                 .option("driver", "org.postgresql.Driver")
+                .option("fetchsize", "100")
                 .load()
             )
         except Exception as e:
@@ -187,6 +203,15 @@ class PredictionService:
         # Return all rows fully-within (may be multiple)
         out_cols = df.columns[:]
         final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
+
+        # Remove intermediate DataFrames (no longer needed) to free RAM
+        del df_within
+        del contained
+        del smallest_one
+        del df2
+        del df
+
+        #gc.collect()#Implment this later (needs import gc)
         return df_within.select(*final_cols)
 
 
@@ -502,13 +527,21 @@ class PredictionService:
 
         # LOG small stats (best-effort)
         try:
-            sample = final_df.select("mmsi", "n_points", "window_index").limit(5).collect()
+            sample = final_df.select("mmsi", "n_points", "window_index").limit(2).collect()
             logger.info("Sliding-window extraction produced %d blocks (sample): %s", final_df.count() if final_df is not None else -1, sample)
         except Exception:
             logger.debug("Skipping heavy logging of sliding-window results (non-fatal).")
 
         # Placeholder for later subdivision/anomaly detection function
         # e.g. final_df = apply_anomaly_subdivision(final_df, sliding_window_size=sliding_window_size, step_size_hours=step_size_hours)
+        
+        # Remove intermediate DataFrames (no longer needed) to free RAM
+        del agg_df
+        del df2
+        del exploded
+        del exploded_filtered
+        del exploded_windows
+        del grouped
 
         return final_df
 

@@ -57,6 +57,8 @@ class SparkSessionInitializer:
         spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
         spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
 
+        spark_sql_debug_max_to_string_fields = os.getenv("SPARK_SQL_DEBUG_MAX_TO_STRING_FIELDS", "10000")
+
         spark = (
             SparkSession.builder
             .appName(spark_session_name)
@@ -77,6 +79,7 @@ class SparkSessionInitializer:
             .config("spark.shuffle.compress", "true")
             .config("spark.rdd.compress", "true")
             .config("spark.shuffle.spill.compress", "true")
+            .config("spark.sql.debug.maxToStringFields", spark_sql_debug_max_to_string_fields)
             .getOrCreate()
         )
         return spark

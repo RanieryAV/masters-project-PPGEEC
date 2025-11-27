@@ -11,7 +11,9 @@ RUN apt-get update && \
         python3-dev \
         pkg-config \
         libssl-dev \
-        libffi-dev 
+        libffi-dev \
+        openjdk-21-jdk && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

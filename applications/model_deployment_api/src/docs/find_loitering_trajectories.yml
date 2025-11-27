@@ -26,7 +26,7 @@ parameters:
         end_date:
           type: "string"
           format: "date-time"
-          example: "2016-02-12T23:59:59"
+          example: "2016-02-16T23:59:59"
         sliding_window_size:
           type: "integer"
           description: "Size of the sliding window in hours"
