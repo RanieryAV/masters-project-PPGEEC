@@ -17,8 +17,7 @@ class PredictionService:
         start_date_str: str,
         end_date_str: str,
         schema: str = "captaima",
-        table: str = "aggregated_ais_data",
-        jdbc_jar_path: str = "infrastructure/jars/postgresql-42.7.3.jar"
+        table: str = "aggregated_ais_data"
     ):
         """
         Read aggregated_ais_data rows for a given mmsi from Postgres via JDBC (uses provided spark),
@@ -35,32 +34,6 @@ class PredictionService:
         """
         import os
         from pyspark.sql import functions as F
-
-        # # 1) Ensure JDBC jar present (try several common candidate paths)
-        # try:
-        #     candidates = [
-        #         os.path.abspath(jdbc_jar_path) if jdbc_jar_path else None,
-        #         "/opt/jars/postgresql.jar",
-        #         "/opt/jars/postgresql-42.7.3.jar",
-        #         "/infrastructure/jars/postgresql-42.7.3.jar",
-        #         os.path.join(os.getcwd(), "infrastructure/jars/postgresql-42.7.3.jar")
-        #     ]
-        #     added = False
-        #     for c in [p for p in candidates if p]:
-        #         if os.path.exists(c):
-        #             try:
-        #                 # use file:// absolute URI to be safe
-        #                 jar_uri = f"file://{os.path.abspath(c)}"
-        #                 spark.sparkContext.addJar(jar_uri)
-        #                 logger.info("Added JDBC jar to Spark classpath: %s", jar_uri)
-        #                 added = True
-        #                 break
-        #             except Exception as eadd:
-        #                 logger.debug("sparkContext.addJar failed for %s (non-fatal): %s", c, eadd)
-        #     if not added:
-        #         logger.warning("No JDBC jar found in candidate paths: %s. JDBC reads may fail with ClassNotFoundException.", candidates)
-        # except Exception as e:
-        #     logger.warning("Could not resolve JDBC jar path(s): %s", e)
 
         # 2) JDBC connection props from env
         pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
@@ -81,28 +54,119 @@ class PredictionService:
 
         logger.info("Reading aggregated ais data for mmsi=%s from %s.%s via JDBC (looking for covering row or fallback within-rows)", mmsi, schema, table)
 
-        # 3) Read only rows for mmsi
+        # helper: sanitize column names in a DataFrame (force strings, replace numeric/empty with col_i)
+        def _sanitize_column_names(df):
+            try:
+                original = list(df.columns)
+                safe_names = []
+                for i, cname in enumerate(original):
+                    s = str(cname) if cname is not None else ""
+                    if s.strip() == "" or s.isdigit():
+                        s = f"col_{i}"
+                    # avoid duplicates
+                    if s in safe_names:
+                        s = f"{s}_{i}"
+                    safe_names.append(s)
+                if safe_names != original:
+                    logger.info("Sanitizing JDBC column names: %s -> %s", original, safe_names)
+                    return df.toDF(*safe_names)
+                else:
+                    logger.debug("JDBC column names OK: %s", original)
+                    return df
+            except Exception as es:
+                logger.debug("Sanitization of column names failed (non-fatal): %s", es)
+                return df
+
+        # 3) Read only rows for mmsi — attempt partitioned JDBC read (memory-safe)
         try:
-            df = (
-                spark.read
-                .format("jdbc")
-                .option("url", jdbc_url)
-                .option("dbtable", dbtable_subquery)
-                .option("user", pg_user)
-                .option("password", pg_pass)
-                .option("driver", "org.postgresql.Driver")
-                .option("fetchsize", "100")
-                .load()
-            )
+            # decide if partitioned read is possible by querying min/max primary_key for mmsi
+            bounds_tbl = f"(select min(primary_key) as min_pk, max(primary_key) as max_pk from {schema}.{table} where mmsi = '{mmsi_escaped}') as boundsq"
+            min_pk = max_pk = None
+            try:
+                bounds_df = (
+                    spark.read
+                    .format("jdbc")
+                    .option("url", jdbc_url)
+                    .option("dbtable", bounds_tbl)
+                    .option("user", pg_user)
+                    .option("password", pg_pass)
+                    .option("driver", "org.postgresql.Driver")
+                    .option("fetchsize", "1000")
+                    .load()
+                )
+                # small driver-side collect is acceptable here (single-row bounds)
+                row = bounds_df.limit(1).collect()
+                if row:
+                    row0 = row[0].asDict()
+                    min_pk = row0.get("min_pk", None)
+                    max_pk = row0.get("max_pk", None)
+            except Exception as eb:
+                # non-fatal — if it fails, fall back to single-read below
+                logger.debug("Could not fetch bounds for partitioning (non-fatal): %s", eb)
+                min_pk = max_pk = None
+
+            # try interpret bounds as integers
+            min_int = max_int = None
+            try:
+                if min_pk is not None and max_pk is not None:
+                    min_int = int(min_pk)
+                    max_int = int(max_pk)
+            except Exception:
+                min_int = max_int = None
+
+            # if we have valid numeric bounds, use partitioned read
+            if min_int is not None and max_int is not None and min_int < max_int:
+                sc = spark.sparkContext
+                default_parallel = 2000#getattr(sc, "defaultParallelism", None) or 2000
+                # reasonable cap so we don't create thousands of tiny partitions that increase overhead
+                num_partitions = min(1000, max(8, int(default_parallel) * 2))
+                logger.info(
+                    "Using partitioned JDBC read on primary_key [%s..%s] with %d partitions (sc.defaultParallelism=%s)",
+                    min_int, max_int, num_partitions, default_parallel
+                )
+
+                df = (
+                    spark.read
+                    .format("jdbc")
+                    .option("url", jdbc_url)
+                    .option("dbtable", dbtable_subquery)
+                    .option("user", pg_user)
+                    .option("password", pg_pass)
+                    .option("driver", "org.postgresql.Driver")
+                    .option("fetchsize", "1000")
+                    .option("partitionColumn", "primary_key")
+                    .option("lowerBound", str(min_int))
+                    .option("upperBound", str(max_int))
+                    .option("numPartitions", str(num_partitions))
+                    .load()
+                )
+            else:
+                # fallback: single read but with fetchsize (cursor) to reduce memory usage
+                logger.info("Using single JDBC read with fetchsize; consider enabling partitioning to avoid OOM.")
+                df = (
+                    spark.read
+                    .format("jdbc")
+                    .option("url", jdbc_url)
+                    .option("dbtable", dbtable_subquery)
+                    .option("user", pg_user)
+                    .option("password", pg_pass)
+                    .option("driver", "org.postgresql.Driver")
+                    .option("fetchsize", "1000")
+                    .load()
+                )
+
+            # sanitize column names immediately after read (fixes errors like Field name is '0' etc)
+            df = _sanitize_column_names(df)
+
         except Exception as e:
             logger.exception("Failed to read aggregated_ais_data via JDBC: %s", e)
             raise
 
-        # quick partition hint
+        # quick partition hint (non-fatal)
         try:
-            logger.info("Read DataFrame for mmsi=%s with %d partitions", mmsi, df.rdd.getNumPartitions())
+            logger.info("Read DataFrame for mmsi=%s with %d partitions and columns=%s", mmsi, df.rdd.getNumPartitions(), df.columns)
         except Exception:
-            pass
+            logger.debug("Could not log partitions/columns (non-fatal).")
 
         # 4) Normalize timestamp_array -> array and compute first/last elements
         df2 = df.withColumn(
@@ -164,7 +228,7 @@ class PredictionService:
         try:
             if smallest_one.take(1):
                 logger.info("Found a covering aggregated row for mmsi=%s; returning the smallest covering trajectory.", mmsi)
-                out_cols = df.columns[:]  # original DB columns
+                out_cols = df.columns[:]  # original DB columns (sanitized)
                 final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
                 return smallest_one.select(*final_cols)
         except Exception:
@@ -204,15 +268,21 @@ class PredictionService:
         out_cols = df.columns[:]
         final_cols = out_cols + ["traj_start_ts", "traj_end_ts", "_duration_s", "_ts_size"]
 
-        # Remove intermediate DataFrames (no longer needed) to free RAM
-        del df_within
-        del contained
-        del smallest_one
-        del df2
-        del df
+        # Produce final DataFrame to return, then free intermediate Python references
+        final_df = df_within.select(*final_cols)
 
-        #gc.collect()#Implment this later (needs import gc)
-        return df_within.select(*final_cols)
+        # Remove intermediate DataFrame references to help Python GC (non-fatal)
+        try:
+            del contained
+            del smallest_one
+            del df2
+            del df
+            del df_within
+        except Exception:
+            pass
+
+        return final_df
+
 
 
     def sliding_window_extract_trajectory_block_for_interval(
@@ -224,26 +294,19 @@ class PredictionService:
         step_size_hours: int,
         *,
         schema: str = "captaima",
-        table: str = "aggregated_ais_data",
-        jdbc_jar_path: str = "infrastructure/jars/postgresql-42.7.3.jar"
+        table: str = "aggregated_ais_data"
     ):
-        """
-        Sliding-window version of extract_trajectory_block_for_interval.
-
-        - sliding_window_size: window length in hours (int)
-        - step_size_hours: sliding step in hours (int)
-
-        Returns a Spark DataFrame where each row is a trajectory block corresponding to
-        one sliding window (per mmsi). Columns emulate the aggregated_ais_data layout,
-        with `primary_key` renamed to `primary_key_from_aggregated_ais_data`. Additional
-        columns: window_index, window_start_ts, window_end_ts.
-        """
         import os
+        import re
         from datetime import datetime
         from pyspark.sql import functions as F
         from pyspark.sql import types as T
+        from pyspark.sql import Window
+        from pyspark.storagelevel import StorageLevel
 
-        # --- helper: canonicalize incoming datetimes (accept T or space) ---
+        # Tunable solicitado
+        MAX_POINTS_PER_WINDOW = 250
+
         def _canon(s: str) -> str:
             s2 = s.replace("T", " ").strip()
             for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
@@ -258,27 +321,26 @@ class PredictionService:
             except Exception:
                 raise ValueError(f"Unrecognized datetime format: {s!r}")
 
-        # validate sliding params
         if sliding_window_size is None or step_size_hours is None:
             raise ValueError("Both sliding_window_size and step_size_hours (ints) must be provided.")
 
         start_canon = _canon(start_date_str)
         end_canon = _canon(end_date_str)
-        logger.info("Sliding-window extract for mmsi=%s interval [%s, %s] window=%dh step=%dh",
+        logger.info("(1 out of 16) Sliding-window extract for mmsi=%s interval [%s, %s] window=%dh step=%dh",
                     mmsi, start_canon, end_canon, sliding_window_size, step_size_hours)
 
-        # --- 1) fetch aggregated rows that either cover or lie within the interval ---
+        # 1) obter aggregated rows
         agg_df = PredictionService.query_aggregated_ais_covering_interval(
             spark=spark,
             mmsi=mmsi,
             start_date_str=start_canon,
             end_date_str=end_canon,
             schema=schema,
-            table=table,
-            jdbc_jar_path=jdbc_jar_path
+            table=table
         )
 
-        # helper to test emptiness safely
+        logger.info("(2 out of 16) returned agg_df cols: %s", agg_df.columns)
+
         def _is_df_empty(df):
             try:
                 return df is None or df.rdd.isEmpty()
@@ -286,8 +348,7 @@ class PredictionService:
                 return df is None or (df.take(1) == [])
 
         if _is_df_empty(agg_df):
-            logger.info("No aggregated rows found that cover or lie within requested interval for mmsi=%s", mmsi)
-            # return an empty DF with expected schema (DB-like + extras)
+            logger.info("(3 out of 16) No aggregated rows found that cover or lie within requested interval for mmsi=%s", mmsi)
             out_schema = T.StructType([
                 T.StructField("primary_key_from_aggregated_ais_data", T.ArrayType(T.LongType()), True),
                 T.StructField("mmsi", T.StringType(), True),
@@ -317,7 +378,35 @@ class PredictionService:
             ])
             return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=out_schema)
 
-        # --- 2) normalize arrays & WKT into arrays of elements (distributed) ---
+        # SANITIZING COLUMN NAMES
+        logger.info("(4 out of 16) Sanitizing column names from JDBC read if necessary.")
+        try:
+            original_cols = list(agg_df.columns)
+            safe_names = []
+            seen = set()
+            for i, cname in enumerate(original_cols):
+                s = "" if cname is None else str(cname)
+                s_clean = s.strip()
+                if s_clean == "" or re.fullmatch(r"\d+", s_clean):
+                    new = f"col_{i}"
+                else:
+                    new = re.sub(r"[^\w]+", "_", s_clean)
+                    if not re.match(r"^[A-Za-z_]", new):
+                        new = f"c_{new}"
+                    if new == "":
+                        new = f"col_{i}"
+                if new in seen:
+                    new = f"{new}_{i}"
+                seen.add(new)
+                safe_names.append(new)
+            if safe_names != original_cols:
+                logger.info("(5 out of 16) Sanitizing JDBC column names: %s -> %s", original_cols, safe_names)
+                agg_df = agg_df.toDF(*safe_names)
+        except Exception as es:
+            logger.debug("Column sanitization failed (non-fatal): %s", es)
+
+        # --- 2) normalizing arrays & WKT ---
+        logger.info("(6 out of 16) Normalizing arrays and WKT columns.")
         df2 = (
             agg_df
             .withColumn("_ts_body", F.regexp_replace(F.col("timestamp_array").cast("string"), r"^\s*\[|\]\s*$", ""))
@@ -329,38 +418,42 @@ class PredictionService:
             .withColumn("_traj_body", F.regexp_replace(F.col("trajectory").cast("string"), r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', ""))
             .withColumn("_traj_body", F.regexp_replace(F.col("_traj_body"), r"\s+", " "))
             .withColumn("_pts_arr", F.when(F.col("_traj_body").isNull(), F.array()).otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
-            # select only columns we need downstream (preserve presence checks)
-            .select(
-                *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
-                            "total_area_time", "low_speed_percentage", "stagnation_time",
-                            "average_time_diff_between_consecutive_points", "behavior_type_vector"]
-                if c in agg_df.columns]),
-                "_ts_arr", "_sog_arr", "_cog_arr", "_pts_arr"
-            )
         )
 
-        # arrays_zip to align positional elements and posexplode to produce one-row-per-point (distributed)
+        logger.info("(7 out of 16) Selecting columns by name (strings).")
+        wanted = [
+            "primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
+            "total_area_time", "low_speed_percentage", "stagnation_time",
+            "average_time_diff_between_consecutive_points", "behavior_type_vector"
+        ]
+        existing = set(df2.columns)
+        select_names = [c for c in wanted if c in existing]
+        for arr_name in ("_ts_arr", "_sog_arr", "_cog_arr", "_pts_arr"):
+            if arr_name not in existing:
+                df2 = df2.withColumn(arr_name, F.array())
+            select_names.append(arr_name)
+
+        df2 = df2.select(*select_names)
+
+        # arrays_zip + posexplode_outer
         df2 = df2.withColumn("_zipped", F.arrays_zip(F.col("_ts_arr"), F.col("_sog_arr"), F.col("_cog_arr"), F.col("_pts_arr")))
 
+        parent_names = [c for c in df2.columns if c not in ("_zipped", "_ts_arr", "_sog_arr", "_cog_arr", "_pts_arr")]
+
+        logger.info("(8 out of 16) Exploding zipped arrays with posexplode_outer and accessing struct fields directly.")
         exploded = df2.select(
-            *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
-                        "total_area_time", "low_speed_percentage", "stagnation_time",
-                        "average_time_diff_between_consecutive_points", "behavior_type_vector"]
-            if c in df2.columns]),
-            F.posexplode_outer(F.col("_zipped")).alias("pos", "elem")
+            *parent_names,
+            F.expr("posexplode_outer(_zipped) as (pos, elem)")
         ).select(
-            *([c for c in ["primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
-                        "total_area_time", "low_speed_percentage", "stagnation_time",
-                        "average_time_diff_between_consecutive_points", "behavior_type_vector"]
-            if c in df2.columns]),
-            "pos",
-            F.col("elem").getItem(0).alias("ts_raw"),
-            F.col("elem").getItem(1).alias("sog_raw"),
-            F.col("elem").getItem(2).alias("cog_raw"),
-            F.col("elem").getItem(3).alias("pt_raw")
+            *parent_names,
+            F.col("pos"),
+            F.col("elem._ts_arr").alias("ts_raw"),
+            F.col("elem._sog_arr").alias("sog_raw"),
+            F.col("elem._cog_arr").alias("cog_raw"),
+            F.col("elem._pts_arr").alias("pt_raw")
         )
 
-        # parse typed columns
+        logger.info("(9 out of 16) Parsing typed columns from raw exploded data.")
         exploded = (
             exploded
             .withColumn("ts_str", F.regexp_replace(F.col("ts_raw").cast("string"), r"^\"|\"$", ""))
@@ -376,7 +469,7 @@ class PredictionService:
             .drop("ts_raw", "sog_raw", "cog_raw", "pt_raw", "pt_clean", "_pt_split", "ts_str")
         )
 
-        # --- 3) restrict points strictly to the overall user interval (avoid windows outside)
+        logger.info("(10 out of 16) Filtering points inside [start, end] interval.")
         start_unix_col = F.unix_timestamp(F.lit(start_canon), "yyyy-MM-dd HH:mm:ss")
         end_unix_col = F.unix_timestamp(F.lit(end_canon), "yyyy-MM-dd HH:mm:ss")
 
@@ -386,36 +479,28 @@ class PredictionService:
             (F.col("ts_unix") <= end_unix_col)
         )
 
-        # if no points -> empty
         try:
             if exploded_filtered.rdd.isEmpty():
-                logger.info("No points inside interval after exploding and filtering for mmsi=%s", mmsi)
+                logger.info("(11 out of 16) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
                 return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
         except Exception:
             if exploded_filtered.take(1) == []:
-                logger.info("No points inside interval after exploding and filtering for mmsi=%s", mmsi)
+                logger.info("(11 out of 16) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
                 return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
 
-        # --- 4) For sliding windows: compute k-range for every point and explode to assign point to windows
+        # 4) indexes of sliding windows covering each point
+        logger.info("(12 out of 16) Computing sliding window indexes for each point.")
         window_size_s = int(sliding_window_size) * 3600
         step_s = int(step_size_hours) * 3600
 
-        # kmin = ceil((ts_unix - window_size_s - start_unix) / step_s)
-        # kmax = floor((ts_unix - start_unix) / step_s)
-        # clamp kmin to >= 0; if kmin > kmax -> no windows for that point
         kmin_expr = F.ceil((F.col("ts_unix") - F.lit(window_size_s) - start_unix_col) / F.lit(step_s)).cast("long")
         kmax_expr = F.floor((F.col("ts_unix") - start_unix_col) / F.lit(step_s)).cast("long")
         kmin_clamped = F.when(kmin_expr < 0, F.lit(0)).otherwise(kmin_expr)
 
-        # generate integer sequence of window indices for each point (may be empty array)
         window_idx_arr = F.when(kmin_clamped <= kmax_expr, F.sequence(kmin_clamped, kmax_expr)).otherwise(F.array())
-
         exploded_windows = exploded_filtered.withColumn("window_idx_arr", window_idx_arr)
-
-        # explode window indices so each row belongs to one window
         exploded_windows = exploded_windows.withColumn("window_index", F.explode_outer(F.col("window_idx_arr"))).drop("window_idx_arr")
 
-        # compute concrete window start/end unix & timestamps
         window_start_unix = (start_unix_col + F.col("window_index") * F.lit(step_s)).cast("long")
         window_end_unix = (window_start_unix + F.lit(window_size_s)).cast("long")
 
@@ -423,12 +508,31 @@ class PredictionService:
         exploded_windows = exploded_windows.withColumn("window_start_ts", F.to_timestamp(F.from_unixtime(F.col("window_start_unix"))))
         exploded_windows = exploded_windows.withColumn("window_end_ts", F.to_timestamp(F.from_unixtime(F.col("window_end_unix"))))
 
-        # drop points that don't actually lie in the computed window range (safety)
         exploded_windows = exploded_windows.filter(
             (F.col("ts_unix") >= F.col("window_start_unix")) & (F.col("ts_unix") <= F.col("window_end_unix"))
         )
 
-        # --- 5) Group by mmsi + window_index -> collect points for each block and compute aggregates ---
+        # Repartition + persist (não aumentamos RAM)
+        default_parallel = 2000
+        num_partitions = min(1000, max(8, int(default_parallel) * 2))
+        try:
+            spark.conf.set("spark.sql.shuffle.partitions", str(num_partitions))
+        except Exception:
+            pass
+
+        exploded_windows = exploded_windows.repartition(num_partitions, F.col("mmsi"), F.col("window_index"))
+        exploded_windows = exploded_windows.persist(StorageLevel.MEMORY_AND_DISK)
+
+        # trim per-window points to MAX_POINTS_PER_WINDOW
+        logger.info("(13 out of 16) Trimming points per window to max %d points if necessary.", MAX_POINTS_PER_WINDOW)
+        try:
+            w = Window.partitionBy("mmsi", "window_index").orderBy("ts_unix")
+            exploded_windows = exploded_windows.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") <= MAX_POINTS_PER_WINDOW).drop("_rn")
+        except Exception:
+            logger.debug("Per-window trimming failed (non-fatal).")
+
+        # 5) group and aggregate
+        logger.info("(14 out of 16) Grouping and aggregating points into sliding windows.")
         pts_struct = F.struct(
             F.col("ts_unix").alias("ts_unix"),
             F.col("ts_ts").alias("ts"),
@@ -447,9 +551,7 @@ class PredictionService:
             F.collect_set(F.col("EventIndex").cast("long")).alias("EventIndex"),
             F.collect_set(F.col("primary_key").cast("long")).alias("primary_key_from_aggregated_ais_data"),
             F.count(F.lit(1)).alias("n_points"),
-            # sum distances contributed by parent aggregated rows (approximate)
             F.sum(F.col("distance_in_kilometers")).alias("distance_in_kilometers"),
-            # sog/cog stats
             F.avg("sog").alias("average_speed"),
             F.min("sog").alias("min_speed"),
             F.max("sog").alias("max_speed"),
@@ -458,7 +560,6 @@ class PredictionService:
             F.min("cog").alias("min_heading"),
             F.max("cog").alias("max_heading"),
             F.stddev("cog").alias("std_dev_heading"),
-            # aggregate other parent-row metrics in a reasonable way (avg or sum depending on semantics)
             F.avg(F.col("average_time_diff_between_consecutive_points")).alias("average_time_diff_between_consecutive_points"),
             F.sum(F.col("total_area_time")).alias("total_area_time"),
             F.avg(F.col("low_speed_percentage")).alias("low_speed_percentage"),
@@ -466,10 +567,8 @@ class PredictionService:
             F.collect_set(F.col("behavior_type_vector")).alias("behavior_type_vector")
         )
 
-        # sort pts by ts_unix
         grouped = grouped.withColumn("pts_sorted", F.expr("array_sort(pts)"))
 
-        # build arrays, linestring and proper timestamp arrays
         grouped = grouped.withColumn(
             "lonlat_arr",
             F.expr("transform(pts_sorted, x -> concat(CAST(x.lon AS STRING), ' ', CAST(x.lat AS STRING)))")
@@ -493,7 +592,6 @@ class PredictionService:
             F.to_timestamp(F.from_unixtime(F.col("window_end_unix")))
         )
 
-        # ensure final column ordering & names match DB columns (except primary_key renamed) and include window info
         final_cols = [
             "primary_key_from_aggregated_ais_data",
             "mmsi",
@@ -517,7 +615,6 @@ class PredictionService:
             "distance_in_kilometers",
             "average_time_diff_between_consecutive_points",
             "n_points",
-            # sliding-window metadata
             "window_index",
             "window_start_ts",
             "window_end_ts"
@@ -525,24 +622,23 @@ class PredictionService:
 
         final_df = grouped.select(*final_cols)
 
-        # LOG small stats (best-effort)
+        # logging: try to get exact total windows (may be expensive) but fallback gracefully
         try:
-            sample = final_df.select("mmsi", "n_points", "window_index").limit(2).collect()
-            logger.info("Sliding-window extraction produced %d blocks (sample): %s", final_df.count() if final_df is not None else -1, sample)
-        except Exception:
-            logger.debug("Skipping heavy logging of sliding-window results (non-fatal).")
+            total_windows = final_df.count()
+            sample_first = final_df.orderBy("window_index").limit(1).collect()
+            logger.info("(15 out of 16) Sliding-window extraction produced %d windows; sample of first window: %s",
+                        total_windows, sample_first)
+        except Exception as e:
+            # fallback: do a cheap existence/sample check
+            sample_first = final_df.orderBy("window_index").limit(1).collect()
+            has_any = True if sample_first else False
+            logger.info("(15 out of 16) Sliding-window extraction produced %s windows (exact count skipped); sample of first window: %s",
+                        ">=1" if has_any else "0", sample_first)
 
-        # Placeholder for later subdivision/anomaly detection function
-        # e.g. final_df = apply_anomaly_subdivision(final_df, sliding_window_size=sliding_window_size, step_size_hours=step_size_hours)
-        
-        # Remove intermediate DataFrames (no longer needed) to free RAM
-        del agg_df
-        del df2
-        del exploded
-        del exploded_filtered
-        del exploded_windows
-        del grouped
+        try:
+            exploded_windows.unpersist(blocking=False)
+            logger.info("(16 out of 16) exploded_windows unpersisted (blocking=False) and function returning final_df.")
+        except Exception:
+            logger.info("(16 out of 16) exploded_windows unpersist attempted (non-fatal).")
 
         return final_df
-
-
