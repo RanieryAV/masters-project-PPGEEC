@@ -50,7 +50,10 @@ class PredictionService:
         mmsi_raw = "" if mmsi is None else str(mmsi)
         mmsi_escaped = mmsi_raw.replace("'", "''")
         # mmsi is varchar -> keep quoted
-        dbtable_subquery = f"(select * from {schema}.{table} where mmsi = '{mmsi_escaped}') as subq"
+        dbtable_subquery = (
+            f"(select *, ST_AsText(trajectory) as trajectory_wkt "
+            f"from {schema}.{table} where mmsi = '{mmsi_escaped}') as subq"
+        )
 
         logger.info("Reading aggregated ais data for mmsi=%s from %s.%s via JDBC (looking for covering row or fallback within-rows)", mmsi, schema, table)
 
@@ -407,6 +410,9 @@ class PredictionService:
 
         # --- 2) normalizing arrays & WKT ---
         logger.info("(6 out of 16) Normalizing arrays and WKT columns.")
+
+        traj_col = "trajectory_wkt" if "trajectory_wkt" in agg_df.columns else "trajectory"
+        
         df2 = (
             agg_df
             .withColumn("_ts_body", F.regexp_replace(F.col("timestamp_array").cast("string"), r"^\s*\[|\]\s*$", ""))
@@ -415,9 +421,15 @@ class PredictionService:
             .withColumn("_sog_arr", F.split(F.col("_sog_body"), r"\s*,\s*"))
             .withColumn("_cog_body", F.regexp_replace(F.col("cog_array").cast("string"), r"^\s*\[|\]\s*$", ""))
             .withColumn("_cog_arr", F.split(F.col("_cog_body"), r"\s*,\s*"))
-            .withColumn("_traj_body", F.regexp_replace(F.col("trajectory").cast("string"), r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', ""))
+            # Use the WKT text column when available
+            .withColumn("_traj_body", F.regexp_replace(F.col(traj_col).cast("string"), r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', ""))
+            # removes occurrences of POINT(...) as well, just in case, leaving only coordinate pairs
+            .withColumn("_traj_body", F.regexp_replace(F.col("_traj_body"), r'(?i)POINT\s*\(\s*|\)\s*', ""))
             .withColumn("_traj_body", F.regexp_replace(F.col("_traj_body"), r"\s+", " "))
-            .withColumn("_pts_arr", F.when(F.col("_traj_body").isNull(), F.array()).otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
+            # if _traj_body is null or empty, create empty array
+            .withColumn("_pts_arr",
+                        F.when((F.col("_traj_body").isNull()) | (F.col("_traj_body") == ""), F.array())
+                        .otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
         )
 
         logger.info("(7 out of 16) Selecting columns by name (strings).")
@@ -453,6 +465,8 @@ class PredictionService:
             F.col("elem._pts_arr").alias("pt_raw")
         )
 
+        logger.info("debug exploded.select for 'pt_raw': %s", exploded.select("pt_raw").limit(3).collect())
+
         logger.info("(9 out of 16) Parsing typed columns from raw exploded data.")
         exploded = (
             exploded
@@ -462,7 +476,12 @@ class PredictionService:
             .withColumn("ts_unix", F.unix_timestamp(F.col("ts_ts")))
             .withColumn("sog", F.when(F.col("sog_raw").isNull(), None).otherwise(F.col("sog_raw").cast("double")))
             .withColumn("cog", F.when(F.col("cog_raw").isNull(), None).otherwise(F.col("cog_raw").cast("double")))
-            .withColumn("pt_clean", F.regexp_replace(F.col("pt_raw").cast("string"), r"^\s*\"|\"\s*$", ""))
+            # --- ADJUSTED: robust pt parsing: remove POINT(...)/quotes, replace commas with spaces and normalize whitespace ---
+            .withColumn("pt_clean", F.regexp_replace(F.col("pt_raw").cast("string"),
+                                                    r'(?i)^\s*POINT\s*\(|\)\s*$|^\"|\"$', ""))
+            .withColumn("pt_clean", F.when(F.col("pt_clean").isNull(), F.lit("")).otherwise(F.regexp_replace(F.col("pt_clean"), r",", " ")))
+            .withColumn("pt_clean", F.regexp_replace(F.col("pt_clean"), r"\s+", " "))
+            .withColumn("pt_clean", F.trim(F.col("pt_clean")))
             .withColumn("_pt_split", F.split(F.col("pt_clean"), r"\s+"))
             .withColumn("lon", F.when(F.size(F.col("_pt_split")) >= 2, F.col("_pt_split").getItem(0).cast("double")).otherwise(None))
             .withColumn("lat", F.when(F.size(F.col("_pt_split")) >= 2, F.col("_pt_split").getItem(1).cast("double")).otherwise(None))
@@ -571,10 +590,14 @@ class PredictionService:
 
         grouped = grouped.withColumn(
             "lonlat_arr",
-            F.expr("transform(pts_sorted, x -> concat(CAST(x.lon AS STRING), ' ', CAST(x.lat AS STRING)))")
+            F.expr(
+                "transform(filter(pts_sorted, x -> x.lon is not null and x.lat is not null), x -> concat(CAST(x.lon AS STRING), ' ', CAST(x.lat AS STRING)))"
+            )
         ).withColumn(
             "trajectory",
-            F.concat(F.lit("LINESTRING("), F.concat_ws(", ", F.col("lonlat_arr")), F.lit(")"))
+            F.when(F.size(F.col("lonlat_arr")) == 0,
+                F.lit("LINESTRING()"))
+            .otherwise(F.concat(F.lit("LINESTRING("), F.concat_ws(", ", F.col("lonlat_arr")), F.lit(")")))
         ).withColumn(
             "timestamp_array",
             F.expr("transform(pts_sorted, x -> date_format(x.ts, 'yyyy-MM-dd HH:mm:ss'))")
