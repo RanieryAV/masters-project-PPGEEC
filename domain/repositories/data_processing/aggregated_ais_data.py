@@ -7,7 +7,7 @@ class AggregatedAISData(db.Model):
     __tablename__ = 'aggregated_ais_data'
     # schema only; no extra columns beyond those requested
     __table_args__ = (
-        UniqueConstraint('mmsi', 'EventIndex', 'behavior_type_vector', name='unique_mmsi_event_index_behavior_type'),
+        UniqueConstraint('mmsi', 'EventIndex', 'behavior_type_label', name='unique_mmsi_event_index_behavior_type'),
         {"schema": "captaima"},
     )
 
@@ -18,7 +18,7 @@ class AggregatedAISData(db.Model):
     timestamp_array = db.Column('timestamp_array', db.Text, nullable=False)
     sog_array = db.Column('sog_array', db.Text, nullable=False)   # speed array
     cog_array = db.Column('cog_array', db.Text, nullable=False)   # heading array
-    behavior_type = db.Column('behavior_type_vector', db.String(255), nullable=False)
+    behavior_type_label = db.Column('behavior_type_label', db.String(255), nullable=False)
 
     average_speed = db.Column('average_speed', db.Float, nullable=False)
     min_speed = db.Column('min_speed', db.Float, nullable=False)
@@ -38,6 +38,10 @@ class AggregatedAISData(db.Model):
     distance_in_kilometers = db.Column('distance_in_kilometers', db.Float, nullable=False)
     average_time_diff = db.Column('average_time_diff_between_consecutive_points', db.Float, nullable=False)
 
+    displacement_ratio = db.Column('displacement_ratio', db.Float, nullable=False)
+    cog_unit_range = db.Column('cog_unit_range', db.Float, nullable=False)
+    cog_ratio = db.Column('cog_ratio', db.Float, nullable=False)
+
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -55,7 +59,7 @@ class AggregatedAISData(db.Model):
             'timestamp_array': self.timestamp_array,
             'sog_array': self.sog_array,
             'cog_array': self.cog_array,
-            'behavior_type_vector': self.behavior_type,
+            'behavior_type_label': self.behavior_type_label,
 
             'average_speed': self.average_speed,
             'min_speed': self.min_speed,
@@ -73,5 +77,9 @@ class AggregatedAISData(db.Model):
             'stagnation_time': self.stagnation_time,
 
             'distance_in_kilometers': self.distance_in_kilometers,
-            'average_time_diff_between_consecutive_points': self.average_time_diff
+            'average_time_diff_between_consecutive_points': self.average_time_diff,
+
+            'displacement_ratio': self.displacement_ratio,
+            'cog_unit_range': self.cog_unit_range,
+            'cog_ratio': self.cog_ratio
         }

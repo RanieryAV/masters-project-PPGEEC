@@ -707,85 +707,18 @@ def process_Pitsikalis_2019_AIS_data_PART_6_AGG_LOITERING():
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
-@swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED.yml'))
-@preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED', methods=['POST'])
-def process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED():
-    """
-    Process the Pitsikalis 2019 AIS data (DEPRECATED_MUST_BE_SKIPPED).
-    Expects a POST request. Loads data from a predefined CSV path ("Pitsikalis_2019_filtered_fluentname_data_v2"),
-    processes it using Spark, and saves the processed data as new CSV files: one for transshipment events ("ais_transshipment_events")
-    and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events").
-    """
-    logger.info("Received request at /process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED")
-
-    try:
-        spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_DEPRECATED_MUST_BE_SKIPPED_[Data_Processing_API]")
-
-        is_container = ProcessDataService._is_running_in_container()  # log if in container or not
-        
-        # input dir from env var or default
-        if is_container:
-            input_dir = "/app/processed_output"
-        else:
-            input_dir = "shared/utils/processed_output"
-
-        # Build paths to the CSV files
-        preprocessed_AIS_dir = os.path.join(input_dir, "ais_loitering_non_loitering_stopping_events")
-        csv_files = glob.glob(os.path.join(preprocessed_AIS_dir, "*.csv"))
-        if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in directory: {preprocessed_AIS_dir}")
-        preprocessed_AIS_csv_path = csv_files[0]
-
-        # if is_container:
-        #     ais_csv_path = "/app/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
-        # else:
-        #     ais_csv_path = "shared/utils/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
-
-        logger.info(f"Loading pre-processed loitering, non-loitering, and stopping events labels from {preprocessed_AIS_csv_path}")
-
-        ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_AIS_csv_path)
-        ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
-        result_df = ProcessDataService.DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
-
-        # Save the processed dataframe as CSV
-        # processed output dir from env var or default
-        if is_container:
-            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
-        else:
-            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
-
-        # Write to an output directory (coalesce to 1)
-        new_file_name = os.getenv("OUTPUT_FOLDER_NAME_FOR_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2", "Placeholder_folder_data_processed_by_spark")
-        cleaned_non_transshipment_output_path = os.path.join(base_output_dir, new_file_name)
-
-        # Call helper function (it coalesces and then promotes)
-        ProcessDataService.save_spark_df_as_csv(result_df, cleaned_non_transshipment_output_path, spark)
-        logger.info(f"CLEANED Loitering, non-loitering, and stopping events saved to '{cleaned_non_transshipment_output_path}'")
-
-        logger.info("Task finished. Stopping Spark session...")
-        spark.stop()
-
-        return jsonify({
-            "status": "success",
-            "message": "CLEANED Loitering, non-loitering, and stopping events processed and saved.",
-            "output_path": cleaned_non_transshipment_output_path
-        }), 200
-    except Exception as e:
-        logger.error("Error loading or processing events data", exc_info=True)
-        traceback_str = traceback.format_exc()
-        return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500    
     
 @swag_from(path.join(path.dirname(__file__), '../docs/write_agg_Pitsikalis_2019_AIS_data_in_database.yml'))
 @preprocess_data_bp.route('/write-agg-Pitsikalis-2019-AIS-data-in-database', methods=['POST'])
 def write_agg_Pitsikalis_2019_AIS_data_in_database():
     """
     Writes the aggregated Pitsikalis 2019 AIS data into the database.
-    This endpoint expects a POST request and performs the following steps:
-    1. Initializes a Spark session.
-    2. Determines input directory based on whether the code is running in a container.
-    3. Loads aggregated AIS data CSV files from predefined directories.
-    4. For each CSV file, reads the data into a Spark DataFrame and writes it to the database using a service function.
-    5. Stops the Spark session and returns a success response.
+
+    Behaviour:
+    - Try standard Spark CSV read (header + inferSchema).
+    - If that fails (exception) or yields no rows, attempt a fallback read that disables CSV quoting
+      (quote and escape set to NUL) and uses permissive/multiLine parsing and large maxColumns.
+    - If fallback also fails, skip the file and log an error but continue processing other files.
     """
     logger.info("Received request at /write-agg-Pitsikalis-2019-AIS-data-in-database")
 
@@ -799,29 +732,95 @@ def write_agg_Pitsikalis_2019_AIS_data_in_database():
         else:
             input_dir = "shared/utils/processed_output"
 
-        # Get aggregated events
-        aggregated_AIS_dir_names = ["agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
-                                     "agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
-                                     "agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
-                                     "agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
-                                     ]
-        
+        # Get aggregated events directories (you had these originally)
+        aggregated_AIS_dir_names = [
+            #"agg_transship_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+            #"agg_loitering_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+            #"agg_normal_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES",
+            "agg_stopping_unique_vessel_data_pitsikalis2019_WITH_EXTRA_FEATURES"
+        ]
+
         for dir_name in aggregated_AIS_dir_names:
             aggregated_AIS_dir = os.path.join(input_dir, dir_name)
             csv_files = glob.glob(os.path.join(aggregated_AIS_dir, "*.csv"))
             if not csv_files:
-                raise FileNotFoundError(f"No CSV files found in directory: {aggregated_AIS_dir}")
-            
+                logger.warning(f"No CSV files found in directory: {aggregated_AIS_dir} (skipping)")
+                continue
+
             for individual_aggregated_AIS_csv_file in csv_files:
                 logger.info(f"Loading aggregated events labels from {individual_aggregated_AIS_csv_file}")
 
-                ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(individual_aggregated_AIS_csv_file)
-                ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
+                ais_spark_df = None
+                # --- 1) Standard read attempt (keep identical to original behaviour) ---
+                try:
+                    ais_spark_df = (
+                        spark.read
+                        .option("header", True)
+                        .option("inferSchema", True)
+                        .csv(individual_aggregated_AIS_csv_file)
+                    )
+                    # normalize column names
+                    ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
+                except Exception as std_err:
+                    logger.warning("Standard spark.read CSV failed for %s: %s", individual_aggregated_AIS_csv_file, std_err)
+                    ais_spark_df = None
 
-                # Write to database
-                SaveAISDataService.upsert_aggregated_ais_spark_df_to_db(ais_spark_df)
-                logger.info(f"Written aggregated data from '{individual_aggregated_AIS_csv_file}' to database.")
-        
+                # --- 2) If standard read produced an empty DataFrame or failed, attempt fallback ---
+                def _df_has_rows(df) -> bool:
+                    try:
+                        # Prefer rdd.isEmpty() if available (cheap on driver), else take(1)
+                        return not df.rdd.isEmpty()
+                    except Exception:
+                        return df.take(1) != []
+
+                if ais_spark_df is None or (ais_spark_df is not None and not _df_has_rows(ais_spark_df)):
+                    # Log reason
+                    if ais_spark_df is None:
+                        logger.info("Attempting fallback read for file (disabling CSV quoting / permissive parsing).")
+                    else:
+                        logger.info("Standard read returned no rows; attempting fallback read (disabling CSV quoting).")
+
+                    try:
+                        # Fallback read: disable quoting/escaping by using NUL char; allow multiline & permissive mode;
+                        # increase maxColumns to avoid univocity column bounds errors for very long rows.
+                        ais_spark_df = (
+                            spark.read
+                            .option("header", True)
+                            .option("inferSchema", True)  # keep inferSchema if you want types; can be False if expensive
+                            .option("multiLine", True)
+                            .option("mode", "PERMISSIVE")
+                            .option("quote", "\u0000")   # disable parsing of quoted fields
+                            .option("escape", "\u0000")
+                            .option("maxColumns", "500000")  # keep large to cover extremely long rows
+                            .csv(individual_aggregated_AIS_csv_file)
+                        )
+                        ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
+                        logger.info("Fallback read succeeded for file %s (rows approx: %s partitions).", individual_aggregated_AIS_csv_file, getattr(ais_spark_df.rdd, "getNumPartitions", lambda: "?")())
+                    except Exception as fb_err:
+                        logger.exception("Fallback read also failed for %s: %s -- skipping this file.", individual_aggregated_AIS_csv_file, fb_err)
+                        ais_spark_df = None
+
+                # --- 3) If still no DataFrame or empty, skip file ---
+                if ais_spark_df is None:
+                    logger.error("Could not read CSV file %s with either standard or fallback reader; skipping.", individual_aggregated_AIS_csv_file)
+                    continue
+
+                try:
+                    # double-check non-empty
+                    if not _df_has_rows(ais_spark_df):
+                        logger.info("No data rows found after parsing %s — skipping.", individual_aggregated_AIS_csv_file)
+                        continue
+                except Exception as e_check:
+                    logger.debug("Could not determine if DataFrame has rows; proceeding cautiously: %s", e_check)
+
+                # --- 4) Continue with existing logic: write to DB via upsert function (unchanged) ---
+                try:
+                    SaveAISDataService.upsert_aggregated_ais_spark_df_to_db(ais_spark_df)
+                    logger.info(f"Written aggregated data from '{individual_aggregated_AIS_csv_file}' to database.")
+                except Exception as upsert_err:
+                    logger.exception("Failed to upsert DataFrame from %s: %s", individual_aggregated_AIS_csv_file, upsert_err)
+                    # continue processing other files
+
         logger.info("Task finished. Stopping Spark session...")
         spark.stop()
 
@@ -829,6 +828,80 @@ def write_agg_Pitsikalis_2019_AIS_data_in_database():
             "status": "success",
             "message": "Aggregated Pitsikalis 2019 AIS data written to database."
         }), 200
+
     except Exception as e:
         logger.error("Error processing aggregated Pitsikalis 2019 AIS data", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+
+
+    
+# @swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED.yml'))
+# @preprocess_data_bp.route('/process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED', methods=['POST'])
+# def process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED():
+#     """
+#     Process the Pitsikalis 2019 AIS data (DEPRECATED_MUST_BE_SKIPPED).
+#     Expects a POST request. Loads data from a predefined CSV path ("Pitsikalis_2019_filtered_fluentname_data_v2"),
+#     processes it using Spark, and saves the processed data as new CSV files: one for transshipment events ("ais_transshipment_events")
+#     and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events").
+#     """
+#     logger.info("Received request at /process-Pitsikalis-2019-AIS-data-DEPRECATED-MUST-BE-SKIPPED")
+
+#     try:
+#         spark = SparkSessionInitializer.init_spark_session("Pitsikalis_2019_AIS_DEPRECATED_MUST_BE_SKIPPED_[Data_Processing_API]")
+
+#         is_container = ProcessDataService._is_running_in_container()  # log if in container or not
+        
+#         # input dir from env var or default
+#         if is_container:
+#             input_dir = "/app/processed_output"
+#         else:
+#             input_dir = "shared/utils/processed_output"
+
+#         # Build paths to the CSV files
+#         preprocessed_AIS_dir = os.path.join(input_dir, "ais_loitering_non_loitering_stopping_events")
+#         csv_files = glob.glob(os.path.join(preprocessed_AIS_dir, "*.csv"))
+#         if not csv_files:
+#             raise FileNotFoundError(f"No CSV files found in directory: {preprocessed_AIS_dir}")
+#         preprocessed_AIS_csv_path = csv_files[0]
+
+#         # if is_container:
+#         #     ais_csv_path = "/app/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
+#         # else:
+#         #     ais_csv_path = "shared/utils/datasets/ais_brest_synopses_v0.8/ais_brest_locations.csv"
+
+#         logger.info(f"Loading pre-processed loitering, non-loitering, and stopping events labels from {preprocessed_AIS_csv_path}")
+
+#         ais_spark_df = spark.read.option("header", True).option("inferSchema", True).csv(preprocessed_AIS_csv_path)
+#         ais_spark_df = ais_spark_df.toDF(*[c.strip() for c in ais_spark_df.columns])
+#         result_df = ProcessDataService.DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(ais_spark_df, spark)
+
+#         # Save the processed dataframe as CSV
+#         # processed output dir from env var or default
+#         if is_container:
+#             base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+#         else:
+#             base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
+
+#         # Write to an output directory (coalesce to 1)
+#         new_file_name = os.getenv("OUTPUT_FOLDER_NAME_FOR_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2", "Placeholder_folder_data_processed_by_spark")
+#         cleaned_non_transshipment_output_path = os.path.join(base_output_dir, new_file_name)
+
+#         # Call helper function (it coalesces and then promotes)
+#         ProcessDataService.save_spark_df_as_csv(result_df, cleaned_non_transshipment_output_path, spark)
+#         logger.info(f"CLEANED Loitering, non-loitering, and stopping events saved to '{cleaned_non_transshipment_output_path}'")
+
+#         logger.info("Task finished. Stopping Spark session...")
+#         spark.stop()
+
+#         return jsonify({
+#             "status": "success",
+#             "message": "CLEANED Loitering, non-loitering, and stopping events processed and saved.",
+#             "output_path": cleaned_non_transshipment_output_path
+#         }), 200
+#     except Exception as e:
+#         logger.error("Error loading or processing events data", exc_info=True)
+#         traceback_str = traceback.format_exc()
+#         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500    

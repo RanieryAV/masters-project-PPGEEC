@@ -2002,248 +2002,248 @@ class ProcessDataService:
 
 
     # ---------- Compute event-level metrics using Spark ----------
-    def compute_event_metrics_spark_Pitsikalis_2019(grouped: DataFrame) -> DataFrame:
-        """
-        Given a grouped DataFrame (output of build_grouped_points_Pitsikalis_2019),
-        compute the derived columns using Spark higher-order functions:
+    # def DEPRECATED_compute_event_metrics_spark_Pitsikalis_2019(grouped: DataFrame) -> DataFrame:
+    #     """
+    #     Given a grouped DataFrame (output of build_grouped_points_Pitsikalis_2019),
+    #     compute the derived columns using Spark higher-order functions:
 
-        - timestamp_array (array of ISO strings "YYYY-MM-DD HH:MM:SS")
-        - average_time_diff_between_consecutive_points (seconds, float)
-        - sog_array, cog_array (arrays of doubles)
-        - average_sog, min_sog, max_sog, standard_deviation_sog (population std)
-        - average_cog, min_cog, max_cog, standard_deviation_cog (population std)
-        - trajectory (LINESTRING string using "lon lat" pairs)
-        - coord_pairs (array of structs lat1,lon1,lat2,lon2) for distance calculations
-        - distance_in_kilometers computed by a pure-Spark haversine aggregator
+    #     - timestamp_array (array of ISO strings "YYYY-MM-DD HH:MM:SS")
+    #     - average_time_diff_between_consecutive_points (seconds, float)
+    #     - sog_array, cog_array (arrays of doubles)
+    #     - average_sog, min_sog, max_sog, standard_deviation_sog (population std)
+    #     - average_cog, min_cog, max_cog, standard_deviation_cog (population std)
+    #     - trajectory (LINESTRING string using "lon lat" pairs)
+    #     - coord_pairs (array of structs lat1,lon1,lat2,lon2) for distance calculations
+    #     - distance_in_kilometers computed by a pure-Spark haversine aggregator
 
-        Returns:
-        - DataFrame with final event-level columns similar to original pandas output.
-        """
-        # 1) ts array and ISO formatted timestamp array
-        grouped2 = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)"))
+    #     Returns:
+    #     - DataFrame with final event-level columns similar to original pandas output.
+    #     """
+    #     # 1) ts array and ISO formatted timestamp array
+    #     grouped2 = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)"))
 
-        grouped2 = grouped2.withColumn(
-            "timestamp_array",
-            F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "timestamp_array",
+    #         F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")
+    #     )
 
-        # 2) time_diffs & average
-        grouped2 = grouped2.withColumn(
-            "time_diffs",
-            F.expr(
-                "CASE WHEN size(ts_array) <= 1 THEN array() "
-                "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
-            )
-        )
+    #     # 2) time_diffs & average
+    #     grouped2 = grouped2.withColumn(
+    #         "time_diffs",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_time_diff_between_consecutive_points",
-            F.expr(
-                "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE (aggregate(time_diffs, cast(0 as bigint), (acc, x) -> acc + x) / size(time_diffs)) END"
-            ).cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE (aggregate(time_diffs, cast(0 as bigint), (acc, x) -> acc + x) / size(time_diffs)) END"
+    #         ).cast(DoubleType())
+    #     )
 
-        # 3) SOG / COG arrays (force double cast to avoid datatype mismatches)
-        grouped2 = grouped2.withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))"))
-        grouped2 = grouped2.withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+    #     # 3) SOG / COG arrays (force double cast to avoid datatype mismatches)
+    #     grouped2 = grouped2.withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))"))
+    #     grouped2 = grouped2.withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # 4) SOG stats (population stddev)
-        # Use explicitly typed accumulator cast(0.0 as double) to avoid datatype mismatch
-        grouped2 = grouped2.withColumn(
-            "sum_sog",
-            F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "sumsq_sog",
-            F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "count_sog",
-            F.expr("aggregate(sog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
-        )
+    #     # 4) SOG stats (population stddev)
+    #     # Use explicitly typed accumulator cast(0.0 as double) to avoid datatype mismatch
+    #     grouped2 = grouped2.withColumn(
+    #         "sum_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "sumsq_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "count_sog",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_sog",
-            F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sum_sog / count_sog END").cast(DoubleType())
-        )
-        grouped2 = grouped2.withColumn("min_sog", F.expr("array_min(sog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn("max_sog", F.expr("array_max(sog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn(
-            "standard_deviation_sog",
-            F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sqrt( (sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2) ) END").cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_sog",
+    #         F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sum_sog / count_sog END").cast(DoubleType())
+    #     )
+    #     grouped2 = grouped2.withColumn("min_sog", F.expr("array_min(sog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn("max_sog", F.expr("array_max(sog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn(
+    #         "standard_deviation_sog",
+    #         F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sqrt( (sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2) ) END").cast(DoubleType())
+    #     )
 
-        # 5) COG stats (same treatment)
-        grouped2 = grouped2.withColumn(
-            "sum_cog",
-            F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "sumsq_cog",
-            F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "count_cog",
-            F.expr("aggregate(cog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
-        )
+    #     # 5) COG stats (same treatment)
+    #     grouped2 = grouped2.withColumn(
+    #         "sum_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "sumsq_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "count_cog",
+    #         F.expr("aggregate(cog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_cog",
-            F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sum_cog / count_cog END").cast(DoubleType())
-        )
-        grouped2 = grouped2.withColumn("min_cog", F.expr("array_min(cog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn("max_cog", F.expr("array_max(cog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn(
-            "standard_deviation_cog",
-            F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sqrt( (sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2) ) END").cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_cog",
+    #         F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sum_cog / count_cog END").cast(DoubleType())
+    #     )
+    #     grouped2 = grouped2.withColumn("min_cog", F.expr("array_min(cog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn("max_cog", F.expr("array_max(cog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn(
+    #         "standard_deviation_cog",
+    #         F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sqrt( (sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2) ) END").cast(DoubleType())
+    #     )
 
-        # 6) trajectory LINESTRING
-        grouped2 = grouped2.withColumn(
-            "trajectory",
-            F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
-        )
+    #     # 6) trajectory LINESTRING
+    #     grouped2 = grouped2.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
+    #     )
 
-        # 7) coord_pairs array for distance calculation
-        grouped2 = grouped2.withColumn(
-            "coord_pairs",
-            F.expr(
-                "CASE WHEN size(points) <= 1 THEN array() ELSE transform(sequence(1, size(points)-1), i -> struct( element_at(points, i).lat as lat1, element_at(points, i).lon as lon1, element_at(points, i+1).lat as lat2, element_at(points, i+1).lon as lon2 )) END"
-            )
-        )
+    #     # 7) coord_pairs array for distance calculation
+    #     grouped2 = grouped2.withColumn(
+    #         "coord_pairs",
+    #         F.expr(
+    #             "CASE WHEN size(points) <= 1 THEN array() ELSE transform(sequence(1, size(points)-1), i -> struct( element_at(points, i).lat as lat1, element_at(points, i).lon as lon1, element_at(points, i+1).lat as lat2, element_at(points, i+1).lon as lon2 )) END"
+    #         )
+    #     )
 
-        # 8) compute Spark haversine sum (pure Spark; fast on executors)
-        haversine_expr = ProcessDataService._spark_haversine_distance_expr_for_coord_pairs()
-        grouped2 = grouped2.withColumn("distance_in_kilometers", F.expr(haversine_expr).cast(DoubleType()))
+    #     # 8) compute Spark haversine sum (pure Spark; fast on executors)
+    #     haversine_expr = ProcessDataService._spark_haversine_distance_expr_for_coord_pairs()
+    #     grouped2 = grouped2.withColumn("distance_in_kilometers", F.expr(haversine_expr).cast(DoubleType()))
 
-        # 9) convert timestamp_array (ARRAY<STRING>) to a STRING that looks exactly like Python's list
-        # Format: ['YYYY-MM-DD HH:MM:SS', None, 'YYYY-...']
-        # Use a CASE to render NULL elements as the bare word None (no quotes) and present elements with single quotes.
-        ts_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE concat(\"'\", t, \"'\") END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+    #     # 9) convert timestamp_array (ARRAY<STRING>) to a STRING that looks exactly like Python's list
+    #     # Format: ['YYYY-MM-DD HH:MM:SS', None, 'YYYY-...']
+    #     # Use a CASE to render NULL elements as the bare word None (no quotes) and present elements with single quotes.
+    #     ts_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE concat(\"'\", t, \"'\") END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
 
-        # 10) convert sog_array (ARRAY<DOUBLE>) to STRING like [1.23, None, 4.56]
-        sog_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     # 10) convert sog_array (ARRAY<DOUBLE>) to STRING like [1.23, None, 4.56]
+    #     sog_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
 
-        # 11) convert cog_array (ARRAY<DOUBLE>) to STRING like [12.3, None, 45.6]
-        cog_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+    #     # 11) convert cog_array (ARRAY<DOUBLE>) to STRING like [12.3, None, 45.6]
+    #     cog_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
 
-        # 12) Select final columns keeping original numeric semantics/column names
-        result = grouped2.select(
-            F.col("mmsi").alias("mmsi"),
-            F.col("distance_in_kilometers").alias("distance_in_kilometers"),
-            F.col("EventIndex").alias("EventIndex"),
-            F.col("trajectory").alias("trajectory"),
-            F.col("timestamp_array_str").alias("timestamp_array"),  # <-- stringified version used here
-            F.col("average_time_diff_between_consecutive_points").alias("average_time_diff_between_consecutive_points"),
-            F.col("sog_array_str").alias("sog_array"),  # stringified
-            F.col("cog_array_str").alias("cog_array"),  # stringified
-            F.col("average_sog").alias("average_sog"),
-            F.col("min_sog").alias("min_sog"),
-            F.col("max_sog").alias("max_sog"),
-            F.col("standard_deviation_sog").alias("standard_deviation_sog"),
-            F.col("average_cog").alias("average_cog"),
-            F.col("min_cog").alias("min_cog"),
-            F.col("max_cog").alias("max_cog"),
-            F.col("standard_deviation_cog").alias("standard_deviation_cog"),
-            F.col("Category").alias("behavior_type_vector"),
-        )
+    #     # 12) Select final columns keeping original numeric semantics/column names
+    #     result = grouped2.select(
+    #         F.col("mmsi").alias("mmsi"),
+    #         F.col("distance_in_kilometers").alias("distance_in_kilometers"),
+    #         F.col("EventIndex").alias("EventIndex"),
+    #         F.col("trajectory").alias("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),  # <-- stringified version used here
+    #         F.col("average_time_diff_between_consecutive_points").alias("average_time_diff_between_consecutive_points"),
+    #         F.col("sog_array_str").alias("sog_array"),  # stringified
+    #         F.col("cog_array_str").alias("cog_array"),  # stringified
+    #         F.col("average_sog").alias("average_sog"),
+    #         F.col("min_sog").alias("min_sog"),
+    #         F.col("max_sog").alias("max_sog"),
+    #         F.col("standard_deviation_sog").alias("standard_deviation_sog"),
+    #         F.col("average_cog").alias("average_cog"),
+    #         F.col("min_cog").alias("min_cog"),
+    #         F.col("max_cog").alias("max_cog"),
+    #         F.col("standard_deviation_cog").alias("standard_deviation_cog"),
+    #         F.col("Category").alias("behavior_type_vector"),
+    #     )
 
-        return result
+    #     return result
 
     # ---------- Top-level orchestrator ----------
-    def DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
-        """
-        Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by EventIndex.
+    # def DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
+    #     """
+    #     Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by EventIndex.
 
-        Steps:
-        - logs partition counts and uses mapPartitionsWithIndex to emit per-partition start/finish messages
-        - aggregates points per EventIndex (ordered by timestamp) using pure Spark
-        - computes event-level metrics (timestamp arrays, average time diffs, SOG/COG arrays & stats, trajectory)
-        - computes total distance using a pure-Spark haversine aggregator
-        - logs progress and sample outputs for debugging
+    #     Steps:
+    #     - logs partition counts and uses mapPartitionsWithIndex to emit per-partition start/finish messages
+    #     - aggregates points per EventIndex (ordered by timestamp) using pure Spark
+    #     - computes event-level metrics (timestamp arrays, average time diffs, SOG/COG arrays & stats, trajectory)
+    #     - computes total distance using a pure-Spark haversine aggregator
+    #     - logs progress and sample outputs for debugging
 
-        Returns:
-        - the final Spark DataFrame (pre-save view) for further use.
-        """
-        # initial stats
-        try:
-            total_rows = df.count()
-        except Exception:
-            total_rows = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: starting pipeline. input rows={total_rows}")
+    #     Returns:
+    #     - the final Spark DataFrame (pre-save view) for further use.
+    #     """
+    #     # initial stats
+    #     try:
+    #         total_rows = df.count()
+    #     except Exception:
+    #         total_rows = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: starting pipeline. input rows={total_rows}")
 
-        # log partition counts for progress insight
-        try:
-            partition_count = df.rdd.getNumPartitions()
-            logger.info(f"convert_to_vessel_events_Pitsikalis_2019: input DataFrame partitions = {partition_count}")
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not get partition count")
+    #     # log partition counts for progress insight
+    #     try:
+    #         partition_count = df.rdd.getNumPartitions()
+    #         logger.info(f"convert_to_vessel_events_Pitsikalis_2019: input DataFrame partitions = {partition_count}")
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not get partition count")
 
-        # run partition-level logger to emit start/finish for each partition
-        #ProcessDataService.log_progress_partitions_Pitsikalis_2019(df)
+    #     # run partition-level logger to emit start/finish for each partition
+    #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(df)
 
-        # aggregate points per EventIndex
-        logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per EventIndex")
-        grouped = ProcessDataService.build_grouped_points_Pitsikalis_2019(df)
+    #     # aggregate points per EventIndex
+    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per EventIndex")
+    #     grouped = ProcessDataService.build_grouped_points_Pitsikalis_2019(df)
 
-        # grouped count logging
-        try:
-            grouped_count = grouped.count()
-        except Exception:
-            grouped_count = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped EventIndex count = {grouped_count}")
+    #     # grouped count logging
+    #     try:
+    #         grouped_count = grouped.count()
+    #     except Exception:
+    #         grouped_count = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped EventIndex count = {grouped_count}")
 
-        # log partitions on grouped DataFrame as well
-        try:
-            grouped_partitions = grouped.rdd.getNumPartitions()
-            logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped DataFrame partitions = {grouped_partitions}")
-            #ProcessDataService.log_progress_partitions_Pitsikalis_2019(grouped)
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: failed grouped partition logging")
+    #     # log partitions on grouped DataFrame as well
+    #     try:
+    #         grouped_partitions = grouped.rdd.getNumPartitions()
+    #         logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped DataFrame partitions = {grouped_partitions}")
+    #         #ProcessDataService.log_progress_partitions_Pitsikalis_2019(grouped)
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: failed grouped partition logging")
 
-        # compute metrics (pure Spark heavy-lifting)
-        logger.info("convert_to_vessel_events_Pitsikalis_2019: computing event metrics (Spark)")
-        metrics_df = ProcessDataService.compute_event_metrics_spark_Pitsikalis_2019(grouped)
+    #     # compute metrics (pure Spark heavy-lifting)
+    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: computing event metrics (Spark)")
+    #     metrics_df = ProcessDataService.DEPRECATED_compute_event_metrics_spark_Pitsikalis_2019(grouped)
 
-        # show a sample (safe attempt)
-        try:
-            sample_row = metrics_df.limit(1).collect()
-            if sample_row:
-                logger.info("convert_to_vessel_events_Pitsikalis_2019: sample row for debugging:\n%s", [row.asDict() for row in sample_row])
-            else:
-                logger.info("convert_to_vessel_events_Pitsikalis_2019: no sample row available")
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not fetch sample row")
+    #     # show a sample (safe attempt)
+    #     try:
+    #         sample_row = metrics_df.limit(1).collect()
+    #         if sample_row:
+    #             logger.info("convert_to_vessel_events_Pitsikalis_2019: sample row for debugging:\n%s", [row.asDict() for row in sample_row])
+    #         else:
+    #             logger.info("convert_to_vessel_events_Pitsikalis_2019: no sample row available")
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not fetch sample row")
 
-        # final counts log
-        try:
-            final_count = metrics_df.count()
-        except Exception:
-            final_count = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: finished. output event rows={final_count}")
+    #     # final counts log
+    #     try:
+    #         final_count = metrics_df.count()
+    #     except Exception:
+    #         final_count = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: finished. output event rows={final_count}")
 
-        # # optionally log partition counts of final df
-        # try:
-        #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(metrics_df)
-        # except Exception:
-        #     logger.debug("convert_to_vessel_events_Pitsikalis_2019: final partition logging failed")
+    #     # # optionally log partition counts of final df
+    #     # try:
+    #     #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(metrics_df)
+    #     # except Exception:
+    #     #     logger.debug("convert_to_vessel_events_Pitsikalis_2019: final partition logging failed")
 
-        return metrics_df
+    #     return metrics_df
 
         #### WARNING: UNTESTED!!! ####
     
@@ -2377,7 +2377,7 @@ class ProcessDataService:
             .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
             .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # NEW: lat/lon arrays for distance computation (haversine)
+        # lat/lon arrays for distance computation (haversine)
         df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
                .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
 
@@ -2413,6 +2413,7 @@ class ProcessDataService:
             .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType())) \
             .withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2)) END").cast(DoubleType()))
 
+        
         # 6) Build trajectory as LINESTRING(lon lat, ...)
         df = df.withColumn(
             "trajectory",
@@ -2436,7 +2437,7 @@ class ProcessDataService:
             ).cast(DoubleType())
         )
 
-        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        # distance_in_kilometers using haversine (Spark-only math)
         # Uses element_at(lat_array, i) 1-based indexing and sums distances between consecutive pairs
         df = df.withColumn(
             "distance_in_kilometers",
@@ -2447,7 +2448,58 @@ class ProcessDataService:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (milliseconds)
+        # --- displacement_ratio (haversine between first and last) ---
+        df = df.withColumn("first_lat", F.element_at(F.col("lat_array"), 1)) \
+               .withColumn("first_lon", F.element_at(F.col("lon_array"), 1)) \
+               .withColumn("last_lat", F.element_at(F.col("lat_array"), F.size(F.col("lat_array")))) \
+               .withColumn("last_lon", F.element_at(F.col("lon_array"), F.size(F.col("lon_array"))))
+
+        df = df.withColumn(
+            "displacement_km",
+            F.expr(
+                "CASE WHEN first_lat IS NULL OR last_lat IS NULL THEN 0.0 ELSE "
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(last_lat) - radians(first_lat)) / 2 ), 2 ) + "
+                "cos(radians(first_lat)) * cos(radians(last_lat)) * pow( sin( (radians(last_lon) - radians(first_lon)) / 2 ), 2 ) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "displacement_ratio",
+            F.when(F.col("distance_in_kilometers") > 0, F.col("displacement_km") / F.col("distance_in_kilometers")).otherwise(F.lit(0.0))
+        )
+
+        # --- cog_unit_range: time-weighted average of per-segment COG (degrees), normalized by 360 ---
+        # numerator = aggregate over i in 2..size(lat_array): cog_segment(i) * element_at(time_diffs, i-1)
+        # denom = aggregate over i in 2..size(lat_array): element_at(time_diffs, i-1)
+        df = df.withColumn(
+            "cog_unit_numer",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), "
+                "(acc, i) -> acc + ( ((degrees(atan2(element_at(lon_array, i) - element_at(lon_array, i-1), element_at(lat_array, i) - element_at(lat_array, i-1))) + 360) % 360) * element_at(time_diffs, i-1) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_denom",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc,i) -> acc + element_at(time_diffs, i-1)) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_range",
+            F.when(F.col("cog_unit_denom") == 0.0, F.lit(0.0)).otherwise(F.col("cog_unit_numer") / F.col("cog_unit_denom"))
+        ).withColumn(
+            "cog_unit_range_normalized",
+            (F.col("cog_unit_range") / F.lit(360.0)).cast(DoubleType())
+        ).drop("cog_unit_numer", "cog_unit_denom", "cog_unit_range")
+
+        # --- cog_ratio: proportion of consecutive COG changes > threshold (10 degrees) ---
+        df = df.withColumn(
+            "_cog_change_count",
+            F.expr(
+                "CASE WHEN size(cog_array) <= 1 THEN 0 ELSE aggregate(sequence(2, size(cog_array)), cast(0 as int), (acc,i) -> acc + CASE WHEN abs(element_at(cog_array,i) - element_at(cog_array,i-1)) > 10.0 THEN 1 ELSE 0 END) END"
+            )
+        ).withColumn(
+            "cog_ratio",
+            F.when(F.size(F.col("cog_array")) <= 1, F.lit(0.0)).otherwise(F.col("_cog_change_count") / (F.size(F.col("cog_array")) - 1))
+        ).drop("_cog_change_count")
+
+        # average_time_diff_between_consecutive_points (milliseconds)
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
@@ -2480,7 +2532,7 @@ class ProcessDataService:
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
             F.col("cog_array_str").alias("cog_array"),
-            F.col("Category").alias("behavior_type_vector"),
+            F.col("Category").alias("behavior_type_label"),
             F.col("average_speed"),
             F.col("min_speed"),
             F.col("max_speed"),
@@ -2492,6 +2544,9 @@ class ProcessDataService:
             # NEW fields included:
             F.col("distance_in_kilometers"),
             F.col("average_time_diff_between_consecutive_points"),
+            F.col("displacement_ratio"),
+            F.col("cog_unit_range_normalized").alias("cog_unit_range"),
+            F.col("cog_ratio"),
             F.col("min_heading"),
             F.col("max_heading"),
             F.col("std_dev_speed")
@@ -2499,8 +2554,262 @@ class ProcessDataService:
 
         # Rename mmsi to id for consistency with NON-TRANSSHIPMENT
         result = result.withColumnRenamed("mmsi", "id")
-        
+
+        logger.info("create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
+
         return result
+
+    
+    # def create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+    #     events_df: DataFrame,
+    #     ais_path: str,
+    #     spark: SparkSession,
+    # ) -> DataFrame:
+    #     """
+    #     Pure-Spark replacement for the pandas `create_aux_dataframe_with_chunks`.
+
+    #     Steps:
+    #     - normalizes and explodes events' MMSI / MMSI_2 into one 'mmsi' column
+    #     - reads AIS CSV with Spark and casts fields
+    #     - joins AIS points to events by mmsi and timestamp window
+    #     - groups points into ordered arrays per (EventIndex, mmsi)
+    #     - computes the same metrics as the pandas implementation:
+    #         trajectory, timestamp_array (array[str] -> then stringified),
+    #         sog_array (array[double] -> then stringified),
+    #         cog_array (array[double] -> then stringified),
+    #         average_speed, min_speed, max_speed, average_heading, std_dev_heading,
+    #         total_area_time, low_speed_percentage, stagnation_time
+    #     - writes the final CSV using ProcessDataService.save_spark_df_as_csv which performs coalesce(1)
+    #         and subsequent promotion/permission adjustments.
+
+    #     Parameters
+    #     ----------
+    #     events_df : DataFrame
+    #         Spark DataFrame with columns ['EventIndex', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
+    #     ais_path : str
+    #         Path to AIS CSV (accessible by Spark).
+    #     spark : SparkSession
+    #     output_dir : str
+    #         Directory to write final CSV (passed to ProcessDataService.save_spark_df_as_csv).
+
+    #     Returns
+    #     -------
+    #     DataFrame
+    #         The final Spark DataFrame (with array columns replaced by their stringified forms).
+    #     """
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: start")
+
+    #     # 1) Normalize events timestamps and explode MMSI/MMSI_2 into single 'mmsi'
+    #     events = (
+    #         events_df
+    #         .withColumn("T_start", F.to_timestamp(F.col("T_start")))
+    #         .withColumn("T_end", F.to_timestamp(F.col("T_end")))
+    #     )
+
+    #     events_exp = events.withColumn(
+    #         "mmsi_array",
+    #         F.array(F.col("MMSI").cast(StringType()), F.col("MMSI_2").cast(StringType()))
+    #     ).withColumn(
+    #         "mmsi",
+    #         F.explode(F.expr("filter(mmsi_array, x -> x is not null)"))
+    #     ).drop("mmsi_array")
+
+    #     events_exp = events_exp.select("EventIndex", "T_start", "T_end", "Category", "mmsi")
+
+    #     # 2) Read AIS CSV
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: reading AIS CSV from %s", ais_path)
+    #     ais = (
+    #         spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
+    #         .withColumnRenamed("Id", "id")
+    #     )
+    #     ais = ais.toDF(*[c.strip() for c in ais.columns])
+    #     ais = ais.withColumn("id", F.col("id").cast(StringType()))
+
+    #     # timestamp heuristic: numeric => already ms; else unix_timestamp * 1000 -> milliseconds
+    #     ais = ais.withColumn(
+    #         "_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & F.col("timestamp").rlike("^[0-9]+$"),
+    #             F.col("timestamp").cast("long"),
+    #         ).otherwise((F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000)))
+    #     ).withColumn("latitude", F.col("latitude").cast(DoubleType())) \
+    #     .withColumn("longitude", F.col("longitude").cast(DoubleType())) \
+    #     .withColumn("speed", F.col("speed").cast(DoubleType())) \
+    #     .withColumn("heading", F.col("heading").cast(DoubleType()))
+
+    #     try:
+    #         ais_parts = ais.rdd.getNumPartitions()
+    #         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: AIS partitions = %s", ais_parts)
+    #     except Exception:
+    #         logger.debug("could not obtain ais partitions")
+
+    #     # 3) Join AIS → events by mmsi and timestamp window
+    #     # use milliseconds for event bounds to match AIS _ts_millis
+    #     events_bounds = events_exp.withColumn(
+    #         "t_start_ms",
+    #         (F.unix_timestamp(F.col("T_start")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+    #     ).withColumn(
+    #         "t_end_ms",
+    #         (F.unix_timestamp(F.col("T_end")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+    #     )
+
+    #     join_cond = (
+    #         (ais.id == events_bounds.mmsi) &
+    #         (ais._ts_millis >= events_bounds.t_start_ms) &
+    #         (ais._ts_millis <= events_bounds.t_end_ms)
+    #     )
+
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
+    #     joined = ais.join(events_bounds, on=join_cond, how="inner").select(
+    #         events_bounds.EventIndex.alias("EventIndex"),
+    #         events_bounds.mmsi.alias("mmsi"),
+    #         events_bounds.Category.alias("Category"),
+    #         ais._ts_millis.alias("ts"),
+    #         ais.longitude.alias("lon"),
+    #         ais.latitude.alias("lat"),
+    #         ais.speed.alias("sog"),
+    #         ais.heading.alias("cog")
+    #     )
+
+    #     # 4) Group into ordered 'points' array per EventIndex,mmsi
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (EventIndex, mmsi)")
+    #     grouped = joined.groupBy("EventIndex", "mmsi", "Category").agg(
+    #         F.expr(
+    #             "array_sort(collect_list(struct(ts as ts, lat as lat, lon as lon, sog as sog, cog as cog)),"
+    #             " (x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
+    #         ).alias("points")
+    #     )
+
+    #     # 5) Compute arrays and stats from points
+    #     df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
+    #         .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")) \
+    #         .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+    #         .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+
+    #     # NEW: lat/lon arrays for distance computation (haversine)
+    #     df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+    #            .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
+    #     # time diffs array (milliseconds)
+    #     df = df.withColumn(
+    #         "time_diffs",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
+
+    #     # total_area_time
+    #     df = df.withColumn("total_area_time", F.expr("aggregate(time_diffs, cast(0.0 as double), (acc,x) -> acc + x)"))
+
+    #     # SOG statistics
+    #     df = df.withColumn("sum_sog", F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("sumsq_sog", F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("count_sog", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)"))
+
+    #     df = df.withColumn("average_speed", F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sum_sog / count_sog END").cast(DoubleType())) \
+    #         .withColumn("min_speed", F.expr("array_min(sog_array)").cast(DoubleType())) \
+    #         .withColumn("max_speed", F.expr("array_max(sog_array)").cast(DoubleType())) \
+    #         .withColumn("std_dev_speed", F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sqrt((sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2)) END").cast(DoubleType()))
+
+    #     # COG statistics
+    #     df = df.withColumn("sum_cog", F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("sumsq_cog", F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("count_cog", F.expr("aggregate(cog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)"))
+
+    #     df = df.withColumn("average_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sum_cog / count_cog END").cast(DoubleType())) \
+    #         .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
+    #         .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType())) \
+    #         .withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2)) END").cast(DoubleType()))
+
+    #     # 6) Build trajectory as LINESTRING(lon lat, ...)
+    #     df = df.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
+    #     )
+
+    #     # 7) low_speed_percentage and stagnation_time
+    #     df = df.withColumn("count_low_speed_2", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")) \
+    #         .withColumn("count_low_speed_0_5", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 0.5 THEN 1 ELSE 0 END)")) \
+    #         .withColumn("count_sog_total", F.expr("size(sog_array)"))
+
+    #     df = df.withColumn(
+    #         "low_speed_percentage",
+    #         F.expr("CASE WHEN count_sog_total = 0 THEN 0.0 ELSE (count_low_speed_2 / cast(count_sog_total as double) * 100.0) END").cast(DoubleType())
+    #     )
+
+    #     df = df.withColumn(
+    #         "stagnation_time",
+    #         F.expr(
+    #             "CASE WHEN count_sog_total = 0 OR size(time_diffs) = 0 THEN 0.0 ELSE count_low_speed_0_5 * (CASE WHEN total_area_time IS NULL THEN 0.0 ELSE total_area_time END) / cast(count_sog_total as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: distance_in_kilometers using haversine (Spark-only math)
+    #     # Uses element_at(lat_array, i) 1-based indexing and sums distances between consecutive pairs
+    #     df = df.withColumn(
+    #         "distance_in_kilometers",
+    #         F.expr(
+    #             "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+    #             "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+    #             "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: average_time_diff_between_consecutive_points (milliseconds)
+    #     df = df.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE aggregate(time_diffs, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs) as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # 8) Stringify array columns so CSV datasource accepts them:
+    #     # timestamp_array -> [YYYY-MM-DD HH:MM:SS, None, ...]  (no quotes around timestamps)
+    #     ts_array_to_str_expr = (
+    #         "concat('[', array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE t END), ', '), ']')"
+    #     )
+    #     df = df.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+
+    #     # sog_array and cog_array stringification: numbers as strings, nulls as None
+    #     sog_array_to_str_expr = (
+    #         "concat('[', array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     )
+    #     cog_array_to_str_expr = (
+    #         "concat('[', array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     )
+    #     df = df.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     df = df.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+
+    #     # 9) Prepare final DataFrame with stringified arrays (so CSV writer won't error)
+    #     result = df.select(
+    #         F.col("mmsi"),
+    #         F.col("EventIndex"),
+    #         F.col("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),
+    #         F.col("sog_array_str").alias("sog_array"),
+    #         F.col("cog_array_str").alias("cog_array"),
+    #         F.col("Category").alias("behavior_type_label"),
+    #         F.col("average_speed"),
+    #         F.col("min_speed"),
+    #         F.col("max_speed"),
+    #         F.col("average_heading"),
+    #         F.col("std_dev_heading"),
+    #         F.col("total_area_time"),
+    #         F.col("low_speed_percentage"),
+    #         F.col("stagnation_time"),
+    #         # NEW fields included:
+    #         F.col("distance_in_kilometers"),
+    #         F.col("average_time_diff_between_consecutive_points"),
+    #         F.col("min_heading"),
+    #         F.col("max_heading"),
+    #         F.col("std_dev_speed")
+    #     )
+
+    #     # Rename mmsi to id for consistency with NON-TRANSSHIPMENT
+    #     result = result.withColumnRenamed("mmsi", "id")
+        
+    #     return result
 
         
     def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
@@ -2517,7 +2826,7 @@ class ProcessDataService:
         - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
 
         Returns a Spark DataFrame with columns:
-        ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_vector',
+        ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
         'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
         'total_area_time','low_speed_percentage','stagnation_time']
         """
@@ -2595,7 +2904,7 @@ class ProcessDataService:
             ).alias("points")
         )
 
-        # --- 5) Extract arrays and compute time_diffs (milliseconds) ---
+        # --- 5) Extract arrays and compute time_diffs_ms (milliseconds) ---
         df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
                     .withColumn(
                         "timestamp_array",
@@ -2605,7 +2914,7 @@ class ProcessDataService:
                     .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
                     .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # NEW: lat/lon arrays for distance computation (haversine)
+        # lat/lon arrays for distance computation (haversine)
         df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
                .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
 
@@ -2678,7 +2987,9 @@ class ProcessDataService:
             .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
             .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType()))
 
-        # --- 8) low_speed_percentage and stagnation_time (pandas formula parity) ---
+        
+
+        # --- 8) low_speed_percentage and stagnation_time ---
         df = df.withColumn(
             "count_low_speed_2",
             F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")
@@ -2700,7 +3011,7 @@ class ProcessDataService:
             ).cast(DoubleType())
         )
 
-        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        # distance_in_kilometers using haversine (Spark-only math)
         df = df.withColumn(
             "distance_in_kilometers",
             F.expr(
@@ -2710,7 +3021,56 @@ class ProcessDataService:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (milliseconds) — keep time_diffs_ms units
+        # --- displacement_ratio (first-last / total distance) ---
+        df = df.withColumn("first_lat", F.element_at(F.col("lat_array"), 1)) \
+               .withColumn("first_lon", F.element_at(F.col("lon_array"), 1)) \
+               .withColumn("last_lat", F.element_at(F.col("lat_array"), F.size(F.col("lat_array")))) \
+               .withColumn("last_lon", F.element_at(F.col("lon_array"), F.size(F.col("lon_array"))))
+
+        df = df.withColumn(
+            "displacement_km",
+            F.expr(
+                "CASE WHEN first_lat IS NULL OR last_lat IS NULL THEN 0.0 ELSE "
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(last_lat) - radians(first_lat)) / 2 ), 2 ) + "
+                "cos(radians(first_lat)) * cos(radians(last_lat)) * pow( sin( (radians(last_lon) - radians(first_lon)) / 2 ), 2 ) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "displacement_ratio",
+            F.when(F.col("distance_in_kilometers") > 0, F.col("displacement_km") / F.col("distance_in_kilometers")).otherwise(F.lit(0.0))
+        )
+
+        # --- cog_unit_range using time_diffs_ms ---
+        df = df.withColumn(
+            "cog_unit_numer",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), "
+                "(acc, i) -> acc + ( ((degrees(atan2(element_at(lon_array, i) - element_at(lon_array, i-1), element_at(lat_array, i) - element_at(lat_array, i-1))) + 360) % 360) * element_at(time_diffs_ms, i-1) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_denom",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc,i) -> acc + element_at(time_diffs_ms, i-1)) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_range",
+            F.when(F.col("cog_unit_denom") == 0.0, F.lit(0.0)).otherwise(F.col("cog_unit_numer") / F.col("cog_unit_denom"))
+        ).withColumn(
+            "cog_unit_range_normalized",
+            (F.col("cog_unit_range") / F.lit(360.0)).cast(DoubleType())
+        ).drop("cog_unit_numer", "cog_unit_denom", "cog_unit_range")
+
+        # --- cog_ratio (threshold 10 degrees) ---
+        df = df.withColumn(
+            "_cog_change_count",
+            F.expr(
+                "CASE WHEN size(cog_array) <= 1 THEN 0 ELSE aggregate(sequence(2,size(cog_array)), cast(0 as int), (acc,i) -> acc + CASE WHEN abs(element_at(cog_array,i) - element_at(cog_array,i-1)) > 10.0 THEN 1 ELSE 0 END) END"
+            )
+        ).withColumn(
+            "cog_ratio",
+            F.when(F.size(F.col("cog_array")) <= 1, F.lit(0.0)).otherwise(F.col("_cog_change_count") / (F.size(F.col("cog_array")) - 1))
+        ).drop("_cog_change_count")
+
+        # average_time_diff_between_consecutive_points (milliseconds)
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
@@ -2743,7 +3103,7 @@ class ProcessDataService:
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
             F.col("cog_array_str").alias("cog_array"),
-            F.col("Category").alias("behavior_type_vector"),
+            F.col("Category").alias("behavior_type_label"),
             F.col("average_speed"),
             F.col("min_speed"),
             F.col("max_speed"),
@@ -2755,6 +3115,9 @@ class ProcessDataService:
             # NEW fields included:
             F.col("distance_in_kilometers"),
             F.col("average_time_diff_between_consecutive_points"),
+            F.col("displacement_ratio"),
+            F.col("cog_unit_range_normalized").alias("cog_unit_range"),
+            F.col("cog_ratio"),
             F.col("min_heading"),
             F.col("max_heading"),
             F.col("std_dev_speed"),
@@ -2763,6 +3126,268 @@ class ProcessDataService:
         logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
 
         return result
+
+    
+    # def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+    #     events_df: DataFrame,
+    #     ais_path: str,
+    #     spark: SparkSession,
+    # ) -> DataFrame:
+    #     """
+    #     Pure-Spark replacement for create_aux_dataframe_with_chunks_V2 (pandas).
+
+    #     - events_df must contain: ['EventIndex', 'timestamp', 'id', 'Category'] where
+    #     'timestamp' on events is the event timestamp (pandas used min(timestamp) per event).
+    #     - ais_path is the path to the AIS CSV which contains ['id','timestamp','longitude','latitude','speed','heading'].
+    #     - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
+
+    #     Returns a Spark DataFrame with columns:
+    #     ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
+    #     'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
+    #     'total_area_time','low_speed_percentage','stagnation_time']
+    #     """
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: start")
+
+    #     # --- 1) Prepare events: compute event_time_ms (min timestamp per EventIndex,id) and keep Category ---
+    #     # Convert events timestamp to milliseconds (robust to numeric or string input)
+    #     events_pre = events_df.withColumn(
+    #         "_ev_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & (F.col("timestamp").rlike("^[0-9]+$")),
+    #             F.col("timestamp").cast("long")  # assume already in ms
+    #         ).otherwise(
+    #             # fallback: parse string to seconds then multiply
+    #             (F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000))
+    #         )
+    #     )
+
+    #     # For each (EventIndex, id) compute min timestamp (ms) and pick first Category
+    #     events_bounds = (
+    #         events_pre.groupBy("EventIndex", "id")
+    #         .agg(
+    #             F.min(F.col("_ev_ts_millis")).alias("event_time_ms"),
+    #             F.first(F.col("Category")).alias("Category")
+    #         )
+    #         .withColumnRenamed("id", "vessel_id")
+    #     )
+
+    #     # --- 2) Read AIS CSV and normalize timestamp to ms (column _ts_millis) ---
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: reading AIS from %s", ais_path)
+    #     ais = (
+    #         spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
+    #         .withColumnRenamed("Id", "id")
+    #     )
+    #     ais = ais.toDF(*[c.strip() for c in ais.columns])
+    #     ais = ais.withColumn("id", F.col("id").cast(StringType()))
+
+    #     # Robustly compute milliseconds epoch for AIS timestamp:
+    #     ais = ais.withColumn(
+    #         "_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & (F.col("timestamp").rlike("^[0-9]+$")),
+    #             F.col("timestamp").cast("long")  # already ms
+    #         ).otherwise(
+    #             (F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000))
+    #         )
+    #     ).withColumn("longitude", F.col("longitude").cast(DoubleType())) \
+    #     .withColumn("latitude", F.col("latitude").cast(DoubleType())) \
+    #     .withColumn("speed", F.col("speed").cast(DoubleType())) \
+    #     .withColumn("heading", F.col("heading").cast(DoubleType()))
+
+    #     # --- 3) Join AIS points to events where ais._ts_millis >= event_time_ms and same vessel id ---
+    #     join_cond = (ais.id == events_bounds.vessel_id) & (ais._ts_millis >= events_bounds.event_time_ms)
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: joining ais -> events (this may shuffle)")
+    #     joined = (
+    #         ais.join(events_bounds, on=join_cond, how="inner")
+    #         .select(
+    #             events_bounds.EventIndex.alias("EventIndex"),
+    #             events_bounds.vessel_id.alias("id"),
+    #             events_bounds.Category.alias("Category"),
+    #             ais._ts_millis.alias("ts"),
+    #             ais.longitude.alias("lon"),
+    #             ais.latitude.alias("lat"),
+    #             ais.speed.alias("sog"),
+    #             ais.heading.alias("cog"),
+    #         )
+    #     )
+
+    #     #  --- 4) Build ordered 'points' per (EventIndex, id) ---
+    #     # collect_list struct and array_sort by ts
+    #     grouped = joined.groupBy("EventIndex", "id", "Category").agg(
+    #         F.expr(
+    #             "array_sort(collect_list(struct(ts as ts, lon as lon, lat as lat, sog as sog, cog as cog)), "
+    #             "(x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
+    #         ).alias("points")
+    #     )
+
+    #     # --- 5) Extract arrays and compute time_diffs (milliseconds) ---
+    #     df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
+    #                 .withColumn(
+    #                     "timestamp_array",
+    #                     # convert ms -> seconds for from_unixtime; show format 'YYYY-MM-DD HH:MM:SS'
+    #                     F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")
+    #                 ) \
+    #                 .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+    #                 .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+
+    #     # NEW: lat/lon arrays for distance computation (haversine)
+    #     df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+    #            .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
+    #     # time_diffs in milliseconds: difference between consecutive ts entries
+    #     df = df.withColumn(
+    #         "time_diffs_ms",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
+
+    #     # total_time_ms (sum of all time diffs)
+    #     df = df.withColumn("total_time_ms", F.expr("aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x)"))
+
+    #     # --- 6) total_area_time: sum of time_diffs for which grid cell exists ---
+    #     # grid_x, grid_y derived from coordinates (floor(lon/0.1), floor(lat/0.1)) and trimmed to len(time_diffs_ms)
+    #     # min_len = least(size(time_diffs_ms), size(points)-1)
+    #     df = df.withColumn(
+    #         "min_len_for_area",
+    #         F.expr("CASE WHEN size(points) <= 1 THEN 0 ELSE least(size(time_diffs_ms), size(points) - 1) END")
+    #     )
+
+    #     # Build index sequence 1..min_len_for_area and sum corresponding time_diffs
+    #     df = df.withColumn(
+    #         "total_area_time",
+    #         F.expr(
+    #             "CASE WHEN min_len_for_area = 0 THEN 0.0 ELSE aggregate(sequence(1, min_len_for_area), cast(0.0 as double), (acc, i) -> acc + element_at(time_diffs_ms, i)) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # --- 7) SOG / COG statistics (avg/min/max/std) and counts ---
+    #     df = df.withColumn(
+    #         "sum_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "sumsq_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "count_sog",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "average_speed",
+    #         F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sum_sog / cast(count_sog as double) END").cast(DoubleType())
+    #     ).withColumn("min_speed", F.expr("array_min(sog_array)").cast(DoubleType())) \
+    #     .withColumn("max_speed", F.expr("array_max(sog_array)").cast(DoubleType())) \
+    #     .withColumn(
+    #         "std_dev_speed",
+    #         F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sqrt( (sumsq_sog / cast(count_sog as double)) - POWER(sum_sog / cast(count_sog as double), 2) ) END").cast(DoubleType())
+    #     )
+
+    #     # COG stats
+    #     df = df.withColumn(
+    #         "sum_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "sumsq_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "count_cog",
+    #         F.expr("aggregate(cog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "average_heading",
+    #         F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sum_cog / cast(count_cog as double) END").cast(DoubleType())
+    #     ).withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / cast(count_cog as double)) - POWER(sum_cog / cast(count_cog as double), 2)) END").cast(DoubleType())) \
+    #         .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
+    #         .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType()))
+
+    #     # --- 8) low_speed_percentage and stagnation_time (pandas formula parity) ---
+    #     df = df.withColumn(
+    #         "count_low_speed_2",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")
+    #     ).withColumn(
+    #         "count_low_speed_0_5",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 0.5 THEN 1 ELSE 0 END)")
+    #     ).withColumn(
+    #         "count_sog_total",
+    #         F.expr("size(sog_array)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "low_speed_percentage",
+    #         F.expr("CASE WHEN count_sog_total = 0 THEN 0.0 ELSE (count_low_speed_2 / cast(count_sog_total as double) * 100.0) END").cast(DoubleType())
+    #     ).withColumn(
+    #         "stagnation_time",
+    #         F.expr(
+    #             "CASE WHEN count_sog_total = 0 THEN 0.0 ELSE count_low_speed_0_5 * (CASE WHEN total_time_ms IS NULL THEN 0.0 ELSE total_time_ms END) / cast(count_sog_total as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: distance_in_kilometers using haversine (Spark-only math)
+    #     df = df.withColumn(
+    #         "distance_in_kilometers",
+    #         F.expr(
+    #             "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+    #             "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+    #             "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: average_time_diff_between_consecutive_points (milliseconds) — keep time_diffs_ms units
+    #     df = df.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # --- 9) Build trajectory LINESTRING('lon lat', ...) ---
+    #     df = df.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, p -> concat(cast(p.lon as string), ' ', cast(p.lat as string))), ', '), ')')")
+    #     )
+
+    #     # --- 10) Stringify arrays for CSV output ---
+    #     # timestamp_array: render as [YYYY-MM-DD HH:MM:SS, None, ...] (no quotes around timestamps)
+    #     ts_array_to_str_expr = "concat('[', array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE t END), ', '), ']')"
+    #     df = df.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+
+    #     # sog_array and cog_array stringification: numbers as strings, nulls as None
+    #     sog_array_to_str_expr = "concat('[', array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     cog_array_to_str_expr = "concat('[', array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     df = df.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     df = df.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+
+    #     # --- 11) Final select and rename to match pandas output keys ---
+    #     result = df.select(
+    #         F.col("id"),
+    #         F.col("EventIndex"),
+    #         F.col("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),
+    #         F.col("sog_array_str").alias("sog_array"),
+    #         F.col("cog_array_str").alias("cog_array"),
+    #         F.col("Category").alias("behavior_type_label"),
+    #         F.col("average_speed"),
+    #         F.col("min_speed"),
+    #         F.col("max_speed"),
+    #         F.col("average_heading"),
+    #         F.col("std_dev_heading"),
+    #         F.col("total_area_time"),
+    #         F.col("low_speed_percentage"),
+    #         F.col("stagnation_time"),
+    #         # NEW fields included:
+    #         F.col("distance_in_kilometers"),
+    #         F.col("average_time_diff_between_consecutive_points"),
+    #         F.col("min_heading"),
+    #         F.col("max_heading"),
+    #         F.col("std_dev_speed"),
+    #     )
+
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
+
+    #     return result
 
     
     

@@ -13,10 +13,10 @@ class SaveAISDataService:
     def upsert_aggregated_ais_spark_df_to_db(spark_df, batch_size: int = 1):
         expected_cols = {
             "id", "EventIndex", "trajectory", "timestamp_array", "sog_array", "cog_array",
-            "behavior_type_vector", "average_speed", "min_speed", "max_speed", "average_heading",
+            "behavior_type_label", "average_speed", "min_speed", "max_speed", "average_heading",
             "std_dev_heading", "total_area_time", "low_speed_percentage", "stagnation_time",
             "distance_in_kilometers", "average_time_diff_between_consecutive_points",
-            "min_heading", "max_heading", "std_dev_speed"
+            "min_heading", "max_heading", "std_dev_speed", "displacement_ratio", "cog_unit_range", "cog_ratio"
         }
 
         missing = expected_cols - set(spark_df.columns)
@@ -42,7 +42,7 @@ class SaveAISDataService:
             logger.warning(f"Filtered out {invalid_count} invalid trajectories with fewer than 2 points.")
 
         # Cast textual array columns to strings in Spark (keeps them as Spark strings)
-        cast_cols = ["trajectory", "timestamp_array", "sog_array", "cog_array", "behavior_type_vector"]
+        cast_cols = ["trajectory", "timestamp_array", "sog_array", "cog_array", "behavior_type_label"]
         for c in cast_cols:
             if c in valid_df.columns:
                 valid_df = valid_df.withColumn(c, F.col(c).cast("string"))
@@ -66,7 +66,7 @@ class SaveAISDataService:
                 "timestamp_array": rdict.get("timestamp_array"),
                 "sog_array": rdict.get("sog_array"),
                 "cog_array": rdict.get("cog_array"),
-                "behavior_type_vector": rdict.get("behavior_type_vector"),
+                "behavior_type_label": rdict.get("behavior_type_label"),
                 "average_speed": float(rdict["average_speed"]) if rdict.get("average_speed") is not None else None,
                 "min_speed": float(rdict["min_speed"]) if rdict.get("min_speed") is not None else None,
                 "max_speed": float(rdict["max_speed"]) if rdict.get("max_speed") is not None else None,
@@ -80,6 +80,9 @@ class SaveAISDataService:
                 "min_heading": float(rdict["min_heading"]) if rdict.get("min_heading") is not None else None,
                 "max_heading": float(rdict["max_heading"]) if rdict.get("max_heading") is not None else None,
                 "std_dev_speed": float(rdict["std_dev_speed"]) if rdict.get("std_dev_speed") is not None else None,
+                "displacement_ratio": float(rdict["displacement_ratio"]) if rdict.get("displacement_ratio") is not None else None,
+                "cog_unit_range": float(rdict["cog_unit_range"]) if rdict.get("cog_unit_range") is not None else None,
+                "cog_ratio": float(rdict["cog_ratio"]) if rdict.get("cog_ratio") is not None else None,
             }
             # do not keep rdict reference
             return db_dict

@@ -329,7 +329,7 @@ class PredictionService:
 
         start_canon = _canon(start_date_str)
         end_canon = _canon(end_date_str)
-        logger.info("(1 out of 16) Sliding-window extract for mmsi=%s interval [%s, %s] window=%dh step=%dh",
+        logger.info("(1 out of 17) Sliding-window extract for mmsi=%s interval [%s, %s] window=%dh step=%dh",
                     mmsi, start_canon, end_canon, sliding_window_size, step_size_hours)
 
         # 1) obter aggregated rows
@@ -342,7 +342,7 @@ class PredictionService:
             table=table
         )
 
-        logger.info("(2 out of 16) returned agg_df cols: %s", agg_df.columns)
+        logger.info("(2 out of 17) returned agg_df cols: %s", agg_df.columns)
 
         def _is_df_empty(df):
             try:
@@ -351,7 +351,7 @@ class PredictionService:
                 return df is None or (df.take(1) == [])
 
         if _is_df_empty(agg_df):
-            logger.info("(3 out of 16) No aggregated rows found that cover or lie within requested interval for mmsi=%s", mmsi)
+            logger.info("(3 out of 17) No aggregated rows found that cover or lie within requested interval for mmsi=%s", mmsi)
             out_schema = T.StructType([
                 T.StructField("primary_key_from_aggregated_ais_data", T.ArrayType(T.LongType()), True),
                 T.StructField("mmsi", T.StringType(), True),
@@ -360,7 +360,7 @@ class PredictionService:
                 T.StructField("timestamp_array", T.ArrayType(T.StringType()), True),
                 T.StructField("sog_array", T.ArrayType(T.DoubleType()), True),
                 T.StructField("cog_array", T.ArrayType(T.DoubleType()), True),
-                T.StructField("behavior_type_vector", T.ArrayType(T.StringType()), True),
+                T.StructField("behavior_type_label", T.ArrayType(T.StringType()), True),
                 T.StructField("average_speed", T.DoubleType(), True),
                 T.StructField("min_speed", T.DoubleType(), True),
                 T.StructField("max_speed", T.DoubleType(), True),
@@ -382,7 +382,7 @@ class PredictionService:
             return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=out_schema)
 
         # SANITIZING COLUMN NAMES
-        logger.info("(4 out of 16) Sanitizing column names from JDBC read if necessary.")
+        logger.info("(4 out of 17) Sanitizing column names from JDBC read if necessary.")
         try:
             original_cols = list(agg_df.columns)
             safe_names = []
@@ -403,16 +403,16 @@ class PredictionService:
                 seen.add(new)
                 safe_names.append(new)
             if safe_names != original_cols:
-                logger.info("(5 out of 16) Sanitizing JDBC column names: %s -> %s", original_cols, safe_names)
+                logger.info("(5 out of 17) Sanitizing JDBC column names: %s -> %s", original_cols, safe_names)
                 agg_df = agg_df.toDF(*safe_names)
         except Exception as es:
             logger.debug("Column sanitization failed (non-fatal): %s", es)
 
         # --- 2) normalizing arrays & WKT ---
-        logger.info("(6 out of 16) Normalizing arrays and WKT columns.")
+        logger.info("(6 out of 17) Normalizing arrays and WKT columns.")
 
         traj_col = "trajectory_wkt" if "trajectory_wkt" in agg_df.columns else "trajectory"
-        
+
         df2 = (
             agg_df
             .withColumn("_ts_body", F.regexp_replace(F.col("timestamp_array").cast("string"), r"^\s*\[|\]\s*$", ""))
@@ -432,11 +432,11 @@ class PredictionService:
                         .otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
         )
 
-        logger.info("(7 out of 16) Selecting columns by name (strings).")
+        logger.info("(7 out of 17) Selecting columns by name (strings).")
         wanted = [
             "primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
             "total_area_time", "low_speed_percentage", "stagnation_time",
-            "average_time_diff_between_consecutive_points", "behavior_type_vector"
+            "average_time_diff_between_consecutive_points", "behavior_type_label"
         ]
         existing = set(df2.columns)
         select_names = [c for c in wanted if c in existing]
@@ -452,7 +452,7 @@ class PredictionService:
 
         parent_names = [c for c in df2.columns if c not in ("_zipped", "_ts_arr", "_sog_arr", "_cog_arr", "_pts_arr")]
 
-        logger.info("(8 out of 16) Exploding zipped arrays with posexplode_outer and accessing struct fields directly.")
+        logger.info("(8 out of 17) Exploding zipped arrays with posexplode_outer and accessing struct fields directly.")
         exploded = df2.select(
             *parent_names,
             F.expr("posexplode_outer(_zipped) as (pos, elem)")
@@ -467,7 +467,7 @@ class PredictionService:
 
         logger.info("debug exploded.select for 'pt_raw': %s", exploded.select("pt_raw").limit(3).collect())
 
-        logger.info("(9 out of 16) Parsing typed columns from raw exploded data.")
+        logger.info("(9 out of 17) Parsing typed columns from raw exploded data.")
         exploded = (
             exploded
             .withColumn("ts_str", F.regexp_replace(F.col("ts_raw").cast("string"), r"^\"|\"$", ""))
@@ -488,7 +488,7 @@ class PredictionService:
             .drop("ts_raw", "sog_raw", "cog_raw", "pt_raw", "pt_clean", "_pt_split", "ts_str")
         )
 
-        logger.info("(10 out of 16) Filtering points inside [start, end] interval.")
+        logger.info("(10 out of 17) Filtering points inside [start, end] interval.")
         start_unix_col = F.unix_timestamp(F.lit(start_canon), "yyyy-MM-dd HH:mm:ss")
         end_unix_col = F.unix_timestamp(F.lit(end_canon), "yyyy-MM-dd HH:mm:ss")
 
@@ -500,15 +500,15 @@ class PredictionService:
 
         try:
             if exploded_filtered.rdd.isEmpty():
-                logger.info("(11 out of 16) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
+                logger.info("(11 out of 17) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
                 return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
         except Exception:
             if exploded_filtered.take(1) == []:
-                logger.info("(11 out of 16) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
+                logger.info("(11 out of 17) No points inside interval after exploding and filtering for mmsi=%s", mmsi)
                 return spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=T.StructType([]))
 
         # 4) indexes of sliding windows covering each point
-        logger.info("(12 out of 16) Computing sliding window indexes for each point.")
+        logger.info("(12 out of 17) Computing sliding window indexes for each point.")
         window_size_s = int(sliding_window_size) * 3600
         step_s = int(step_size_hours) * 3600
 
@@ -543,7 +543,7 @@ class PredictionService:
         exploded_windows = exploded_windows.persist(StorageLevel.MEMORY_AND_DISK)
 
         # trim per-window points to MAX_POINTS_PER_WINDOW
-        logger.info("(13 out of 16) Trimming points per window to max %d points if necessary.", MAX_POINTS_PER_WINDOW)
+        logger.info("(13 out of 17) Trimming points per window to max %d points if necessary.", MAX_POINTS_PER_WINDOW)
         try:
             w = Window.partitionBy("mmsi", "window_index").orderBy("ts_unix")
             exploded_windows = exploded_windows.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") <= MAX_POINTS_PER_WINDOW).drop("_rn")
@@ -551,7 +551,7 @@ class PredictionService:
             logger.debug("Per-window trimming failed (non-fatal).")
 
         # 5) group and aggregate
-        logger.info("(14 out of 16) Grouping and aggregating points into sliding windows.")
+        logger.info("(14 out of 17) Grouping and aggregating points into sliding windows.")
         pts_struct = F.struct(
             F.col("ts_unix").alias("ts_unix"),
             F.col("ts_ts").alias("ts"),
@@ -570,7 +570,8 @@ class PredictionService:
             F.collect_set(F.col("EventIndex").cast("long")).alias("EventIndex"),
             F.collect_set(F.col("primary_key").cast("long")).alias("primary_key_from_aggregated_ais_data"),
             F.count(F.lit(1)).alias("n_points"),
-            F.sum(F.col("distance_in_kilometers")).alias("distance_in_kilometers"),
+            # keep original sum as a fallback but we'll recompute distance below
+            F.sum(F.col("distance_in_kilometers")).alias("distance_in_kilometers_raw_sum"),
             F.avg("sog").alias("average_speed"),
             F.min("sog").alias("min_speed"),
             F.max("sog").alias("max_speed"),
@@ -583,7 +584,7 @@ class PredictionService:
             F.sum(F.col("total_area_time")).alias("total_area_time"),
             F.avg(F.col("low_speed_percentage")).alias("low_speed_percentage"),
             F.sum(F.col("stagnation_time")).alias("stagnation_time"),
-            F.collect_set(F.col("behavior_type_vector")).alias("behavior_type_vector")
+            F.collect_set(F.col("behavior_type_label")).alias("behavior_type_label")
         )
 
         grouped = grouped.withColumn("pts_sorted", F.expr("array_sort(pts)"))
@@ -615,6 +616,89 @@ class PredictionService:
             F.to_timestamp(F.from_unixtime(F.col("window_end_unix")))
         )
 
+        # --- 15) Compute lat/lon arrays, time diffs (ms), per-window distance (haversine) and new metrics ---
+        logger.info("(15 out of 17) Computing distance_in_kilometers, displacement_ratio, cog_unit_range and cog_ratio for each window.")
+        grouped = grouped.withColumn(
+            "lat_array",
+            F.expr("transform(pts_sorted, x -> cast(x.lat as double))")
+        ).withColumn(
+            "lon_array",
+            F.expr("transform(pts_sorted, x -> cast(x.lon as double))")
+        ).withColumn(
+            "ts_array",
+            F.expr("transform(pts_sorted, x -> cast(x.ts_unix as long))")  # seconds
+        ).withColumn(
+            # time_diffs_ms: differences (in ms) between consecutive ts entries
+            "time_diffs_ms",
+            F.expr(
+                "CASE WHEN size(ts_array) <= 1 THEN array() "
+                "ELSE transform(sequence(2, size(ts_array)), i -> (element_at(ts_array, i) - element_at(ts_array, i-1)) * 1000) END"
+            )
+        )
+
+        # recompute distance using haversine across lat_array/lon_array (in km)
+        grouped = grouped.withColumn(
+            "distance_in_kilometers",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+                "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+            ).cast(T.DoubleType())
+        )
+
+        # displacement_ratio: first-last straight distance divided by total window distance
+        grouped = grouped.withColumn("first_lat", F.element_at(F.col("lat_array"), 1)) \
+            .withColumn("first_lon", F.element_at(F.col("lon_array"), 1)) \
+            .withColumn("last_lat", F.element_at(F.col("lat_array"), F.size(F.col("lat_array")))) \
+            .withColumn("last_lon", F.element_at(F.col("lon_array"), F.size(F.col("lon_array"))))
+
+        grouped = grouped.withColumn(
+            "displacement_km",
+            F.expr(
+                "CASE WHEN first_lat IS NULL OR last_lat IS NULL THEN 0.0 ELSE "
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(last_lat) - radians(first_lat)) / 2 ), 2 ) + "
+                "cos(radians(first_lat)) * cos(radians(last_lat)) * pow( sin( (radians(last_lon) - radians(first_lon)) / 2 ), 2 ) ) ) END"
+            ).cast(T.DoubleType())
+        ).withColumn(
+            "displacement_ratio",
+            F.when(F.col("distance_in_kilometers") > 0, F.col("displacement_km") / F.col("distance_in_kilometers")).otherwise(F.lit(0.0))
+        )
+
+        # cog_unit_range: time-weighted mean COG, normalized to [0,1]
+        # note: atan2(deg) usage follows the formula the pandas code used (converted to SQL/Spark)
+        grouped = grouped.withColumn(
+            "cog_unit_numer",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), "
+                "(acc, i) -> acc + ( ((degrees(atan2(element_at(lon_array, i) - element_at(lon_array, i-1), element_at(lat_array, i) - element_at(lat_array, i-1))) + 360) % 360) * element_at(time_diffs_ms, i-1) ) ) END"
+            ).cast(T.DoubleType())
+        ).withColumn(
+            "cog_unit_denom",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc,i) -> acc + element_at(time_diffs_ms, i-1)) END"
+            ).cast(T.DoubleType())
+        ).withColumn(
+            "cog_unit_range_val",
+            F.when(F.col("cog_unit_denom") == 0.0, F.lit(0.0)).otherwise(F.col("cog_unit_numer") / F.col("cog_unit_denom"))
+        ).withColumn(
+            "cog_unit_range",
+            (F.col("cog_unit_range_val") / F.lit(360.0)).cast(T.DoubleType())
+        ).drop("cog_unit_numer", "cog_unit_denom", "cog_unit_range_val")
+
+        # cog_ratio: fraction of consecutive COG changes > 10 degrees
+        grouped = grouped.withColumn(
+            "_cog_change_count",
+            F.expr(
+                "CASE WHEN size(cog_array) <= 1 THEN 0 ELSE aggregate(sequence(2,size(cog_array)), cast(0 as int), (acc,i) -> acc + CASE WHEN abs(element_at(cog_array,i) - element_at(cog_array,i-1)) > 10.0 THEN 1 ELSE 0 END) END"
+            )
+        ).withColumn(
+            "cog_ratio",
+            F.when(F.size(F.col("cog_array")) <= 1, F.lit(0.0)).otherwise(F.col("_cog_change_count") / (F.size(F.col("cog_array")) - 1))
+        ).drop("_cog_change_count")
+
+        # drop helper columns used for computation that should not be persisted
+        grouped = grouped.drop("first_lat", "first_lon", "last_lat", "last_lon", "displacement_km", "lat_array", "lon_array", "ts_array", "time_diffs_ms")
+
         final_cols = [
             "primary_key_from_aggregated_ais_data",
             "mmsi",
@@ -623,7 +707,7 @@ class PredictionService:
             "timestamp_array",
             "sog_array",
             "cog_array",
-            "behavior_type_vector",
+            "behavior_type_label",
             "average_speed",
             "min_speed",
             "max_speed",
@@ -640,28 +724,145 @@ class PredictionService:
             "n_points",
             "window_index",
             "window_start_ts",
-            "window_end_ts"
+            "window_end_ts",
+            # new metrics
+            "displacement_ratio",
+            "cog_unit_range",
+            "cog_ratio"
         ]
 
-        final_df = grouped.select(*final_cols)
+        final_df = grouped.select(*[c for c in final_cols if c in grouped.columns])
+
+        # Delete unnecessary auxiliary DataFrame references to help Python GC (non-fatal)
+        try:
+            del agg_df
+            del df2
+            del exploded
+            del exploded_filtered
+            del grouped
+        except Exception:
+            pass
 
         # logging: try to get exact total windows (may be expensive) but fallback gracefully
         try:
             total_windows = final_df.count()
             sample_first = final_df.orderBy("window_index").limit(1).collect()
-            logger.info("(15 out of 16) Sliding-window extraction produced %d windows; sample of first window: %s",
+            logger.info("(16 out of 17) Sliding-window extraction produced %d windows; sample of first window: %s",
                         total_windows, sample_first)
         except Exception as e:
             # fallback: do a cheap existence/sample check
             sample_first = final_df.orderBy("window_index").limit(1).collect()
             has_any = True if sample_first else False
-            logger.info("(15 out of 16) Sliding-window extraction produced %s windows (exact count skipped); sample of first window: %s",
+            logger.info("(16 out of 17) Sliding-window extraction produced %s windows (exact count skipped); sample of first window: %s",
                         ">=1" if has_any else "0", sample_first)
 
         try:
             exploded_windows.unpersist(blocking=False)
-            logger.info("(16 out of 16) exploded_windows unpersisted (blocking=False) and function returning final_df.")
+            logger.info("(17 out of 17) exploded_windows unpersisted (blocking=False) and function returning final_df.")
         except Exception:
-            logger.info("(16 out of 16) exploded_windows unpersist attempted (non-fatal).")
+            logger.info("(17 out of 17) exploded_windows unpersist attempted (non-fatal).")
 
         return final_df
+
+    
+
+    def classify_loitering_equation_spark(windows_df, earth_radius_km: float = 6371.0):
+        """
+        Receives the DataFrame of windows (containing 'trajectory' column in LINESTRING(lon lat, ...) format)
+        and returns a DataFrame with the columns:
+        - trajectory_redundancy (double)
+        - behavior_type (string) -> 'LOITERING' if redundancy > 1.0 else 'NON-LOITERING'
+        """
+        # 1) extract body of LINESTRING: "-4.5130033 48.371128, -4.513005 48.371128, ..."
+        df = windows_df.withColumn(
+            "_traj_body",
+            F.regexp_replace(F.col("trajectory").cast("string"), r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', "")
+        )
+
+        # 2) transform into array of strings ["lon lat", ...]
+        df = df.withColumn("_pt_arr", F.when((F.col("_traj_body").isNull()) | (F.col("_traj_body") == ""), F.array()).otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
+
+        # 3) generate numeric arrays of lon and lat using transform + split (using F.expr for compatibility)
+        df = df.withColumn(
+            "lon_arr",
+            F.expr("transform(_pt_arr, p -> cast(split(trim(p), '\\\\s+')[0] as double))")
+        ).withColumn(
+            "lat_arr",
+            F.expr("transform(_pt_arr, p -> cast(split(trim(p), '\\\\s+')[1] as double))")
+        )
+
+        # 4) size and first/last points (store as double)
+        df = df.withColumn("n_pts_array", F.size(F.col("lon_arr")))
+
+        df = df.withColumn("first_lon", F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lon_arr"), F.lit(1))).otherwise(F.lit(None))) \
+            .withColumn("first_lat", F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lat_arr"), F.lit(1))).otherwise(F.lit(None))) \
+            .withColumn("last_lon", F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lon_arr"), F.col("n_pts_array"))).otherwise(F.lit(None))) \
+            .withColumn("last_lat", F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lat_arr"), F.col("n_pts_array"))).otherwise(F.lit(None)))
+
+        # 5) haversine function on columns (returns km). implemented step-by-step with Spark expressions
+        def haversine_km(lat1_col, lon1_col, lat2_col, lon2_col):
+            lat1_rad = F.radians(lat1_col)
+            lat2_rad = F.radians(lat2_col)
+            lon1_rad = F.radians(lon1_col)
+            lon2_rad = F.radians(lon2_col)
+            dlat = lat2_rad - lat1_rad
+            dlon = lon2_rad - lon1_rad
+            a = F.sin(dlat / 2) * F.sin(dlat / 2) + F.cos(lat1_rad) * F.cos(lat2_rad) * F.sin(dlon / 2) * F.sin(dlon / 2)
+            c = 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
+            return F.lit(earth_radius_km) * c
+
+        # 6) distance between first and last point (numerator). if n_pts_array < 2 -> 0.0
+        df = df.withColumn(
+            "departure_to_arrival_km",
+            F.when(F.col("n_pts_array") >= 2,
+                haversine_km(F.col("first_lat"), F.col("first_lon"), F.col("last_lat"), F.col("last_lon"))
+            ).otherwise(F.lit(0.0))
+        )
+
+        # 7) bbox: min/max lon/lat (array_min/array_max)
+        df = df.withColumn("min_lon", F.array_min(F.col("lon_arr"))) \
+            .withColumn("max_lon", F.array_max(F.col("lon_arr"))) \
+            .withColumn("min_lat", F.array_min(F.col("lat_arr"))) \
+            .withColumn("max_lat", F.array_max(F.col("lat_arr")))
+
+        # 8) width = distance between (min_lat, min_lon) and (min_lat, max_lon)
+        #    height = distance between (min_lat, min_lon) and (max_lat, min_lon)
+        df = df.withColumn(
+            "bbox_width_km",
+            F.when((F.col("min_lon").isNotNull()) & (F.col("max_lon").isNotNull()),
+                haversine_km(F.col("min_lat"), F.col("min_lon"), F.col("min_lat"), F.col("max_lon"))
+            ).otherwise(F.lit(0.0))
+        ).withColumn(
+            "bbox_height_km",
+            F.when((F.col("min_lat").isNotNull()) & (F.col("max_lat").isNotNull()),
+                haversine_km(F.col("min_lat"), F.col("min_lon"), F.col("max_lat"), F.col("min_lon"))
+            ).otherwise(F.lit(0.0))
+        )
+
+        # 9) perimeter = 2 * (width + height)
+        df = df.withColumn("bbox_perimeter_km", 2 * (F.col("bbox_width_km") + F.col("bbox_height_km")))
+
+        # 10) redundancy = numerator / perimeter, with protection against division by zero or null
+        df = df.withColumn(
+            "trajectory_redundancy",
+            F.when((F.col("bbox_perimeter_km").isNotNull()) & (F.col("bbox_perimeter_km") > 0),
+                F.col("departure_to_arrival_km") / F.col("bbox_perimeter_km")
+            ).otherwise(F.lit(0.0))
+        )
+
+        # 11) behavior_type
+        df = df.withColumn(
+            "behavior_type",
+            F.when(F.col("trajectory_redundancy") > F.lit(1.0), F.lit("LOITERING")).otherwise(F.lit("NON-LOITERING"))
+        )
+
+        # 12) remove auxiliary columns and return (keeping original order + new columns)
+        aux_cols = ["_traj_body", "_pt_arr", "lon_arr", "lat_arr", "n_pts_array",
+                    "first_lon", "first_lat", "last_lon", "last_lat",
+                    "departure_to_arrival_km", "min_lon", "max_lon", "min_lat", "max_lat",
+                    "bbox_width_km", "bbox_height_km", "bbox_perimeter_km"]
+        # if any of these do not exist, ignore (defensive)
+        existing_aux = [c for c in aux_cols if c in df.columns]
+        dataframe_processed_by_equation = df.drop(*existing_aux)
+
+        return dataframe_processed_by_equation
