@@ -1104,7 +1104,7 @@ class ProcessDataService:
         max_buckets_to_process: int = 0,  # NEW: if >0, limit number of buckets to process then stop
     ):
         """
-        Write `spark_df` in multiple smaller files by splitting on a stable hash of EventIndex.
+        Write `spark_df` in multiple smaller files by splitting on a stable hash of event_index.
 
         Behavior notes:
         - For each bucket a part CSV is created and then compressed to part-{i:05d}.csv.gz.
@@ -1138,10 +1138,10 @@ class ProcessDataService:
         except Exception as e:
             logger.warning("Could not create output_dir %s: %s", output_dir, e)
 
-        if "EventIndex" not in spark_df.columns:
-            raise ValueError("Input DataFrame must contain 'EventIndex' column")
+        if "event_index" not in spark_df.columns:
+            raise ValueError("Input DataFrame must contain 'event_index' column")
 
-        hash_col_expr = _F.abs(_F.hash(_F.col("EventIndex")))
+        hash_col_expr = _F.abs(_F.hash(_F.col("event_index")))
         total_buckets = int(num_buckets)
         produced_files = []
 
@@ -1501,15 +1501,15 @@ class ProcessDataService:
         )
 
         # Correct windowing for row numbers
-        window_spec = Window.orderBy("EventIndexLong")
+        window_spec = Window.orderBy("event_indexLong")
         df_with_index = (
             df_transformed
-            .withColumn("EventIndexLong", F.monotonically_increasing_id())
+            .withColumn("event_indexLong", F.monotonically_increasing_id())
             .withColumn(
-                "EventIndex",
-                F.row_number().over(Window.orderBy("EventIndexLong"))
+                "event_index",
+                F.row_number().over(Window.orderBy("event_indexLong"))
             )
-            .drop("EventIndexLong")
+            .drop("event_indexLong")
         )
 
         return df_with_index
@@ -1703,7 +1703,7 @@ class ProcessDataService:
     #     - filter AIS rows by relevant MMSI set and global min/max event times to reduce data scanned
     #     - perform a join where (ais.id == events.MMSI) AND (ais.timestamp between events.T_start and events.T_end)
     #     - select and order the output columns:
-    #     ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','EventIndex','Category']
+    #     ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','event_index','Category']
     #     Returns the Spark DataFrame with the joined results ("result_df").
     #     """
     #     # read AIS CSV
@@ -1783,12 +1783,12 @@ class ProcessDataService:
     #         "heading",
     #         "turn",
     #         "course",
-    #         "EventIndex",
+    #         "event_index",
     #         "Category",
     #     ]
 
-    #     # If EventIndex or Category are not present in events, ensure they exist (avoid exceptions)
-    #     for c in ["EventIndex", "Category"]:
+    #     # If event_index or Category are not present in events, ensure they exist (avoid exceptions)
+    #     for c in ["event_index", "Category"]:
     #         if c not in joined.columns:
     #             joined = joined.withColumn(c, F.lit(None))
 
@@ -1823,7 +1823,7 @@ class ProcessDataService:
         -------
         (loitering_result_df, normal_result_df, stopping_result_df)
             Three Spark DataFrames with the selected columns:
-            ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','EventIndex','Category']
+            ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','event_index','Category']
         """
         # --- read AIS CSV ---
         ais_df = spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
@@ -1904,12 +1904,12 @@ class ProcessDataService:
                 "heading",
                 "turn",
                 "course",
-                "EventIndex",
+                "event_index",
                 "Category",
             ]
 
-            # Ensure EventIndex and Category exist in joined
-            for c in ["EventIndex", "Category"]:
+            # Ensure event_index and Category exist in joined
+            for c in ["event_index", "Category"]:
                 if c not in joined.columns:
                     joined = joined.withColumn(c, F.lit(None))
 
@@ -1930,11 +1930,11 @@ class ProcessDataService:
     # ---------- Helper: build grouped points ----------
     def build_grouped_points_Pitsikalis_2019(df: DataFrame) -> DataFrame:
         """
-        Group input AIS Spark DataFrame by EventIndex and produce an array-of-structs 'points'
+        Group input AIS Spark DataFrame by event_index and produce an array-of-structs 'points'
         sorted by timestamp.
 
         The resulting DataFrame has columns:
-        - EventIndex
+        - event_index
         - mmsi (first id)
         - Category (first Category)
         - points: array<struct(ts: long, lat: double, lon: double, sog: double, cog: double)>
@@ -1957,7 +1957,7 @@ class ProcessDataService:
         # note: use the raw columns while building the struct via SQL expression below for stable compatibility
         grouped = (
             df_ts
-            .groupBy("EventIndex")
+            .groupBy("event_index")
             .agg(
                 F.first(F.col("id")).alias("mmsi"),
                 F.first(F.col("Category")).alias("Category"),
@@ -2146,7 +2146,7 @@ class ProcessDataService:
     #     result = grouped2.select(
     #         F.col("mmsi").alias("mmsi"),
     #         F.col("distance_in_kilometers").alias("distance_in_kilometers"),
-    #         F.col("EventIndex").alias("EventIndex"),
+    #         F.col("event_index").alias("event_index"),
     #         F.col("trajectory").alias("trajectory"),
     #         F.col("timestamp_array_str").alias("timestamp_array"),  # <-- stringified version used here
     #         F.col("average_time_diff_between_consecutive_points").alias("average_time_diff_between_consecutive_points"),
@@ -2168,11 +2168,11 @@ class ProcessDataService:
     # ---------- Top-level orchestrator ----------
     # def DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
     #     """
-    #     Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by EventIndex.
+    #     Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by event_index.
 
     #     Steps:
     #     - logs partition counts and uses mapPartitionsWithIndex to emit per-partition start/finish messages
-    #     - aggregates points per EventIndex (ordered by timestamp) using pure Spark
+    #     - aggregates points per event_index (ordered by timestamp) using pure Spark
     #     - computes event-level metrics (timestamp arrays, average time diffs, SOG/COG arrays & stats, trajectory)
     #     - computes total distance using a pure-Spark haversine aggregator
     #     - logs progress and sample outputs for debugging
@@ -2197,8 +2197,8 @@ class ProcessDataService:
     #     # run partition-level logger to emit start/finish for each partition
     #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(df)
 
-    #     # aggregate points per EventIndex
-    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per EventIndex")
+    #     # aggregate points per event_index
+    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per event_index")
     #     grouped = ProcessDataService.build_grouped_points_Pitsikalis_2019(df)
 
     #     # grouped count logging
@@ -2206,7 +2206,7 @@ class ProcessDataService:
     #         grouped_count = grouped.count()
     #     except Exception:
     #         grouped_count = None
-    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped EventIndex count = {grouped_count}")
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped event_index count = {grouped_count}")
 
     #     # log partitions on grouped DataFrame as well
     #     try:
@@ -2263,7 +2263,7 @@ class ProcessDataService:
         - normalizes and explodes events' MMSI / MMSI_2 into one 'mmsi' column
         - reads AIS CSV with Spark and casts fields
         - joins AIS points to events by mmsi and timestamp window
-        - groups points into ordered arrays per (EventIndex, mmsi)
+        - groups points into ordered arrays per (event_index, mmsi)
         - computes the same metrics as the pandas implementation:
             trajectory, timestamp_array (array[str] -> then stringified),
             sog_array (array[double] -> then stringified),
@@ -2276,7 +2276,7 @@ class ProcessDataService:
         Parameters
         ----------
         events_df : DataFrame
-            Spark DataFrame with columns ['EventIndex', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
+            Spark DataFrame with columns ['event_index', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
         ais_path : str
             Path to AIS CSV (accessible by Spark).
         spark : SparkSession
@@ -2305,7 +2305,7 @@ class ProcessDataService:
             F.explode(F.expr("filter(mmsi_array, x -> x is not null)"))
         ).drop("mmsi_array")
 
-        events_exp = events_exp.select("EventIndex", "T_start", "T_end", "Category", "mmsi")
+        events_exp = events_exp.select("event_index", "T_start", "T_end", "Category", "mmsi")
 
         # 2) Read AIS CSV
         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: reading AIS CSV from %s", ais_path)
@@ -2352,7 +2352,7 @@ class ProcessDataService:
 
         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
         joined = ais.join(events_bounds, on=join_cond, how="inner").select(
-            events_bounds.EventIndex.alias("EventIndex"),
+            events_bounds.event_index.alias("event_index"),
             events_bounds.mmsi.alias("mmsi"),
             events_bounds.Category.alias("Category"),
             ais._ts_millis.alias("ts"),
@@ -2362,9 +2362,9 @@ class ProcessDataService:
             ais.heading.alias("cog")
         )
 
-        # 4) Group into ordered 'points' array per EventIndex,mmsi
-        logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (EventIndex, mmsi)")
-        grouped = joined.groupBy("EventIndex", "mmsi", "Category").agg(
+        # 4) Group into ordered 'points' array per event_index,mmsi
+        logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (event_index, mmsi)")
+        grouped = joined.groupBy("event_index", "mmsi", "Category").agg(
             F.expr(
                 "array_sort(collect_list(struct(ts as ts, lat as lat, lon as lon, sog as sog, cog as cog)),"
                 " (x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
@@ -2527,7 +2527,7 @@ class ProcessDataService:
         # 9) Prepare final DataFrame with stringified arrays (so CSV writer won't error)
         result = df.select(
             F.col("mmsi"),
-            F.col("EventIndex"),
+            F.col("event_index"),
             F.col("trajectory"),
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
@@ -2572,7 +2572,7 @@ class ProcessDataService:
     #     - normalizes and explodes events' MMSI / MMSI_2 into one 'mmsi' column
     #     - reads AIS CSV with Spark and casts fields
     #     - joins AIS points to events by mmsi and timestamp window
-    #     - groups points into ordered arrays per (EventIndex, mmsi)
+    #     - groups points into ordered arrays per (event_index, mmsi)
     #     - computes the same metrics as the pandas implementation:
     #         trajectory, timestamp_array (array[str] -> then stringified),
     #         sog_array (array[double] -> then stringified),
@@ -2585,7 +2585,7 @@ class ProcessDataService:
     #     Parameters
     #     ----------
     #     events_df : DataFrame
-    #         Spark DataFrame with columns ['EventIndex', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
+    #         Spark DataFrame with columns ['event_index', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
     #     ais_path : str
     #         Path to AIS CSV (accessible by Spark).
     #     spark : SparkSession
@@ -2614,7 +2614,7 @@ class ProcessDataService:
     #         F.explode(F.expr("filter(mmsi_array, x -> x is not null)"))
     #     ).drop("mmsi_array")
 
-    #     events_exp = events_exp.select("EventIndex", "T_start", "T_end", "Category", "mmsi")
+    #     events_exp = events_exp.select("event_index", "T_start", "T_end", "Category", "mmsi")
 
     #     # 2) Read AIS CSV
     #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: reading AIS CSV from %s", ais_path)
@@ -2661,7 +2661,7 @@ class ProcessDataService:
 
     #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
     #     joined = ais.join(events_bounds, on=join_cond, how="inner").select(
-    #         events_bounds.EventIndex.alias("EventIndex"),
+    #         events_bounds.event_index.alias("event_index"),
     #         events_bounds.mmsi.alias("mmsi"),
     #         events_bounds.Category.alias("Category"),
     #         ais._ts_millis.alias("ts"),
@@ -2671,9 +2671,9 @@ class ProcessDataService:
     #         ais.heading.alias("cog")
     #     )
 
-    #     # 4) Group into ordered 'points' array per EventIndex,mmsi
-    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (EventIndex, mmsi)")
-    #     grouped = joined.groupBy("EventIndex", "mmsi", "Category").agg(
+    #     # 4) Group into ordered 'points' array per event_index,mmsi
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (event_index, mmsi)")
+    #     grouped = joined.groupBy("event_index", "mmsi", "Category").agg(
     #         F.expr(
     #             "array_sort(collect_list(struct(ts as ts, lat as lat, lon as lon, sog as sog, cog as cog)),"
     #             " (x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
@@ -2784,7 +2784,7 @@ class ProcessDataService:
     #     # 9) Prepare final DataFrame with stringified arrays (so CSV writer won't error)
     #     result = df.select(
     #         F.col("mmsi"),
-    #         F.col("EventIndex"),
+    #         F.col("event_index"),
     #         F.col("trajectory"),
     #         F.col("timestamp_array_str").alias("timestamp_array"),
     #         F.col("sog_array_str").alias("sog_array"),
@@ -2820,19 +2820,19 @@ class ProcessDataService:
         """
         Pure-Spark replacement for create_aux_dataframe_with_chunks_V2 (pandas).
 
-        - events_df must contain: ['EventIndex', 'timestamp', 'id', 'Category'] where
+        - events_df must contain: ['event_index', 'timestamp', 'id', 'Category'] where
         'timestamp' on events is the event timestamp (pandas used min(timestamp) per event).
         - ais_path is the path to the AIS CSV which contains ['id','timestamp','longitude','latitude','speed','heading'].
         - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
 
         Returns a Spark DataFrame with columns:
-        ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
+        ['id','event_index','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
         'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
         'total_area_time','low_speed_percentage','stagnation_time']
         """
         logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: start")
 
-        # --- 1) Prepare events: compute event_time_ms (min timestamp per EventIndex,id) and keep Category ---
+        # --- 1) Prepare events: compute event_time_ms (min timestamp per event_index,id) and keep Category ---
         # Convert events timestamp to milliseconds (robust to numeric or string input)
         events_pre = events_df.withColumn(
             "_ev_ts_millis",
@@ -2845,9 +2845,9 @@ class ProcessDataService:
             )
         )
 
-        # For each (EventIndex, id) compute min timestamp (ms) and pick first Category
+        # For each (event_index, id) compute min timestamp (ms) and pick first Category
         events_bounds = (
-            events_pre.groupBy("EventIndex", "id")
+            events_pre.groupBy("event_index", "id")
             .agg(
                 F.min(F.col("_ev_ts_millis")).alias("event_time_ms"),
                 F.first(F.col("Category")).alias("Category")
@@ -2884,7 +2884,7 @@ class ProcessDataService:
         joined = (
             ais.join(events_bounds, on=join_cond, how="inner")
             .select(
-                events_bounds.EventIndex.alias("EventIndex"),
+                events_bounds.event_index.alias("event_index"),
                 events_bounds.vessel_id.alias("id"),
                 events_bounds.Category.alias("Category"),
                 ais._ts_millis.alias("ts"),
@@ -2895,9 +2895,9 @@ class ProcessDataService:
             )
         )
 
-        #  --- 4) Build ordered 'points' per (EventIndex, id) ---
+        #  --- 4) Build ordered 'points' per (event_index, id) ---
         # collect_list struct and array_sort by ts
-        grouped = joined.groupBy("EventIndex", "id", "Category").agg(
+        grouped = joined.groupBy("event_index", "id", "Category").agg(
             F.expr(
                 "array_sort(collect_list(struct(ts as ts, lon as lon, lat as lat, sog as sog, cog as cog)), "
                 "(x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
@@ -3098,7 +3098,7 @@ class ProcessDataService:
         # --- 11) Final select and rename to match pandas output keys ---
         result = df.select(
             F.col("id"),
-            F.col("EventIndex"),
+            F.col("event_index"),
             F.col("trajectory"),
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
@@ -3136,19 +3136,19 @@ class ProcessDataService:
     #     """
     #     Pure-Spark replacement for create_aux_dataframe_with_chunks_V2 (pandas).
 
-    #     - events_df must contain: ['EventIndex', 'timestamp', 'id', 'Category'] where
+    #     - events_df must contain: ['event_index', 'timestamp', 'id', 'Category'] where
     #     'timestamp' on events is the event timestamp (pandas used min(timestamp) per event).
     #     - ais_path is the path to the AIS CSV which contains ['id','timestamp','longitude','latitude','speed','heading'].
     #     - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
 
     #     Returns a Spark DataFrame with columns:
-    #     ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
+    #     ['id','event_index','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
     #     'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
     #     'total_area_time','low_speed_percentage','stagnation_time']
     #     """
     #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: start")
 
-    #     # --- 1) Prepare events: compute event_time_ms (min timestamp per EventIndex,id) and keep Category ---
+    #     # --- 1) Prepare events: compute event_time_ms (min timestamp per event_index,id) and keep Category ---
     #     # Convert events timestamp to milliseconds (robust to numeric or string input)
     #     events_pre = events_df.withColumn(
     #         "_ev_ts_millis",
@@ -3161,9 +3161,9 @@ class ProcessDataService:
     #         )
     #     )
 
-    #     # For each (EventIndex, id) compute min timestamp (ms) and pick first Category
+    #     # For each (event_index, id) compute min timestamp (ms) and pick first Category
     #     events_bounds = (
-    #         events_pre.groupBy("EventIndex", "id")
+    #         events_pre.groupBy("event_index", "id")
     #         .agg(
     #             F.min(F.col("_ev_ts_millis")).alias("event_time_ms"),
     #             F.first(F.col("Category")).alias("Category")
@@ -3200,7 +3200,7 @@ class ProcessDataService:
     #     joined = (
     #         ais.join(events_bounds, on=join_cond, how="inner")
     #         .select(
-    #             events_bounds.EventIndex.alias("EventIndex"),
+    #             events_bounds.event_index.alias("event_index"),
     #             events_bounds.vessel_id.alias("id"),
     #             events_bounds.Category.alias("Category"),
     #             ais._ts_millis.alias("ts"),
@@ -3211,9 +3211,9 @@ class ProcessDataService:
     #         )
     #     )
 
-    #     #  --- 4) Build ordered 'points' per (EventIndex, id) ---
+    #     #  --- 4) Build ordered 'points' per (event_index, id) ---
     #     # collect_list struct and array_sort by ts
-    #     grouped = joined.groupBy("EventIndex", "id", "Category").agg(
+    #     grouped = joined.groupBy("event_index", "id", "Category").agg(
     #         F.expr(
     #             "array_sort(collect_list(struct(ts as ts, lon as lon, lat as lat, sog as sog, cog as cog)), "
     #             "(x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
@@ -3363,7 +3363,7 @@ class ProcessDataService:
     #     # --- 11) Final select and rename to match pandas output keys ---
     #     result = df.select(
     #         F.col("id"),
-    #         F.col("EventIndex"),
+    #         F.col("event_index"),
     #         F.col("trajectory"),
     #         F.col("timestamp_array_str").alias("timestamp_array"),
     #         F.col("sog_array_str").alias("sog_array"),

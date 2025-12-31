@@ -7,13 +7,13 @@ class AggregatedAISData(db.Model):
     __tablename__ = 'aggregated_ais_data'
     # schema only; no extra columns beyond those requested
     __table_args__ = (
-        UniqueConstraint('mmsi', 'EventIndex', 'behavior_type_label', name='unique_mmsi_event_index_behavior_type'),
+        UniqueConstraint('mmsi', 'event_index', 'behavior_type_label', name='unique_mmsi_event_index_behavior_type_label'),
         {"schema": "captaima"},
     )
 
     primary_key = db.Column(db.Integer, primary_key=True, autoincrement=True)
     mmsi = db.Column('mmsi', db.String(255), nullable=False)
-    EventIndex = db.Column('EventIndex', db.Integer, nullable=False)
+    event_index = db.Column('event_index', db.Integer, nullable=False)
     trajectory = db.Column(Geometry(geometry_type='LINESTRING', srid=4326), nullable=False)
     timestamp_array = db.Column('timestamp_array', db.Text, nullable=False)
     sog_array = db.Column('sog_array', db.Text, nullable=False)   # speed array
@@ -54,7 +54,7 @@ class AggregatedAISData(db.Model):
         return {
             'primary_key': self.primary_key,
             'mmsi': self.mmsi,
-            'EventIndex': self.EventIndex,
+            'event_index': self.event_index,
             'trajectory': trajectory_wkt,
             'timestamp_array': self.timestamp_array,
             'sog_array': self.sog_array,

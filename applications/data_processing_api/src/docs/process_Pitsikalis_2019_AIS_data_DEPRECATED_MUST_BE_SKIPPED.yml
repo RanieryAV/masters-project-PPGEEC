@@ -6,7 +6,7 @@ description: |
   - Filter by certain FluentName types
   - Convert T_start and T_end from UNIX epoch to timestamps
   - Map FluentName to categories
-  - Add an EventIndex
+  - Add an event_index
   - Save the processed data in two separate files: one for transshipment events ("ais_transshipment_events") and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events")
 
 tags:

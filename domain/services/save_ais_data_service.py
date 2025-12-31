@@ -12,7 +12,7 @@ class SaveAISDataService:
     @staticmethod
     def upsert_aggregated_ais_spark_df_to_db(spark_df, batch_size: int = 1):
         expected_cols = {
-            "id", "EventIndex", "trajectory", "timestamp_array", "sog_array", "cog_array",
+            "id", "event_index", "trajectory", "timestamp_array", "sog_array", "cog_array",
             "behavior_type_label", "average_speed", "min_speed", "max_speed", "average_heading",
             "std_dev_heading", "total_area_time", "low_speed_percentage", "stagnation_time",
             "distance_in_kilometers", "average_time_diff_between_consecutive_points",
@@ -61,7 +61,7 @@ class SaveAISDataService:
             # Map CSV id -> mmsi
             db_dict = {
                 "mmsi": rdict.get("id"),
-                "EventIndex": int(rdict["EventIndex"]) if rdict.get("EventIndex") is not None else None,
+                "event_index": int(rdict["event_index"]) if rdict.get("event_index") is not None else None,
                 "trajectory": rdict.get("trajectory"),
                 "timestamp_array": rdict.get("timestamp_array"),
                 "sog_array": rdict.get("sog_array"),
@@ -101,7 +101,7 @@ class SaveAISDataService:
                         update_dict = {col: getattr(stmt.excluded, col) for col in updatable_cols}
 
                         stmt = stmt.on_conflict_do_update(
-                            constraint="unique_mmsi_event_index_behavior_type",
+                            constraint="unique_mmsi_event_index_behavior_type_label",
                             set_=update_dict
                         )
 
@@ -144,7 +144,7 @@ class SaveAISDataService:
                             stmt = insert(AggregatedAISData).values(batch)
                             update_dict = {col: getattr(stmt.excluded, col) for col in updatable_cols}
                             stmt = stmt.on_conflict_do_update(
-                                constraint="unique_mmsi_event_index_behavior_type",
+                                constraint="unique_mmsi_event_index_behavior_type_label",
                                 set_=update_dict
                             )
                             db.session.execute(stmt)
@@ -172,7 +172,7 @@ class SaveAISDataService:
                         stmt = insert(AggregatedAISData).values(batch)
                         update_dict = {col: getattr(stmt.excluded, col) for col in updatable_cols}
                         stmt = stmt.on_conflict_do_update(
-                            constraint="unique_mmsi_event_index_behavior_type",
+                            constraint="unique_mmsi_event_index_behavior_type_label",
                             set_=update_dict
                         )
                         db.session.execute(stmt)

@@ -355,7 +355,7 @@ class PredictionService:
             out_schema = T.StructType([
                 T.StructField("primary_key_from_aggregated_ais_data", T.ArrayType(T.LongType()), True),
                 T.StructField("mmsi", T.StringType(), True),
-                T.StructField("EventIndex", T.ArrayType(T.LongType()), True),
+                T.StructField("event_index", T.ArrayType(T.LongType()), True),
                 T.StructField("trajectory", T.StringType(), True),
                 T.StructField("timestamp_array", T.ArrayType(T.StringType()), True),
                 T.StructField("sog_array", T.ArrayType(T.DoubleType()), True),
@@ -432,9 +432,23 @@ class PredictionService:
                         .otherwise(F.split(F.col("_traj_body"), r"\s*,\s*")))
         )
 
+        # # --- CLEAN _cog_arr robustly: handle '', 'None', quotes, spaces; cast elements to double ---
+        # # create _cog_arr_clean which is an array<double|null>
+        # df2 = df2.withColumn(
+        #     "_cog_arr_clean",
+        #     F.expr(
+        #         "transform(_cog_arr, x -> CASE WHEN x IS NULL OR trim(x) = '' OR lower(trim(x)) = 'none' THEN NULL "
+        #         "ELSE cast(regexp_replace(trim(x), '^\"|\"$', '') as double) END)"
+        #     )
+        # )
+
+        # # also ensure _sog_arr and _ts_arr are arrays (already handled above, but be defensive)
+        # df2 = df2.withColumn("_sog_arr", F.when(F.col("_sog_arr").isNull(), F.array()).otherwise(F.col("_sog_arr"))) \
+        #          .withColumn("_ts_arr", F.when(F.col("_ts_arr").isNull(), F.array()).otherwise(F.col("_ts_arr")))
+
         logger.info("(7 out of 17) Selecting columns by name (strings).")
         wanted = [
-            "primary_key", "mmsi", "EventIndex", "distance_in_kilometers",
+            "primary_key", "mmsi", "event_index", "distance_in_kilometers",
             "total_area_time", "low_speed_percentage", "stagnation_time",
             "average_time_diff_between_consecutive_points", "behavior_type_label"
         ]
@@ -559,7 +573,7 @@ class PredictionService:
             F.col("lat").alias("lat"),
             F.col("sog").alias("sog"),
             F.col("cog").alias("cog"),
-            F.col("EventIndex").alias("EventIndex"),
+            F.col("event_index").alias("event_index"),
             F.col("pos").alias("pos"),
             F.col("primary_key").alias("primary_key"),
             F.col("distance_in_kilometers").alias("distance_in_kilometers")
@@ -567,7 +581,7 @@ class PredictionService:
 
         grouped = exploded_windows.groupBy("mmsi", "window_index", "window_start_unix", "window_end_unix").agg(
             F.collect_list(pts_struct).alias("pts"),
-            F.collect_set(F.col("EventIndex").cast("long")).alias("EventIndex"),
+            F.collect_set(F.col("event_index").cast("long")).alias("event_index"),
             F.collect_set(F.col("primary_key").cast("long")).alias("primary_key_from_aggregated_ais_data"),
             F.count(F.lit(1)).alias("n_points"),
             # keep original sum as a fallback but we'll recompute distance below
@@ -702,7 +716,7 @@ class PredictionService:
         final_cols = [
             "primary_key_from_aggregated_ais_data",
             "mmsi",
-            "EventIndex",
+            "event_index",
             "trajectory",
             "timestamp_array",
             "sog_array",
