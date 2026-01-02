@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, current_app
 from flasgger import swag_from
 from os import path
 from ..services.prediction_service import PredictionService
+from domain.services.save_ais_data_service import SaveAISDataService
 from domain.config.data_processing.spark_session_initializer import SparkSessionInitializer
 import traceback
 import logging
@@ -18,9 +19,9 @@ prediction_bp = Blueprint('prediction_bp', __name__)
 # Load environment variables
 load_dotenv()
 
-@prediction_bp.route('/sliding-window-loitering', methods=['POST'])
-@swag_from(path.join(path.dirname(__file__), '../docs/find_loitering_trajectories.yml'))
-def find_loitering_trajectories():
+@prediction_bp.route('/sliding-window-loitering-equation', methods=['POST'])
+@swag_from(path.join(path.dirname(__file__), '../docs/apply_loitering_equation_to_AIS_trajectories.yml'))
+def apply_loitering_equation_to_AIS_trajectories():
     try:
         # Extract data from the POST request
         data = request.get_json()
@@ -36,7 +37,7 @@ def find_loitering_trajectories():
         step_size_hours = data['step_size_hours']
         mmsi = data['mmsi']
 
-        spark = SparkSessionInitializer.init_spark_session("Find_Loitering_Trajectories_Service_[Model_Deployment_API]")
+        spark = SparkSessionInitializer.init_spark_session("Apply_Loitering_Equation_To_AIS_Trajectories_Service_[Model_Deployment_API]")
 
         # Call the sliding window function for the specific MMSI
         response_data = PredictionService.sliding_window_extract_trajectory_block_for_interval(
@@ -50,12 +51,24 @@ def find_loitering_trajectories():
 
         logger.info("WARNING: Successfully received response from sliding window extraction!!!")
 
-        # Show first rows of the response data (a Spark Dataframe) for debugging
-        logger.info("First rows of the response data:")
-        response_data.show(2, truncate=True)
+        # Test the loitering classification function
+        logger.info("Calling 'classify_trajectory_with_loitering_equation'...")
+        trajectories_processed_by_the_loitering_equation = PredictionService.classify_trajectory_with_loitering_equation(response_data)
 
+        # Show first rows of the response data (a Spark Dataframe) for debugging
+        sample_first_row = trajectories_processed_by_the_loitering_equation.orderBy("window_index").limit(1).collect()
+        logger.info(
+            "First row of the 'trajectories_processed_by_the_loitering_equation' data:\n%s",
+            sample_first_row
+        )
+
+        # Upsert the AIS trajectories classified by the loitering equation into the database
+        SaveAISDataService.upsert_agg_ais_classified_by_lotering_equation_spark_df_to_db(trajectories_processed_by_the_loitering_equation)
+        logger.info("Successfully upserted loitering equation classified trajectories into the database!")    
+
+        del response_data, trajectories_processed_by_the_loitering_equation, sample_first_row
         # Testing only to free RAM, remove later
-        del response_data
+        #del response_data
 
         # # Parse the JSON response
         # full_response = None
@@ -116,7 +129,7 @@ def find_loitering_trajectories():
             }), 404  # Or another appropriate status code
 
     except Exception as e:
-        logger.error(f"Exception occurred in find_loitering_trajectories: {str(e)}")
+        logger.error(f"Exception occurred in apply_loitering_equation_to_AIS_trajectories: {str(e)}")
         traceback.print_exc()
         return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
