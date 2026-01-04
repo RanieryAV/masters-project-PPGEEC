@@ -766,34 +766,22 @@ class PredictionService:
 
     
 
-    def classify_trajectory_with_loitering_equation(
+    def classify_trajectory_with_loitering_equation_Zhang_2022(
         windows_df,
         earth_radius_km: float = 6371.0,
         redundancy_threshold: float = 1.0
     ):
         """
-        Pure-Spark classifier that receives the windows DataFrame (as returned by
-        sliding_window_extract_trajectory_block_for_interval) and returns the same
-        rows/columns in the original order plus two columns:
+        Pure-Spark classifier that receives the windows DataFrame (as returned by sliding_window_extract_trajectory_block_for_interval)
+        and returns the same rows/columns in the original order plus two columns:
         - trajectory_redundancy (double)
         - behavior_type_by_loitering_equation (string) -> 'LOITERING' if redundancy > redundancy_threshold else 'NON-LOITERING'
 
-        Parameters
-        ----------
-        windows_df : pyspark.sql.DataFrame
-            Input DataFrame containing at least a 'trajectory' or 'trajectory_wkt' column
-            in LINESTRING(lon lat, ...) text format (but function is robust if missing).
-        earth_radius_km : float
-            Earth radius in kilometers used by the haversine formula (default 6371.0).
-        redundancy_threshold : float
-            Threshold to classify a window as LOITERING (default 1.0).
-
-        Returns
-        -------
-        pyspark.sql.DataFrame
-            DataFrame with original columns preserved in order plus appended new columns
-            (if they did not exist already): 'trajectory_redundancy' and
-            'behavior_type_by_loitering_equation'.
+        Notes:
+        - based on the Zhang et al. (2022) paper "Loitering behavior detection and classification of vessel movements based on trajectory shape and Convolutional Neural Networks"
+        - computes absolute_distance_traveled_km as the sum of haversine distances between consecutive points
+        (point-to-point). It is NOT the same as first point->last point distance.
+        - uses absolute_distance_traveled_km to compute trajectory_redundancy.
         """
         # preserve original column order
         original_cols = list(windows_df.columns)
@@ -829,7 +817,7 @@ class PredictionService:
             F.expr("transform(_pt_arr, p -> cast(split(trim(p), '\\\\s+')[1] as double))")
         )
 
-        # 4) array size and endpoints
+        # 4) array size and endpoints (keep endpoints for compatibility/optional use)
         df = df.withColumn("n_pts_array", F.size(F.col("lon_arr")))
 
         df = df.withColumn(
@@ -846,8 +834,26 @@ class PredictionService:
             F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lat_arr"), F.col("n_pts_array"))).otherwise(F.lit(None))
         )
 
-        # 5) haversine implemented with Spark column expressions; returns kilometers
-        def haversine_km(lat1_col, lon1_col, lat2_col, lon2_col):
+        # 5) compute absolute distance traveled as sum of haversine over consecutive pairs
+        # Build a SQL expression that aggregates pairwise haversine distances across the arrays.
+        # Uses the same haversine formula as before but applied element-wise inside aggregate().
+        agg_expr = (
+            "CASE WHEN size(lat_arr) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_arr)), cast(0.0 as double), (acc, i) -> acc + ("
+            f"2 * {earth_radius_km} * asin( sqrt( pow( sin( (radians(element_at(lat_arr, i)) - radians(element_at(lat_arr, i-1))) / 2 ), 2 ) "
+            "+ cos(radians(element_at(lat_arr, i-1))) * cos(radians(element_at(lat_arr, i))) * pow( sin( (radians(element_at(lon_arr, i)) - radians(element_at(lon_arr, i-1))) / 2 ), 2 ) ) ) ) ) END"
+        )
+
+        df = df.withColumn("absolute_distance_traveled_km", F.expr(agg_expr).cast(T.DoubleType()))
+
+        # 7) bbox min/max lon/lat
+        df = df.withColumn("min_lon", F.array_min(F.col("lon_arr"))) \
+            .withColumn("max_lon", F.array_max(F.col("lon_arr"))) \
+            .withColumn("min_lat", F.array_min(F.col("lat_arr"))) \
+            .withColumn("max_lat", F.array_max(F.col("lat_arr")))
+
+        # 8) bbox width/height (km); guard against nulls
+        def _haversine_expr(lat1_col, lon1_col, lat2_col, lon2_col):
+            # helper that reuses column-based haversine (for clarity, we use expressions directly below)
             lat1_rad = F.radians(lat1_col)
             lat2_rad = F.radians(lat2_col)
             lon1_rad = F.radians(lon1_col)
@@ -858,45 +864,30 @@ class PredictionService:
             c = 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
             return F.lit(earth_radius_km) * c
 
-        # 6) departure-to-arrival distance (numerator)
-        df = df.withColumn(
-            "departure_to_arrival_km",
-            F.when(F.col("n_pts_array") >= 2,
-                haversine_km(F.col("first_lat"), F.col("first_lon"), F.col("last_lat"), F.col("last_lon"))
-            ).otherwise(F.lit(0.0))
-        )
-
-        # 7) bbox min/max lon/lat
-        df = df.withColumn("min_lon", F.array_min(F.col("lon_arr"))) \
-            .withColumn("max_lon", F.array_max(F.col("lon_arr"))) \
-            .withColumn("min_lat", F.array_min(F.col("lat_arr"))) \
-            .withColumn("max_lat", F.array_max(F.col("lat_arr")))
-
-        # 8) bbox width/height (km); guard against nulls
         df = df.withColumn(
             "bbox_width_km",
             F.when((F.col("min_lon").isNotNull()) & (F.col("max_lon").isNotNull()) & (F.col("min_lat").isNotNull()),
-                haversine_km(F.col("min_lat"), F.col("min_lon"), F.col("min_lat"), F.col("max_lon"))
+                _haversine_expr(F.col("min_lat"), F.col("min_lon"), F.col("min_lat"), F.col("max_lon"))
             ).otherwise(F.lit(0.0))
         ).withColumn(
             "bbox_height_km",
             F.when((F.col("min_lat").isNotNull()) & (F.col("max_lat").isNotNull()) & (F.col("min_lon").isNotNull()),
-                haversine_km(F.col("min_lat"), F.col("min_lon"), F.col("max_lat"), F.col("min_lon"))
+                _haversine_expr(F.col("min_lat"), F.col("min_lon"), F.col("max_lat"), F.col("min_lon"))
             ).otherwise(F.lit(0.0))
         )
 
-        # 9) perimeter
+        # 9) perimeter (unchanged)
         df = df.withColumn("bbox_perimeter_km", 2 * (F.col("bbox_width_km") + F.col("bbox_height_km")))
 
-        # 10) redundancy with safe division
+        # 10) redundancy with safe division: use absolute_distance_traveled_km numerator
         df = df.withColumn(
             "trajectory_redundancy",
             F.when((F.col("bbox_perimeter_km").isNotNull()) & (F.col("bbox_perimeter_km") > 0),
-                (F.col("departure_to_arrival_km") / F.col("bbox_perimeter_km"))
+                (F.col("absolute_distance_traveled_km") / F.col("bbox_perimeter_km"))
             ).otherwise(F.lit(0.0)).cast(T.DoubleType())
         )
 
-        # --- 11) behavior type label using redundancy_threshold (renamed as requested) ---
+        # --- 11) behavior type label using redundancy_threshold ---
         df = df.withColumn(
             "behavior_type_by_loitering_equation",
             F.when(F.col("trajectory_redundancy") > F.lit(float(redundancy_threshold)), F.lit("LOITERING")).otherwise(F.lit("NON-LOITERING"))
@@ -906,7 +897,167 @@ class PredictionService:
         aux_cols = [
             "_traj_body", "_pt_arr", "lon_arr", "lat_arr", "n_pts_array",
             "first_lon", "first_lat", "last_lon", "last_lat",
-            "departure_to_arrival_km", "min_lon", "max_lon", "min_lat", "max_lat",
+            # note: we drop absolute_distance_traveled_km as we treated it as auxiliary (same behavior as previous departure_to_arrival_km)
+            "absolute_distance_traveled_km", "min_lon", "max_lon", "min_lat", "max_lat",
+            "bbox_width_km", "bbox_height_km", "bbox_perimeter_km"
+        ]
+        existing_aux = [c for c in aux_cols if c in df.columns]
+        df = df.drop(*existing_aux)
+
+        # final column order: original columns (unchanged) + appended new columns if they weren't in the original
+        new_cols = ["trajectory_redundancy", "behavior_type_by_loitering_equation"]
+        cols_to_append = [c for c in new_cols if c not in original_cols]
+        final_cols = original_cols + cols_to_append
+        final_cols = [c for c in final_cols if c in df.columns]
+
+        return df.select(*final_cols)
+    
+    def classify_trajectory_with_loitering_equation_Wijaya_Nakamura_2022(
+        windows_df,
+        earth_radius_km: float = 6371.0,
+        redundancy_threshold: float = 1.0
+    ):
+        """
+        Pure-Spark classifier that receives the windows DataFrame (as returned by sliding_window_extract_trajectory_block_for_interval)
+        and returns the same rows/columns in the original order plus two columns:
+        - trajectory_redundancy (double)
+        - behavior_type_by_loitering_equation (string) -> 'LOITERING' if redundancy > redundancy_threshold else 'NON-LOITERING'
+
+        Notes:
+        - based on the Wijaya and Nakamura (2023) paper "Loitering behavior detection by spatiotemporal characteristics quantification based on the dynamic features of Automatic Identification System (AIS) messages"
+        - computes absolute_distance_traveled_km as the sum of haversine distances between consecutive points
+        (point-to-point). It is NOT the same as first point->last point distance.
+        - uses absolute_distance_traveled_km to compute trajectory_redundancy.
+        - also computes sum_sog (sum of SOG values for the window) and sum_cog_delta (sum of absolute consecutive COG diffs)
+        """
+        # preserve original column order
+        original_cols = list(windows_df.columns)
+
+        # choose trajectory column if present
+        if "trajectory" in original_cols:
+            traj_col_expr = F.col("trajectory").cast("string")
+        elif "trajectory_wkt" in original_cols:
+            traj_col_expr = F.col("trajectory_wkt").cast("string")
+        else:
+            traj_col_expr = F.lit("")
+
+        # 1) extract body of LINESTRING text
+        df = windows_df.withColumn(
+            "_traj_body",
+            F.regexp_replace(traj_col_expr, r'(?i)^\s*LINESTRING\s*\(\s*|\)\s*$', "")
+        )
+
+        # 2) split into array of "lon lat" strings (empty array if none)
+        df = df.withColumn(
+            "_pt_arr",
+            F.when((F.col("_traj_body").isNull()) | (F.col("_traj_body") == ""), F.array()).otherwise(
+                F.split(F.col("_traj_body"), r"\s*,\s*")
+            )
+        )
+
+        # 3) numeric lon/lat arrays
+        df = df.withColumn(
+            "lon_arr",
+            F.expr("transform(_pt_arr, p -> cast(split(trim(p), '\\\\s+')[0] as double))")
+        ).withColumn(
+            "lat_arr",
+            F.expr("transform(_pt_arr, p -> cast(split(trim(p), '\\\\s+')[1] as double))")
+        )
+
+        # 4) array size and endpoints (keep endpoints for compatibility/optional use)
+        df = df.withColumn("n_pts_array", F.size(F.col("lon_arr")))
+
+        df = df.withColumn(
+            "first_lon",
+            F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lon_arr"), F.lit(1))).otherwise(F.lit(None))
+        ).withColumn(
+            "first_lat",
+            F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lat_arr"), F.lit(1))).otherwise(F.lit(None))
+        ).withColumn(
+            "last_lon",
+            F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lon_arr"), F.col("n_pts_array"))).otherwise(F.lit(None))
+        ).withColumn(
+            "last_lat",
+            F.when(F.col("n_pts_array") >= 1, F.element_at(F.col("lat_arr"), F.col("n_pts_array"))).otherwise(F.lit(None))
+        )
+
+        # 5) compute absolute distance traveled as sum of haversine over consecutive pairs
+        agg_expr = (
+            "CASE WHEN size(lat_arr) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_arr)), cast(0.0 as double), (acc, i) -> acc + ("
+            f"2 * {earth_radius_km} * asin( sqrt( pow( sin( (radians(element_at(lat_arr, i)) - radians(element_at(lat_arr, i-1))) / 2 ), 2 ) "
+            "+ cos(radians(element_at(lat_arr, i-1))) * cos(radians(element_at(lat_arr, i))) * pow( sin( (radians(element_at(lon_arr, i)) - radians(element_at(lon_arr, i-1))) / 2 ), 2 ) ) ) ) ) END"
+        )
+
+        df = df.withColumn("absolute_distance_traveled_km", F.expr(agg_expr).cast(T.DoubleType()))
+
+        # --- compute sum_sog (sum of SOG values for the window) ---
+        sum_sog_expr = (
+            "CASE WHEN sog_array IS NULL OR size(sog_array) = 0 THEN 0.0 "
+            "ELSE aggregate(transform(sog_array, x -> cast(x as double)), cast(0.0 as double), (acc,x) -> acc + x) END"
+        )
+        df = df.withColumn("sum_sog", F.expr(sum_sog_expr).cast(T.DoubleType()))
+
+        # --- compute sum_cog_delta (sum of absolute consecutive COG diffs) ---
+        sum_cog_delta_expr = (
+            "CASE WHEN cog_array IS NULL OR size(cog_array) <= 1 THEN 0.0 "
+            "ELSE aggregate(sequence(2, size(cog_array)), cast(0.0 as double), (acc,i) -> acc + abs(cast(element_at(cog_array,i) as double) - cast(element_at(cog_array,i-1) as double))) END"
+        )
+        df = df.withColumn("sum_cog_delta", F.expr(sum_cog_delta_expr).cast(T.DoubleType()))
+
+        # 7) bbox min/max lon/lat
+        df = df.withColumn("min_lon", F.array_min(F.col("lon_arr"))) \
+            .withColumn("max_lon", F.array_max(F.col("lon_arr"))) \
+            .withColumn("min_lat", F.array_min(F.col("lat_arr"))) \
+            .withColumn("max_lat", F.array_max(F.col("lat_arr")))
+
+        # 8) bbox width/height (km); guard against nulls (unchanged)
+        def _haversine_expr(lat1_col, lon1_col, lat2_col, lon2_col):
+            lat1_rad = F.radians(lat1_col)
+            lat2_rad = F.radians(lat2_col)
+            lon1_rad = F.radians(lon1_col)
+            lon2_rad = F.radians(lon2_col)
+            dlat = lat2_rad - lat1_rad
+            dlon = lon2_rad - lon1_rad
+            a = F.sin(dlat / 2) * F.sin(dlat / 2) + F.cos(lat1_rad) * F.cos(lat2_rad) * F.sin(dlon / 2) * F.sin(dlon / 2)
+            c = 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
+            return F.lit(earth_radius_km) * c
+
+        df = df.withColumn(
+            "bbox_width_km",
+            F.when((F.col("min_lon").isNotNull()) & (F.col("max_lon").isNotNull()) & (F.col("min_lat").isNotNull()),
+                _haversine_expr(F.col("min_lat"), F.col("min_lon"), F.col("min_lat"), F.col("max_lon"))
+            ).otherwise(F.lit(0.0))
+        ).withColumn(
+            "bbox_height_km",
+            F.when((F.col("min_lat").isNotNull()) & (F.col("max_lat").isNotNull()) & (F.col("min_lon").isNotNull()),
+                _haversine_expr(F.col("min_lat"), F.col("min_lon"), F.col("max_lat"), F.col("min_lon"))
+            ).otherwise(F.lit(0.0))
+        )
+
+        # 9) perimeter
+        df = df.withColumn("bbox_perimeter_km", 2 * (F.col("bbox_width_km") + F.col("bbox_height_km")))
+
+        # 10) redundancy: compute psi = (sum d_k * sum delta_C_k) / (P * sum_sog) with safe guards
+        df = df.withColumn(
+            "trajectory_redundancy",
+            F.when(
+                (F.col("bbox_perimeter_km").isNotNull()) & (F.col("bbox_perimeter_km") > 0) & (F.col("sum_sog").isNotNull()) & (F.col("sum_sog") > 0),
+                (F.col("absolute_distance_traveled_km") * F.col("sum_cog_delta")) / (F.col("bbox_perimeter_km") * F.col("sum_sog"))
+            ).otherwise(F.lit(0.0)).cast(T.DoubleType())
+        )
+
+        # --- 11) behavior type label using redundancy_threshold ---
+        df = df.withColumn(
+            "behavior_type_by_loitering_equation",
+            F.when(F.col("trajectory_redundancy") > F.lit(float(redundancy_threshold)), F.lit("LOITERING")).otherwise(F.lit("NON-LOITERING"))
+        )
+
+        # drop auxiliary columns we created earlier (do NOT keep sum_sog or sum_cog_delta in the final DF)
+        aux_cols = [
+            "_traj_body", "_pt_arr", "lon_arr", "lat_arr", "n_pts_array",
+            "first_lon", "first_lat", "last_lon", "last_lat",
+            "absolute_distance_traveled_km", "sum_sog", "sum_cog_delta",
+            "min_lon", "max_lon", "min_lat", "max_lat",
             "bbox_width_km", "bbox_height_km", "bbox_perimeter_km"
         ]
         existing_aux = [c for c in aux_cols if c in df.columns]

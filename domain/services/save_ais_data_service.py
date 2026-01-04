@@ -236,7 +236,7 @@ class SaveAISDataService:
     @staticmethod
     def upsert_agg_ais_classified_by_lotering_equation_spark_df_to_db(spark_df, batch_size: int = 1):
         expected_cols = {
-            "id", "event_index", "trajectory", "timestamp_array", "sog_array", "cog_array",
+            "mmsi", "event_index", "trajectory", "timestamp_array", "sog_array", "cog_array",
             "behavior_type_label", "average_speed", "min_speed", "max_speed", "average_heading",
             "std_dev_heading", "total_area_time", "low_speed_percentage", "stagnation_time",
             "distance_in_kilometers", "average_time_diff_between_consecutive_points",
@@ -310,6 +310,41 @@ class SaveAISDataService:
                 return float(s)
             except Exception:
                 return None
+
+        def _to_str_scalar(v):
+            """
+            Convert v to a plain string scalar:
+            - if v is list/tuple -> take first element (and convert to str)
+            - if v is a string that looks like "['X']" or '["X","Y"]' -> extract first item without brackets/quotes
+            - otherwise return str(v)
+            Returns None if input is None or empty.
+            """
+            if v is None:
+                return None
+            # list/tuple -> take first element
+            if isinstance(v, (list, tuple)):
+                if len(v) == 0:
+                    return None
+                first = v[0]
+                return None if first is None else str(first)
+            s = str(v).strip()
+            if s == "":
+                return None
+            # if stringified list like "['LOITERING']" or '["LOITERING","X"]'
+            if s.startswith("[") and s.endswith("]"):
+                inner = s[1:-1].strip()
+                if inner == "":
+                    return None
+                # take first element before any comma
+                first_part = inner.split(",", 1)[0].strip()
+                # remove surrounding quotes if present
+                if (first_part.startswith("'") and first_part.endswith("'")) or (first_part.startswith('"') and first_part.endswith('"')):
+                    first_part = first_part[1:-1]
+                return first_part
+            # remove surrounding single/double quotes if present
+            if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+                return s[1:-1]
+            return s
         # -------------------------------------------
 
         # helper that converts a Spark Row to a DB dict, using one asDict() call
@@ -341,6 +376,9 @@ class SaveAISDataService:
             cog_range = _to_float(rdict.get("cog_unit_range"))
             cog_r = _to_float(rdict.get("cog_ratio"))
 
+            # Extract a clean string scalar for behavior_type_label (removes [ ] and quotes if present)
+            behavior_label_scalar = _to_str_scalar(rdict.get("behavior_type_label"))
+
             # Build db_dict using scalars (preserve textual arrays as strings where appropriate)
             db_dict = {
                 "aggregated_ais_data_id": aggregated_pk,
@@ -350,7 +388,7 @@ class SaveAISDataService:
                 "timestamp_array": rdict.get("timestamp_array"),
                 "sog_array": rdict.get("sog_array"),
                 "cog_array": rdict.get("cog_array"),
-                "behavior_type_label": rdict.get("behavior_type_label"),
+                "behavior_type_label": behavior_label_scalar,
                 "behavior_type_by_loitering_equation": rdict.get("behavior_type_by_loitering_equation"),
                 "trajectory_redundancy": traj_redundancy_scalar,
                 "average_speed": avg_speed,
