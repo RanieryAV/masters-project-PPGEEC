@@ -64,6 +64,10 @@ RUN mkdir -p /app/processed_output /app/datasets /app/shared /app/processed_outp
 # Print confirmation that directories were created and permissions set
 RUN echo "--> WARNING: Directories created and permissions set successfully! <--"
 
+# Install numpy into the image so Spark Python workers have it available
+# Keep this minimal and cache-less to keep image small.
+RUN pip install --no-cache-dir numpy
+
 # Set working dir (runtime will be /app)
 WORKDIR /app
 

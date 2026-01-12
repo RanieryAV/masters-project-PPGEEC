@@ -11,4 +11,4 @@ RUN pip install psycopg2-binary
 EXPOSE ${MLFLOW_UI_PORT}
 
 # Command to run the MLflow server
-CMD ["sh", "-c", "mlflow server --backend-store-uri ${MLFLOW_TRACKING_DB_URI} --host ${MLFLOW_HOST} --port ${MLFLOW_UI_PORT}"]
+CMD ["sh", "-c", "mlflow server --backend-store-uri ${MLFLOW_TRACKING_DB_URI} --host 0.0.0.0 --port ${MLFLOW_UI_PORT} --allowed-hosts \"${MLFLOW_ALLOWED_HOSTS:-mlflow:*,mlflow_app:*,localhost:*,127.0.0.1:*}\""]

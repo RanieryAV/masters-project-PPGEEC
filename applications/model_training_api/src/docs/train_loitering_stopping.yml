@@ -1,0 +1,78 @@
+summary: "Endpoint for Random Forest Model Training (Loitering vs Stopping)"
+description: |
+  Trains a Random Forest classifier to distinguish **LOITERING** vs **STOPPING** behaviors
+  using features stored in `captaima.aggregated_ais_data`. Training artifacts and metrics
+  are logged into MLflow.
+
+tags:
+  - "Train Machine Learning Models"
+produces:
+  - "application/json"
+parameters:
+  - in: body
+    name: body
+    description: |
+      Pass hyperparameters to customize training:
+
+      - **per_label_n**: number of samples per class (defaults to minimum class size if omitted).
+      - **n_estimators**: number of trees.
+      - **max_depth**: maximum tree depth.
+      - **test_size**: fraction of data reserved for test.
+      - **random_state**: seed for reproducibility.
+      - **experiment_name**: name of MLflow experiment.
+
+    required: true
+    schema:
+      type: object
+      properties:
+        experiment_name:
+          type: string
+          example: "LoiteringStoppingExperiment"
+        hyperparameters:
+          type: object
+          properties:
+            per_label_n:
+              type: integer
+              example: 300
+            n_estimators:
+              type: integer
+              example: 100
+            max_depth:
+              type: integer
+              example: null
+            test_size:
+              type: number
+              format: float
+              example: 0.20
+            random_state:
+              type: integer
+              example: 42
+
+responses:
+  200:
+    description: Training finished, returns metrics and MLflow run id.
+    schema:
+      type: object
+      properties:
+        accuracy:
+          type: number
+          format: float
+        f1:
+          type: number
+          format: float
+        precision:
+          type: number
+          format: float
+        recall:
+          type: number
+        mlflow_run_id:
+          type: string
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+        details:
+          type: string

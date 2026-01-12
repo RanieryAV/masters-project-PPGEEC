@@ -83,6 +83,8 @@ services:
       dockerfile: applications/model_training_api/dockerfile.model_training_api
     ports:
       - ${FLASK_MODEL_TRAINING_PORT_DOCKER}:${FLASK_MODEL_TRAINING_PORT_DOCKER}
+    volumes:
+      - ./infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     environment:
       # Flask-related env vars
       FLASK_MODEL_TRAINING_HOST: ${FLASK_MODEL_TRAINING_HOST}
@@ -98,6 +100,11 @@ services:
       # MLFlow env vars
       MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+
+      # ensure driver JVM and executors see the jar
+      PYSPARK_SUBMIT_ARGS: "--jars /opt/jars/postgresql.jar --driver-class-path /opt/jars/postgresql.jar pyspark-shell"
+      # optional fallback (some spark builds read this)
+      SPARK_CLASSPATH: "/opt/jars/postgresql.jar"
     networks:
       - captaima-network
 

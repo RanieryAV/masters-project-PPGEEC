@@ -11,12 +11,17 @@ RUN apt-get update && \
         python3-dev \
         pkg-config \
         libssl-dev \
-        libffi-dev 
+        libffi-dev \
+        openjdk-21-jdk && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY ./applications/model_training_api .
 COPY ./domain/ ./domain/
+
+# Upgrade pip / setuptools / wheel
+RUN pip install --upgrade pip setuptools wheel
 
 # Install Python dependencies
 RUN pip install -r ./model-training-api-requirements.txt
