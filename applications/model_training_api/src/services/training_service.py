@@ -780,7 +780,7 @@ Notes:
             logger.exception("Failed to register model to MLflow registry for %s", registered_model_name)
             return None
 
-    # ------------------------
+        # ------------------------
     # 1) LOITERING vs TRANSSHIPMENT SVM (renamed)
     # ------------------------
     def train_loitering_transshipment_svm(per_label_n=None, test_size=0.20, random_state=42,
@@ -879,6 +879,122 @@ Notes:
                             regParam=float(regParam) if regParam is not None else 0.0)
             ovr = OneVsRest(classifier=svc, labelCol="label", featuresCol="features")
 
+            # helper: safely extract objective history from a binary model and log per-step metrics
+            def _extract_and_log_objective_history(onevs_model, label_order_list, mlflow_prefix, fold_number=None):
+                """
+                Tenta extrair objectiveHistory do OneVsRestModel (por classe) e logar
+                séries de métricas por step em MLflow. Faz várias tentativas:
+                1) Python-side: binary_model.summary.objectiveHistory (comum em alguns modelos)
+                2) Java-side: binary_model._java_obj.summary().objectiveHistory() (fallback)
+                Também faz logger.info para inspeção local antes de logar em MLflow.
+                """
+                try:
+                    models_list = getattr(onevs_model, "models", None)
+                    if not models_list:
+                        logger.info("OneVsRest model has no .models attribute -> skipping objectiveHistory extraction")
+                        return
+
+                    per_class_histories = {}
+                    max_len = 0
+
+                    for idx, binary_model in enumerate(models_list):
+                        label_name = label_order_list[idx] if idx < len(label_order_list) else f"class_{idx}"
+                        hist = None
+
+                        # 1) try python summary.objectiveHistory
+                        try:
+                            summ = getattr(binary_model, "summary", None)
+                            if summ is not None:
+                                hist_attr = getattr(summ, "objectiveHistory", None)
+                                if callable(hist_attr):
+                                    hist = hist_attr()
+                                else:
+                                    hist = hist_attr
+                            if hist:
+                                logger.info("Found objectiveHistory via python summary for label '%s' (len=%d)", label_name, len(hist))
+                        except Exception as ex:
+                            logger.debug("python-summary attempt failed for label %s: %s", label_name, ex)
+                            hist = None
+
+                        # 2) fallback: try java-level access binary_model._java_obj.summary().objectiveHistory()
+                        if not hist:
+                            try:
+                                jmodel = getattr(binary_model, "_java_obj", None)
+                                if jmodel is not None:
+                                    # some Spark builds expose summary() as a method
+                                    try:
+                                        jsummary = jmodel.summary()
+                                    except Exception:
+                                        # sometimes it's an attribute or call fails; try property-like access
+                                        try:
+                                            jsummary = jmodel.summary
+                                        except Exception:
+                                            jsummary = None
+
+                                    if jsummary is not None:
+                                        try:
+                                            jhist = jsummary.objectiveHistory()
+                                            # jhist may be a Java array/Seq; convert robustly
+                                            try:
+                                                # py4j collection -> iterable
+                                                hist = list(jhist)
+                                            except Exception:
+                                                # try to iterate via toArray / toList
+                                                try:
+                                                    hist = [float(x) for x in jhist.toArray()]
+                                                except Exception:
+                                                    hist = None
+                                            if hist:
+                                                logger.info("Found objectiveHistory via java summary for label '%s' (len=%d)", label_name, len(hist))
+                                        except Exception as ex2:
+                                            logger.debug("java-summary.objectiveHistory() not available for label %s: %s", label_name, ex2)
+                            except Exception as ex_outer:
+                                logger.debug("java-level attempt failed for label %s: %s", label_name, ex_outer)
+                                hist = None
+
+                        # normalize into list[float]
+                        if hist:
+                            try:
+                                hist_list = [float(x) for x in hist]
+                                per_class_histories[label_name] = hist_list
+                                max_len = max(max_len, len(hist_list))
+                            except Exception as econv:
+                                logger.debug("Could not convert objectiveHistory for %s: %s", label_name, econv)
+                                continue
+
+                    if not per_class_histories:
+                        logger.info("No objectiveHistory found for OneVsRest model (no per-step training metrics will be logged).")
+                        return
+
+                    # log per-class histories (with verbose logging)
+                    for label_name, hist_list in per_class_histories.items():
+                        metric_base = f"{mlflow_prefix}_train_step_objective_{label_name}"
+                        if fold_number is not None:
+                            metric_base = f"{mlflow_prefix}_fold{fold_number}_{metric_base}"
+                        for step_idx, val in enumerate(hist_list):
+                            logger.info("MLflow metric -> name=%s step=%d value=%.8f", metric_base, step_idx, float(val))
+                            mlflow.log_metric(metric_base, float(val), step=step_idx)
+
+                    # log mean across classes per step
+                    for step_idx in range(max_len):
+                        vals = []
+                        for hist_list in per_class_histories.values():
+                            if step_idx < len(hist_list):
+                                vals.append(hist_list[step_idx])
+                        if vals:
+                            mean_val = float(sum(vals) / len(vals))
+                            mean_name = f"{mlflow_prefix}_train_step_objective_mean"
+                            if fold_number is not None:
+                                mean_name = f"{mlflow_prefix}_fold{fold_number}_{mean_name}"
+                            logger.info("MLflow metric -> name=%s step=%d value=%.8f", mean_name, step_idx, mean_val)
+                            mlflow.log_metric(mean_name, mean_val, step=step_idx)
+
+                except Exception as ex_final:
+                    logger.exception("Unexpected error extracting objectiveHistory: %s", ex_final)
+                    # Don't raise; fall back gracefully
+                    return
+
+
             # MLflow run start (defensive)
             experiment_name = experiment_name or f"SVM_Loitering_vs_Transshipment_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
             # try to ensure once more; use the boolean to decide nested
@@ -942,10 +1058,14 @@ Notes:
 
                     logger.info("Fitting model for CV fold %d", fold_idx + 1)
                     model_fold = ovr.fit(train_fold_scaled)
+                    # log per-iteration objective history for this fold (if available)
+                    _extract_and_log_objective_history(model_fold, label_order, mlflow_prefix="cv", fold_number=fold_idx+1)
+
                     logger.info("Predicting validation fold %d", fold_idx + 1)
                     pred_val = model_fold.transform(val_scaled)
                     rows = pred_val.groupBy("label", "prediction").count().collect()
                     report_cv = TrainModelService.compute_metrics_from_confusion_rows(rows, label_order)
+                    # existing CV aggregated metrics (no change)
                     TrainModelService.log_metrics_from_report(report_cv, prefix="cv", step=fold_idx)
                     logger.info("Completed CV fold %d: accuracy=%.4f", fold_idx + 1, float(report_cv.get("accuracy", 0.0)))
 
@@ -953,13 +1073,16 @@ Notes:
                 logger.info("Training final model on full train set")
                 model = ovr.fit(train_scaled)
 
+                # log per-iteration objective history for final model (train), if available
+                _extract_and_log_objective_history(model, label_order, mlflow_prefix="train", fold_number=None)
+
                 # train aggregated metrics
                 logger.info("Evaluating on train set")
                 rows_train = model.transform(train_scaled).groupBy("label", "prediction").count().collect()
                 report_train = TrainModelService.compute_metrics_from_confusion_rows(rows_train, label_order)
                 TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
 
-                # test aggregated metrics
+                # test aggregated metrics (no per-step metrics)
                 logger.info("Evaluating on test set")
                 rows_test = model.transform(test_scaled).groupBy("label", "prediction").count().collect()
                 report_test = TrainModelService.compute_metrics_from_confusion_rows(rows_test, label_order)
@@ -1015,6 +1138,7 @@ Notes:
             except Exception:
                 pass
             return {"error": str(e), "trace": traceback.format_exc()}
+
 
     # ------------------------------------------------------------------
     # 2) train_loitering_stopping_model (RandomForest)
@@ -1366,30 +1490,30 @@ Notes:
                     TrainModelService.log_metrics_from_report(report_cv, prefix="cv", step=fold_idx)
                     logger.info("Completed CV fold %d: accuracy=%.4f", fold_idx + 1, float(report_cv.get("accuracy", 0.0)))
 
-                    model = rf.fit(train_scaled)
+                model = rf.fit(train_scaled)
 
-                    rows_train = model.transform(train_scaled).groupBy("label", "prediction").count().collect()
-                    report_train = TrainModelService.compute_metrics_from_confusion_rows(rows_train, label_order)
-                    TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+                rows_train = model.transform(train_scaled).groupBy("label", "prediction").count().collect()
+                report_train = TrainModelService.compute_metrics_from_confusion_rows(rows_train, label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
 
-                    rows_test = model.transform(test_scaled).groupBy("label", "prediction").count().collect()
-                    report_test = TrainModelService.compute_metrics_from_confusion_rows(rows_test, label_order)
-                    TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+                rows_test = model.transform(test_scaled).groupBy("label", "prediction").count().collect()
+                report_test = TrainModelService.compute_metrics_from_confusion_rows(rows_test, label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
 
-                    TrainModelService.plot_confusion_matrix_and_log(report_test)
+                TrainModelService.plot_confusion_matrix_and_log(report_test)
 
-                    mlflow.spark.log_model(spark_model=model, artifact_path="model")
-                    mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+                mlflow.spark.log_model(spark_model=model, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
 
-                    base_dirs = ["artifacts/class_distribution", "artifacts/feature_distributions", "artifacts/confusion_matrix", "used_features", "artifacts/readme"]
-                    TrainModelService.build_html_summary_artifact(base_dirs, out_html="artifacts/summary_report.html")
+                base_dirs = ["artifacts/class_distribution", "artifacts/feature_distributions", "artifacts/confusion_matrix", "used_features", "artifacts/readme"]
+                TrainModelService.build_html_summary_artifact(base_dirs, out_html="artifacts/summary_report.html")
 
-                    run_id = mlflow.active_run().info.run_id
-                    logger.info("Finished MLflow run: run_id=%s", run_id)
-                    if register_model_name:
-                        logger.info("Registering model name=%s", register_model_name)
-                        registration_info = TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
-                        logger.info("Registration info: %s", registration_info)
+                run_id = mlflow.active_run().info.run_id
+                logger.info("Finished MLflow run: run_id=%s", run_id)
+                if register_model_name:
+                    logger.info("Registering model name=%s", register_model_name)
+                    registration_info = TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+                    logger.info("Registration info: %s", registration_info)
 
             acc = float(report_test.get("accuracy", 0.0))
             prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
