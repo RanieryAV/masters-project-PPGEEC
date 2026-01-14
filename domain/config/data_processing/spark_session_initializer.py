@@ -56,6 +56,7 @@ class SparkSessionInitializer:
         spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor
         spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
         spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
+        spark_driver_max_result_size = os.getenv("SPARK_DRIVER_MAX_RESULT_SIZE", "4g")
 
         spark_sql_debug_max_to_string_fields = os.getenv("SPARK_SQL_DEBUG_MAX_TO_STRING_FIELDS", "10000")
 
@@ -71,6 +72,7 @@ class SparkSessionInitializer:
             .config("spark.executor.cores", spark_executor_cores)
             .config("spark.executor.memory", spark_executor_memory)
             .config("spark.driver.memory", spark_driver_memory)
+            .config("spark.driver.maxResultSize", spark_driver_max_result_size)
             .config("spark.driver.host", driver_host)
             .config("spark.driver.bindAddress", "0.0.0.0")
             .config("spark.local.dir", "/app/processed_output/spark_tmp")

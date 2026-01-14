@@ -1,0 +1,85 @@
+summary: "Generate grayscale image datasets (.png) for all behavior types"
+description: |
+  Generate grayscale image datasets (.png) for all behavior types.
+    - Folder structure and filenames as specified in the request.
+    - Returns: Flask JSON response (200 success or 500 error with message).
+
+tags:
+  - "Data Processing - Maritime Composite Events"
+
+produces:
+  - "application/json"
+consumes:
+  - "application/json"
+
+parameters:
+  - in: "body"
+    name: "body"
+    description: "No request body required for this endpoint. The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
+    required: false
+    schema:
+      type: "object"
+      properties: {}
+      example: {}
+
+responses:
+  200:
+    description: "Pitsikalis 2019 labels data processing completed successfully."
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            status:
+              type: "string"
+              example: "success"
+            num_rows:
+              type: "integer"
+              example: 12345
+            num_columns:
+              type: "integer"
+              example: 7
+            columns:
+              type: "array"
+              items:
+                type: "string"
+              example: ["event_index", "FluentName", "MMSI", "Argument", "Value", "T_start", "T_end", "Category"]
+            unique_counts:
+              type: "object"
+              additionalProperties:
+                type: "integer"
+              example:
+                FluentName: 6
+                MMSI: 1534
+                Argument: 10
+                Value: 234
+                T_start: 1000
+                T_end: 1000
+                Category: 4
+            output_path:
+              type: "string"
+              example: "processed_output/filtered_fluentname_data_v2.csv"
+
+  400:
+    description: "Bad request. Input parameters invalid (if any)."
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: "Invalid input"
+  500:
+    description: "Server error during Pitsikalis 2019 labels data processing."
+    content:
+      application/json:
+        schema:
+          type: "object"
+          properties:
+            message:
+              type: "string"
+              example: "An error occurred while processing the Pitsikalis 2019 labels data."
+            traceback:
+              type: "string"
+              example: "Detailed error stacktrace here"

@@ -1,0 +1,79 @@
+summary: "Endpoint for Random Forest Training (Loitering vs Transshipment vs Stopping vs Normal)"
+description: |
+  Trains a Random Forest classifier to distinguish between **"LOITERING"**, **"NORMAL"**, **"STOPPING"**, **"TRANSSHIPMENT"**
+  using pandas + sklearn. Features are read from `captaima.aggregated_ais_data`.
+  Metrics and artifacts are logged in MLflow.
+
+tags:
+  - "Train Machine Learning Models"
+produces:
+  - "application/json"
+
+parameters:
+  - in: body
+    name: body
+    required: true
+    schema:
+      type: object
+      properties:
+        per_label_n:
+          type: integer
+          example: 300
+        test_size:
+          type: number
+          format: float
+          example: 0.2
+        random_state:
+          type: integer
+          example: 42
+        n_estimators:
+          type: integer
+          example: 200
+        max_depth:
+          type: integer
+          nullable: true
+          example: null
+        number_of_folds:
+          type: integer
+          example: 5
+        impute_strategy:
+          type: string
+          example: "median"
+        histogram_bins:
+          type: integer
+          example: 30
+        histogram_sample_size:
+          type: integer
+          example: 20000
+        experiment_name:
+          type: string
+          example: "RF_Loitering_vs_Stopping_vs_Transshipment_vs_Normal"
+        register_model_name:
+          type: string
+          example: "rf_loitering_stopping_transshipment_normal"
+
+responses:
+  200:
+    description: Random Forest model trained successfully.
+    schema:
+      type: object
+      properties:
+        accuracy:
+          type: number
+        f1:
+          type: number
+        precision:
+          type: number
+        recall:
+          type: number
+        mlflow_run_id:
+          type: string
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+        trace:
+          type: string

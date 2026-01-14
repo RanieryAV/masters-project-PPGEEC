@@ -1,13 +1,14 @@
 import os
 import traceback
 import logging
+import math
 import subprocess
 import socket
 import csv
 import gzip
 from typing import Optional
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, make_response
 from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
@@ -19,6 +20,15 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.window import Window
 from typing import Any, Tuple, List, Dict
+
+# Image libs (Pillow). Shapely optional but recommended.
+try:
+    from shapely import wkt as shapely_wkt
+    SHAPELY_AVAILABLE = True
+except Exception:
+    SHAPELY_AVAILABLE = False
+
+from PIL import Image, ImageDraw
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
 
@@ -1685,6 +1695,341 @@ class ProcessDataService:
             result.append(entry)
         return result
 
+    def _parse_linestring_wkt_to_coords(wkt_str: str):
+        """
+        Retorna lista de (lon, lat) a partir de LINESTRING WKT.
+        Tenta usar shapely quando disponível, senão faz parsing simples.
+        """
+        if not wkt_str:
+            return []
+
+        try:
+            if SHAPELY_AVAILABLE:
+                geom = shapely_wkt.loads(wkt_str)
+                # shapely LineString.coords yields (x, y) -> (lon, lat)
+                return [(float(x), float(y)) for x, y in geom.coords]
+            else:
+                # Exemplo LINESTRING: "LINESTRING(-17.0056 178.6708, -5.6758 11.9243, ...)"
+                s = wkt_str.strip()
+                if s.upper().startswith("LINESTRING"):
+                    inner = s[s.find("(")+1 : s.rfind(")")]
+                    pts = []
+                    for part in inner.split(","):
+                        part = part.strip()
+                        if part == "":
+                            continue
+                        # split por whitespace (lon lat)
+                        pieces = part.split()
+                        if len(pieces) >= 2:
+                            lon = float(pieces[0])
+                            lat = float(pieces[1])
+                            pts.append((lon, lat))
+                    return pts
+                else:
+                    return []
+        except Exception:
+            logger.debug("WKT parse failed for: %s\n%s", wkt_str, traceback.format_exc())
+            return []
+
+    def _coords_to_image_pixels(coords, width, height, pad_frac=0.03, upscale=4):
+        """
+        Takes coords: list[(lon, lat)] and returns a list of integer (x_pixel, y_pixel) tuples,
+        projecting to occupy the maximum image area while maintaining aspect ratio.
+        - pad_frac: fraction of padding relative to the larger side (e.g., 0.03 = 3%)
+        - upscale: factor to draw at higher resolution and then downscale (antialias)
+        """
+        if not coords:
+            return []
+
+        lons = [p[0] for p in coords]
+        lats = [p[1] for p in coords]
+        minx, maxx = min(lons), max(lons)
+        miny, maxy = min(lats), max(lats)
+
+        # if all equal (degenerate trajectory), expand by a small epsilon
+        if math.isclose(minx, maxx):
+            minx -= 1e-6
+            maxx += 1e-6
+        if math.isclose(miny, maxy):
+            miny -= 1e-6
+            maxy += 1e-6
+
+        # size/range/span (lon span, lat span)
+        span_x = maxx - minx
+        span_y = maxy - miny
+
+        # use available dimension (after upscale)
+        W = width * upscale
+        H = height * upscale
+
+        # padding in pixels
+        pad = max(W, H) * pad_frac
+
+        # scale to fit while maintaining aspect ratio and maximizing area usage
+        scale_x = (W - 2 * pad) / span_x
+        scale_y = (H - 2 * pad) / span_y
+        scale = min(scale_x, scale_y)
+
+        # offset to center
+        # mapping: lon -> x increases to the right
+        # lat -> y decreases upwards (higher latitude -> top) -> invert y
+        used_width = span_x * scale
+        used_height = span_y * scale
+
+        offset_x = (W - used_width) / 2.0
+        offset_y = (H - used_height) / 2.0
+
+        pixels = []
+        for lon, lat in coords:
+            x = (lon - minx) * scale + offset_x
+            y = (maxy - lat) * scale + offset_y  # invert lat -> y
+            pixels.append((int(round(x)), int(round(y))))
+        return pixels, upscale
+
+    def generate_image_trajectory_dataset_for_all_behavior_types_with_spark(
+            spark,
+            output_dir: str,
+            behavior_types_to_generate_dataset: List[str] = None,
+            max_rows_per_behavior: int = None,  # NEW parameter: limit rows per behavior (None => no limit)
+        ):
+        """
+        Generate grayscale image datasets (.png) for all behavior types.
+        Folder path as specified in the request.
+
+        The resulting grayscale images are saved in this structure:
+        - output_directory/
+            - image_resolution_120x120/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                ...
+        Returns: Flask JSON response (200 success or 500 error with message).
+        """
+        logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: start")
+
+        # Force the list as specified (controller)
+        behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+
+        image_resolutions = [(120, 120), (128, 128), (224, 224), (256, 256),
+                            (299, 299), (384, 384), (512, 512), (640, 640)]
+
+        # JDBC / Postgres connection via env vars (same convention already used in the project)
+        try:
+            pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
+            pg_port = os.getenv("POSTGRES_PORT", "5432")
+            pg_db = os.getenv("POSTGRES_DB")
+            pg_user = os.getenv("POSTGRES_USER")
+            pg_pass = os.getenv("POSTGRES_PASSWORD")
+
+            if not (pg_db and pg_user and pg_pass):
+                msg = "Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD)."
+                logger.error(msg)
+                return make_response(jsonify({"status": "error", "message": msg}), 500)
+
+            jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+            schema = "captaima"
+            table = "aggregated_ais_data"
+
+            # create base directory and per-resolution/behavior folders
+            os.makedirs(output_dir, exist_ok=True)
+            for width, height in image_resolutions:
+                for behavior in behavior_types_to_generate_dataset:
+                    out_path = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior)
+                    os.makedirs(out_path, exist_ok=True)
+
+            total_processed = 0
+
+            # Process each behavior separately so we can LIMIT rows per behavior
+            for behavior in behavior_types_to_generate_dataset:
+                logger.info("Generating images for behavior type '%s' (max rows per behavior = %s)", behavior, max_rows_per_behavior)
+
+                # Escape single quotes in behavior for SQL
+                behavior_escaped = behavior.replace("'", "''")
+
+                # Optional LIMIT clause
+                limit_clause = f" LIMIT {int(max_rows_per_behavior)}" if (max_rows_per_behavior is not None and int(max_rows_per_behavior) > 0) else ""
+
+                # Subquery: read only necessary columns and convert trajectory to WKT (per behavior)
+                dbtable_subquery = (
+                    f"(select primary_key, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, behavior_type_label "
+                    f"from {schema}.{table} where behavior_type_label = '{behavior_escaped}' {limit_clause}) as subq"
+                )
+
+                # try to determine bounds for partitioned read by primary_key (performance hint)
+                bounds_tbl = f"(select min(primary_key) as min_pk, max(primary_key) as max_pk from {schema}.{table} where behavior_type_label = '{behavior_escaped}'){'' if limit_clause=='' else ''} as boundsq"
+                min_pk = max_pk = None
+                try:
+                    bounds_df = (
+                        spark.read
+                        .format("jdbc")
+                        .option("url", jdbc_url)
+                        .option("dbtable", bounds_tbl)
+                        .option("user", pg_user)
+                        .option("password", pg_pass)
+                        .option("driver", "org.postgresql.Driver")
+                        .option("fetchsize", "1000")
+                        .load()
+                    )
+                    row = bounds_df.limit(1).collect()
+                    if row:
+                        row0 = row[0].asDict()
+                        min_pk = row0.get("min_pk", None)
+                        max_pk = row0.get("max_pk", None)
+                except Exception as eb:
+                    logger.debug("Could not fetch bounds for partitioning for behavior %s (non-fatal): %s", behavior, eb)
+                    min_pk = max_pk = None
+
+                # decide whether to use partitioned read or single read for this behavior
+                num_partitions = None
+                try:
+                    min_int = int(min_pk) if min_pk is not None else None
+                    max_int = int(max_pk) if max_pk is not None else None
+                    if min_int is not None and max_int is not None and min_int < max_int:
+                        sc = spark.sparkContext
+                        default_parallel = getattr(sc, "defaultParallelism", None) or 8
+                        num_partitions = min(1000, max(8, int(default_parallel) * 2))
+                        logger.info("Using partitioned JDBC read on primary_key [%s..%s] with %d partitions for behavior %s", min_int, max_int, num_partitions, behavior)
+
+                        df = (
+                            spark.read
+                            .format("jdbc")
+                            .option("url", jdbc_url)
+                            .option("dbtable", dbtable_subquery)
+                            .option("user", pg_user)
+                            .option("password", pg_pass)
+                            .option("driver", "org.postgresql.Driver")
+                            .option("fetchsize", "1000")
+                            .option("partitionColumn", "primary_key")
+                            .option("lowerBound", str(min_int))
+                            .option("upperBound", str(max_int))
+                            .option("numPartitions", str(num_partitions))
+                            .load()
+                        )
+                    else:
+                        logger.info("Using single JDBC read with fetchsize (no partitioning) for behavior %s.", behavior)
+                        df = (
+                            spark.read
+                            .format("jdbc")
+                            .option("url", jdbc_url)
+                            .option("dbtable", dbtable_subquery)
+                            .option("user", pg_user)
+                            .option("password", pg_pass)
+                            .option("driver", "org.postgresql.Driver")
+                            .option("fetchsize", "1000")
+                            .load()
+                        )
+                except Exception as e:
+                    logger.exception("Failed to read aggregated_ais_data via JDBC for behavior %s: %s", behavior, e)
+                    return make_response(jsonify({"status": "error", "message": f"JDBC read failed for behavior {behavior}: {e}"}), 500)
+
+                # sanitize column names if needed (simple manner)
+                try:
+                    original_cols = list(df.columns)
+                    safe_names = []
+                    for i, cname in enumerate(original_cols):
+                        s = str(cname) if cname is not None else ""
+                        if s.strip() == "" or s.isdigit():
+                            s = f"col_{i}"
+                        if s in safe_names:
+                            s = f"{s}_{i}"
+                        safe_names.append(s)
+                    if safe_names != original_cols:
+                        df = df.toDF(*safe_names)
+                except Exception:
+                    logger.debug("Column sanitization failed for behavior %s (non-fatal).", behavior)
+
+                # iterate rows for this behavior; use toLocalIterator to avoid materializing everything
+                try:
+                    it = df.toLocalIterator()
+                except Exception:
+                    logger.warning("toLocalIterator() failed for behavior %s; falling back to collect(). Be careful of memory usage.", behavior)
+                    it = iter(df.collect())
+
+                processed_for_behavior = 0
+                for row in it:
+                    try:
+                        rowd = row.asDict() if hasattr(row, "asDict") else dict(row)
+                        pk = rowd.get("primary_key")
+                        mmsi = rowd.get("mmsi")
+                        event_index = rowd.get("event_index")
+                        traj_wkt = rowd.get("trajectory_wkt") or rowd.get("trajectory")
+                        behavior_label = rowd.get("behavior_type_label") or behavior  # fallback
+
+                        if pk is None or traj_wkt is None or behavior_label is None:
+                            logger.debug("Skipping row with missing pk/trajectory/behavior: %s", {k: rowd.get(k) for k in ("primary_key","mmsi","event_index","behavior_type_label")})
+                            continue
+
+                        coords = ProcessDataService._parse_linestring_wkt_to_coords(traj_wkt)
+                        if not coords or len(coords) == 0:
+                            logger.debug("No coordinates parsed for pk=%s; skipping.", pk)
+                            continue
+
+                        # for each resolution, generate and save image
+                        for (width, height) in image_resolutions:
+                            pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, width, height, pad_frac=0.03, upscale=4)
+                            W = width * upscale
+                            H = height * upscale
+
+                            img = Image.new("L", (W, H), 255)
+                            draw = ImageDraw.Draw(img)
+
+                            base_line_width = max(1, int(round(min(W, H) / 120.0)))
+                            if len(pixels) >= 2:
+                                draw.line(pixels, fill=0, width=base_line_width, joint="curve")
+                            else:
+                                x0, y0 = pixels[0]
+                                r = max(1, base_line_width * 2)
+                                draw.ellipse((x0-r, y0-r, x0+r, y0+r), fill=0)
+
+                            final_img = img.resize((width, height), resample=Image.LANCZOS)
+
+                            xx = str(int(pk)).zfill(6)
+                            yy = str(int(pk))
+                            zz = str(int(event_index)) if event_index is not None else "0"
+                            ww = str(mmsi)
+                            filename = f"im_{xx}_aggregated_ais_data_primary_key_{yy}_event_index_{zz}_mmsi_{ww}.png"
+
+                            out_dir = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior_label)
+                            os.makedirs(out_dir, exist_ok=True)
+                            save_path = os.path.join(out_dir, filename)
+
+                            final_img.save(save_path, format="PNG", optimize=True)
+
+                        processed_for_behavior += 1
+                        total_processed += 1
+                        if processed_for_behavior % 100 == 0:
+                            logger.info("Processed %d rows for behavior %s...", processed_for_behavior, behavior)
+                        # If max_rows_per_behavior is set, we can stop early (defensive check in case LIMIT didn't apply)
+                        if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                            logger.info("Reached max_rows_per_behavior=%s for behavior %s; stopping processing for this behavior.", max_rows_per_behavior, behavior)
+                            break
+                    except Exception as row_e:
+                        logger.exception("Failed processing row for behavior %s: %s", behavior, row_e)
+                        # continue with next row
+
+                logger.info("Finished behavior %s: processed %d rows", behavior, processed_for_behavior)
+
+            logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: finished; total_processed=%d", total_processed)
+
+            # delete auxiliary variables to free memory
+            del df
+            del final_img
+            del img
+            del draw
+            del pixels
+            del coords
+            del traj_wkt
+            del pk
+            del event_index
+            del behavior
+            del it
+
+            return make_response(jsonify({"status": "success", "message": f"Images generated under {output_dir}", "processed_rows": total_processed}), 200)
+
+        except Exception as e:
+            logger.exception("Error generating image trajectory datasets: %s", e)
+            return make_response(jsonify({"status": "error", "message": str(e)}), 500)
 
     # def process_ais_events_Pitsikalis_2019(
     #     spark: SparkSession,
@@ -3127,7 +3472,128 @@ class ProcessDataService:
 
         return result
 
-    
+    def generate_image_trajectory_dataset_for_all_behavior_types_with_spark_prototype(
+            spark,
+            output_dir: str,
+            behavior_types_to_generate_dataset: List[str],
+        ):
+        """
+        Generates grayscale image trajectory datasets (in .png format) for all behavior types using Spark.
+        The image resolutions used are 120x120, 128x128, 224x224, 256x256, 299x299, 384x384, 512x512, and 640x640 pixels.
+        The resulting grayscale images are saved in this structure:
+        - output_directory/
+            - image_resolution_120x120/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_128x128/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_224x224/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_256x256/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_299x299/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_384x384/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_512x512/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_640x640/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+        Returns:
+            Flask Response: JSON object with status and message indicating success or failure.
+        """
+        logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: start")
+        image_resolutions = [(120, 120), (128, 128), (224, 224), (256, 256),
+                             (299, 299), (384, 384), (512, 512), (640, 640)]
+        
+        try:
+            # Ensure base output directory exists
+            os.makedirs(output_dir, exist_ok=True)
+
+            for behavior_type in behavior_types_to_generate_dataset:
+                for width, height in image_resolutions:
+                    logger.info(f"Generating images for behavior type '{behavior_type}' at resolution {width}x{height}")
+                    output_path = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior_type)
+                    # Create the folder for the image resolution and behavior type if it doesn't exist
+                    os.makedirs(output_path, exist_ok=True)
+
+                    # fetch trajectory data for the behavior type using Spark from aggregated_ais_data
+                    # For demonstration, we'll just log the intended actions
+                    logger.info(f"Fetching trajectory data for behavior type '{behavior_type}' using Spark")
+
+                    logger.info(f"Generating grayscale images at {width}x{height} and saving to {output_path}")
+
+                    logger.info(f"Finished generating images for behavior type '{behavior_type}' at resolution {width}x{height}")
+                    
+                    # actual grayscale image generation logic would go here
+            logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: finished")
+        except Exception as e:
+            logger.error(f"Error generating image trajectory datasets: {e}")
+            raise
+
     # def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
     #     events_df: DataFrame,
     #     ais_path: str,

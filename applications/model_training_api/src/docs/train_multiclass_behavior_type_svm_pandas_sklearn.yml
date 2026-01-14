@@ -1,0 +1,81 @@
+summary: "Endpoint for SVM model training (Loitering vs Transshipment vs Stopping vs Normal)"
+description: |
+  Trains a One-vs-Rest Linear SVM model to classify ship trajectories as either
+  **"LOITERING"**, **"NORMAL"**, **"STOPPING"**, **"TRANSSHIPMENT"** using features from `captaima.aggregated_ais_data`.
+
+  All metrics, artifacts, and models are logged to MLflow.
+
+tags:
+  - "Train Machine Learning Models"
+produces:
+  - "application/json"
+
+parameters:
+  - in: body
+    name: body
+    required: true
+    schema:
+      type: object
+      properties:
+        per_label_n:
+          type: integer
+          example: 800
+          description: Number of samples per class (defaults to smallest class size if omitted).
+        test_size:
+          type: number
+          format: float
+          example: 0.2
+        random_state:
+          type: integer
+          example: 42
+        max_iteration_steps:
+          type: integer
+          example: 1000
+        C:
+          type: number
+          format: float
+          example: 1.0
+        number_of_folds:
+          type: integer
+          example: 5
+        impute_strategy:
+          type: string
+          example: "median"
+        histogram_bins:
+          type: integer
+          example: 30
+        histogram_sample_size:
+          type: integer
+          example: 20000
+        experiment_name:
+          type: string
+          example: "SVM_Loitering_vs_Transshipment_vs_Stopping_vs_Normal"
+        register_model_name:
+          type: string
+          example: "svm_loitering_transshipment_stopping_normal"
+
+responses:
+  200:
+    description: SVM model trained and logged to MLflow.
+    schema:
+      type: object
+      properties:
+        accuracy:
+          type: number
+        f1:
+          type: number
+        precision:
+          type: number
+        recall:
+          type: number
+        mlflow_run_id:
+          type: string
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+        trace:
+          type: string

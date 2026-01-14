@@ -1,3 +1,28 @@
+# ------------------------
+# Pandas and Sklearn Imports
+# ------------------------
+import pandas as pd
+import numpy as np
+import joblib
+import tempfile
+import pathlib
+import os
+import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
+from sklearn.svm import LinearSVC as SklearnLinearSVC
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.ensemble import RandomForestClassifier as SklearnRandomForestClassifier
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, accuracy_score
+from sklearn.preprocessing import StandardScaler as SklearnStandardScaler
+import mlflow
+import mlflow.sklearn
+from domain.config.database_config import db  # Flask-SQLAlchemy db
+
+# ------------------------
+# Spark Imports
+# ------------------------
 import os
 import json
 import math
@@ -7,6 +32,15 @@ from datetime import datetime
 from dotenv import load_dotenv
 from domain.config.data_processing.spark_session_initializer import SparkSessionInitializer
 from domain.services.mlflow_service import MLFlowService
+
+# ------------------------
+# Tensorflow Imports
+# ------------------------
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, CSVLogger
+from tensorflow.keras.losses import SparseCategoricalCrossentropy
+from tensorflow.keras.metrics import SparseCategoricalAccuracy
+import csv
 
 """
 Spark-based training services that read only from captaima.aggregated_ais_data,
@@ -30,6 +64,13 @@ import mlflow
 from mlflow import MlflowClient
 import mlflow.spark
 import matplotlib.pyplot as plt
+
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    _HAS_PLOTTING = True
+except Exception:
+    _HAS_PLOTTING = False
 
 # Load environment variables
 load_dotenv()
@@ -230,6 +271,7 @@ class TrainModelService:
     def log_metrics_from_report(report: dict, prefix: str, step: Optional[int]):
         """
         Log numeric metrics from report to MLflow. If step is provided, metrics appear as a line series.
+        Changed: use 'support_count' instead of 'support' in metric names.
         """
         labels = report["labels"]
         for lab in labels:
@@ -237,16 +279,17 @@ class TrainModelService:
             mlflow.log_metric(f"{prefix}_precision_{lab}", float(cls["precision"]), step=step if step is not None else None)
             mlflow.log_metric(f"{prefix}_recall_{lab}", float(cls["recall"]), step=step if step is not None else None)
             mlflow.log_metric(f"{prefix}_f1_{lab}", float(cls["f1-score"]), step=step if step is not None else None)
-            mlflow.log_metric(f"{prefix}_support_{lab}", float(cls["support"]), step=step if step is not None else None)
+            # clearer name: support_count (number of true samples for that label in this evaluated set)
+            mlflow.log_metric(f"{prefix}_support_count_{lab}", float(cls["support"]), step=step if step is not None else None)
 
         mlflow.log_metric(f"{prefix}_accuracy", float(report["accuracy"]), step=step if step is not None else None)
         mlflow.log_metric(f"{prefix}_precision_macro", float(report["macro_avg"]["precision"]), step=step if step is not None else None)
         mlflow.log_metric(f"{prefix}_recall_macro", float(report["macro_avg"]["recall"]), step=step if step is not None else None)
         mlflow.log_metric(f"{prefix}_f1_macro", float(report["macro_avg"]["f1-score"]), step=step if step is not None else None)
         logger.info("Logged MLflow metrics for %s (step=%s) : accuracy=%.4f", prefix, str(step), float(report["accuracy"]))
-
+        
     @staticmethod
-    def plot_confusion_matrix_and_log(report: dict, artifact_dir="artifacts/confusion_matrix"):
+    def plot_confusion_matrix_and_log_spark(report: dict, artifact_dir="artifacts/confusion_matrix"):
         os.makedirs(artifact_dir, exist_ok=True)
         cm = report["confusion_matrix"]
         labels = report["labels"]
@@ -780,10 +823,10 @@ Notes:
             logger.exception("Failed to register model to MLflow registry for %s", registered_model_name)
             return None
 
-        # ------------------------
-    # 1) LOITERING vs TRANSSHIPMENT SVM (renamed)
     # ------------------------
-    def train_loitering_transshipment_svm(per_label_n=None, test_size=0.20, random_state=42,
+    # 1) LOITERING vs TRANSSHIPMENT SVM (SPARK)
+    # ------------------------
+    def train_loitering_transshipment_svm_spark(per_label_n=None, test_size=0.20, random_state=42,
                                 max_iteration_steps=20, regParam=None,
                                 experiment_name=None, register_model_name=None,
                                 number_of_folds: int = 5,
@@ -793,7 +836,7 @@ Notes:
         """
         Train OneVsRest(LinearSVC) for LOITERING vs TRANSSHIPMENT.
         """
-        logger.info("=== START train_loitering_transshipment_svm ===")
+        logger.info("=== START train_loitering_transshipment_svm_spark ===")
         logger.info("Parameters: per_label_n=%s, test_size=%s, random_state=%s, max_iteration_steps=%s",
                     str(per_label_n), str(test_size), str(random_state), str(max_iteration_steps))
 
@@ -1089,7 +1132,7 @@ Notes:
                 TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
 
                 # confusion matrix artifact
-                TrainModelService.plot_confusion_matrix_and_log(report_test)
+                TrainModelService.plot_confusion_matrix_and_log_spark(report_test)
 
                 # log used_features again
                 mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
@@ -1116,11 +1159,11 @@ Notes:
             prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
             rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
 
-            logger.info("=== END train_loitering_transshipment_svm: accuracy=%.4f f1=%.4f ===", acc, f1)
+            logger.info("=== END train_loitering_transshipment_svm_spark: accuracy=%.4f f1=%.4f ===", acc, f1)
             return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id, "registered_model": registration_info}
 
         except Exception as e:
-            logger.exception("Error in train_loitering_transshipment_svm: %s", e)
+            logger.exception("Error in train_loitering_transshipment_svm_spark: %s", e)
             # Ensure MLflow run cleaned up
             TrainModelService._end_mlflow_if_active()
             try:
@@ -1141,9 +1184,9 @@ Notes:
 
 
     # ------------------------------------------------------------------
-    # 2) train_loitering_stopping_model (RandomForest)
+    # 2) train_loitering_stopping_model (RandomForest) (SPARK)
     # ------------------------------------------------------------------
-    def train_loitering_stopping_model(per_label_n=None, test_size=0.20, random_state=42,
+    def train_loitering_stopping_spark_model(per_label_n=None, test_size=0.20, random_state=42,
                                 n_estimators=100, max_depth=None,
                                 experiment_name=None, register_model_name=None,
                                 number_of_folds: int = 5,
@@ -1299,7 +1342,7 @@ Notes:
                 report_test = TrainModelService.compute_metrics_from_confusion_rows(rows_test, label_order)
                 TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
 
-                TrainModelService.plot_confusion_matrix_and_log(report_test)
+                TrainModelService.plot_confusion_matrix_and_log_spark(report_test)
 
                 mlflow.spark.log_model(spark_model=model, artifact_path="model")
                 mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
@@ -1343,16 +1386,16 @@ Notes:
 
 
     # ------------------------
-    # 3) train_transhipment_model: multiclass RandomForest
+    # 3) train_transshipment_spark_model: multiclass RandomForest (SPARK)
     # ------------------------
-    def train_transhipment_model(per_label_n=None, test_size=0.20, random_state=42,
+    def train_transshipment_spark_model(per_label_n=None, test_size=0.20, random_state=42,
                             n_estimators=100, max_depth=None,
                             experiment_name=None, register_model_name=None,
                             number_of_folds: int = 5,
                             impute_strategy: str = "median",
                             histogram_bins: int = 30,
                             histogram_sample_size: Optional[int] = 20000):
-        logger.info("=== START train_transhipment_model ===")
+        logger.info("=== START train_transshipment_spark_model ===")
         logger.info("Parameters: per_label_n=%s, test_size=%s, n_estimators=%s, max_depth=%s",
                     str(per_label_n), str(test_size), str(n_estimators), str(max_depth))
 
@@ -1500,7 +1543,7 @@ Notes:
                 report_test = TrainModelService.compute_metrics_from_confusion_rows(rows_test, label_order)
                 TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
 
-                TrainModelService.plot_confusion_matrix_and_log(report_test)
+                TrainModelService.plot_confusion_matrix_and_log_spark(report_test)
 
                 mlflow.spark.log_model(spark_model=model, artifact_path="model")
                 mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
@@ -1520,11 +1563,11 @@ Notes:
             rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
             f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
 
-            logger.info("=== END train_transhipment_model: accuracy=%.4f f1=%.4f ===", acc, f1)
+            logger.info("=== END train_transshipment_spark_model: accuracy=%.4f f1=%.4f ===", acc, f1)
             return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id, "registered_model": registration_info}
 
         except Exception as e:
-            logger.exception("Error in train_transhipment_model: %s", e)
+            logger.exception("Error in train_transshipment_spark_model: %s", e)
             TrainModelService._end_mlflow_if_active()
             try:
                 del df
@@ -1541,3 +1584,2295 @@ Notes:
             except Exception:
                 pass
             return {"error": str(e), "trace": traceback.format_exc()}
+
+    # ------------------------
+    # Pandas specific code
+    # ------------------------        
+
+    # ---------- Utility: read aggregated table into pandas ----------
+    @staticmethod
+    def read_aggregated_table_pandas(
+        selected_cols: Optional[List[str]] = None,
+        schema: str = "captaima",
+        table: str = "aggregated_ais_data",
+        where_clause: Optional[str] = None,
+        chunksize: Optional[int] = None
+    ) -> pd.DataFrame:
+        """
+        Read from captaima.aggregated_ais_data into a pandas DataFrame using a raw DB-API connection
+        (engine.raw_connection()). This avoids pandas->SQLAlchemy MetaData signature incompatibility.
+        """
+        logger.info("Starting pandas JDBC read (raw_connection) for %s.%s (selected_cols=%s)", schema, table, selected_cols)
+        if selected_cols:
+            select_sql = ", ".join(selected_cols)
+        else:
+            select_sql = "*"
+        where_sql = f" WHERE {where_clause}" if where_clause else ""
+        sql = f"SELECT {select_sql} FROM {schema}.{table}{where_sql}"
+
+        raw_conn = None
+        try:
+            raw_conn = db.engine.raw_connection()  # DB-API connection (psycopg, etc.)
+            if chunksize:
+                parts = []
+                # pd.read_sql with a raw DB-API connection and chunksize returns an iterator of DataFrames
+                iterator = pd.read_sql(sql, con=raw_conn, chunksize=chunksize)
+                for chunk in iterator:
+                    parts.append(chunk)
+                df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=selected_cols or [])
+            else:
+                df = pd.read_sql(sql, con=raw_conn)
+
+            # sanitize column names if needed
+            df.columns = [str(c) if (c is not None and str(c).strip() != "") else f"col_{i}" for i, c in enumerate(df.columns)]
+            logger.info("Completed pandas read: rows=%d cols=%s", len(df), list(df.columns))
+            return df
+        except Exception as e:
+            logger.exception("Failed to read aggregated table via pandas (raw_connection path): %s", e)
+            raise
+        finally:
+            # ensure raw DB-API connection closed
+            try:
+                if raw_conn is not None:
+                    raw_conn.close()
+            except Exception:
+                pass
+
+
+    # ---------- Sampling / splitting helpers ----------
+    @staticmethod
+    def sample_random_balanced_pandas(df: pd.DataFrame, labels: List[str], per_label_n: int, label_col: str = "behavior_type_label", random_state: int = 42) -> pd.DataFrame:
+        """Return balanced sample with per_label_n rows for each label (concatenated)."""
+        logger.info("Sampling %d rows per label (pandas) for labels=%s", per_label_n, labels)
+        parts = []
+        for lbl in labels:
+            sub = df[df[label_col] == lbl]
+            if sub.shape[0] == 0:
+                logger.warning("Label %s has 0 rows", lbl)
+                continue
+            if per_label_n <= 0:
+                continue
+            # if per_label_n > available, sample without replacement up to available (keep deterministic)
+            n = min(per_label_n, sub.shape[0])
+            parts.append(sub.sample(n=n, random_state=int(random_state)))
+        if not parts:
+            return df.iloc[0:0].copy()
+        res = pd.concat(parts, ignore_index=True)
+        return res.sample(frac=1.0, random_state=int(random_state)).reset_index(drop=True)
+
+    @staticmethod
+    def stratified_train_test_split_pandas(df: pd.DataFrame, label_col: str = "behavior_type_label", test_size: float = 0.28, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Deterministic stratified split using sklearn StratifiedShuffleSplit.
+        Returns (train_df, test_df).
+        """
+        logger.info("Performing stratified train/test split (pandas): test_size=%.3f, seed=%d", test_size, random_state)
+        if df.empty:
+            return df.copy(), df.copy()
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        y = df[label_col].values
+        for train_idx, test_idx in sss.split(np.zeros(len(y)), y):
+            train_df = df.iloc[train_idx].reset_index(drop=True)
+            test_df = df.iloc[test_idx].reset_index(drop=True)
+            logger.info("Stratified split done: train=%d test=%d", len(train_df), len(test_df))
+            return train_df, test_df
+        # fallback
+        return df.copy(), df.iloc[0:0].copy()
+
+    # ---------- Clean + impute (pandas + sklearn) ----------
+    @staticmethod
+    def clean_and_impute_pandas(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: List[str], impute_strategy: str = "median"):
+        """
+        - Convert features to numeric, coerce inf/nan to np.nan
+        - Drop zero-variance features (based on train)
+        - Fit SimpleImputer on train and transform both train & test
+        Returns: train_imputed_df, test_imputed_df, used_features, imputer
+        """
+        logger.info("Starting clean_and_impute_pandas: strategy=%s, num_features=%d", impute_strategy, len(feature_cols))
+        train = train_df.copy()
+        test = test_df.copy()
+        # ensure features exist
+        available = [c for c in feature_cols if c in train.columns or c in test.columns]
+        # coerce to numeric and handle inf
+        for c in available:
+            train[c] = pd.to_numeric(train.get(c), errors="coerce")
+            test[c] = pd.to_numeric(test.get(c), errors="coerce")
+            train.loc[~np.isfinite(train[c]), c] = np.nan
+            test.loc[~np.isfinite(test[c]), c] = np.nan
+
+        # zero-variance detection on train
+        zero_var = []
+        used_features = []
+        for c in available:
+            std = float(train[c].std(skipna=True)) if not train[c].isnull().all() else 0.0
+            if std == 0.0 or np.isnan(std):
+                zero_var.append(c)
+            else:
+                used_features.append(c)
+        logger.info("Zero-variance features (dropped): %s", zero_var)
+        if not used_features:
+            logger.warning("No usable features after dropping zero-variance.")
+            return None, None, [], None
+
+        # Fit imputer on train[used_features]
+        imputer = SimpleImputer(strategy=impute_strategy)
+        imputer.fit(train[used_features])
+        train_imp_vals = imputer.transform(train[used_features])
+        test_imp_vals = imputer.transform(test[used_features])
+        # put back into frames
+        train_imp = train.copy()
+        test_imp = test.copy()
+        train_imp.loc[:, used_features] = train_imp_vals
+        test_imp.loc[:, used_features] = test_imp_vals
+        logger.info("Imputation completed (pandas). Used features: %s", used_features)
+        return train_imp, test_imp, used_features, imputer
+
+    # ---------- Feature histograms / stats (pandas) ----------
+    @staticmethod
+    def log_feature_stats_histograms_pandas(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str], bins: int, histogram_sample_size: Optional[int] = None, artifact_dir="artifacts/feature_distributions"):
+        os.makedirs(artifact_dir, exist_ok=True)
+        feature_stats = []
+        logger.info("Starting feature histograms (pandas): bins=%d, sample_size=%s", bins, str(histogram_sample_size))
+
+        # optional sampling to limit memory/plot time
+        if histogram_sample_size:
+            train_for_hist = train_df.sample(n=min(histogram_sample_size, len(train_df)), random_state=42) if len(train_df) > 0 else train_df
+            test_for_hist = test_df.sample(n=min(histogram_sample_size, len(test_df)), random_state=42) if len(test_df) > 0 else test_df
+        else:
+            train_for_hist = train_df
+            test_for_hist = test_df
+
+        for feat in features:
+            if feat not in train_df.columns:
+                logger.debug("Skipping histogram for missing feature: %s", feat)
+                continue
+            tr_ser = pd.to_numeric(train_df[feat], errors="coerce")
+            te_ser = pd.to_numeric(test_df[feat], errors="coerce")
+            agg_train = {"count": int(tr_ser.count()), "mean": float(tr_ser.mean()) if tr_ser.count() else None, "std": float(tr_ser.std()) if tr_ser.count() else None, "min": float(tr_ser.min()) if tr_ser.count() else None, "max": float(tr_ser.max()) if tr_ser.count() else None}
+            agg_test = {"count": int(te_ser.count()), "mean": float(te_ser.mean()) if te_ser.count() else None, "std": float(te_ser.std()) if te_ser.count() else None, "min": float(te_ser.min()) if te_ser.count() else None, "max": float(te_ser.max()) if te_ser.count() else None}
+            feature_stats.append({
+                "feature": feat,
+                "train_count": agg_train["count"],
+                "train_mean": agg_train["mean"],
+                "train_std": agg_train["std"],
+                "train_min": agg_train["min"],
+                "train_max": agg_train["max"],
+                "test_count": agg_test["count"],
+                "test_mean": agg_test["mean"],
+                "test_std": agg_test["std"],
+                "test_min": agg_test["min"],
+                "test_max": agg_test["max"],
+            })
+
+            # compute quantile edges robustly
+            try:
+                quantiles = np.nanquantile(train_for_hist[feat].dropna().astype(float), np.linspace(0, 1, bins + 1))
+                # deduplicate edges
+                edges = [float(quantiles[0])]
+                for v in quantiles[1:]:
+                    if not np.isclose(v, edges[-1], atol=1e-12):
+                        edges.append(float(v))
+                if len(edges) < 2:
+                    logger.debug("Skipping histogram (edges < 2) for: %s", feat)
+                    continue
+                # counts by bin
+                train_counts, _ = np.histogram(train_for_hist[feat].dropna().astype(float), bins=edges)
+                test_counts, _ = np.histogram(test_for_hist[feat].dropna().astype(float), bins=edges)
+            except Exception:
+                # fallback simple bins
+                try:
+                    train_counts, edges = np.histogram(train_for_hist[feat].dropna().astype(float), bins=bins)
+                    test_counts, _ = np.histogram(test_for_hist[feat].dropna().astype(float), bins=edges)
+                except Exception:
+                    continue
+
+            # plot
+            fig, ax = plt.subplots(figsize=(6, 4))
+            centers = [(edges[i] + edges[i+1]) / 2.0 for i in range(len(edges)-1)]
+            ax.bar([c - 0.15 for c in centers], train_counts, width=0.3, alpha=0.6, label="train")
+            ax.bar([c + 0.15 for c in centers], test_counts, width=0.3, alpha=0.6, label="test")
+            ax.set_title(f"Hist: {feat}")
+            ax.set_xlabel(feat)
+            ax.legend()
+            plt.tight_layout()
+            fname = os.path.join(artifact_dir, f"{feat}_hist.png")
+            fig.savefig(fname)
+            plt.close(fig)
+
+        stats_path = os.path.join(artifact_dir, "feature_stats.json")
+        with open(stats_path, "w") as fh:
+            json.dump(feature_stats, fh, default=lambda x: None)
+        mlflow.log_artifacts(artifact_dir, artifact_path="feature_distributions")
+        logger.info("Logged feature distribution artifacts to MLflow for %d features", len(feature_stats))
+
+    # ---------- Metrics conversion (pandas/sklearn) ----------
+    @staticmethod
+    def compute_metrics_from_predictions(y_true, y_pred, label_order: List[str]) -> dict:
+        """
+        Build report dict similar to compute_metrics_from_confusion_rows but from arrays.
+        """
+        labels_idx = list(range(len(label_order)))
+        cm = confusion_matrix(y_true, y_pred, labels=label_order).tolist()
+        prec, rec, f1, sup = precision_recall_fscore_support(y_true, y_pred, labels=label_order, zero_division=0)
+        per_class = {}
+        sum_precision = sum_recall = sum_f1 = 0.0
+        for i, lab in enumerate(label_order):
+            per_class[lab] = {"precision": float(prec[i]), "recall": float(rec[i]), "f1-score": float(f1[i]), "support": int(sup[i])}
+            sum_precision += float(prec[i])
+            sum_recall += float(rec[i])
+            sum_f1 += float(f1[i])
+        n = len(label_order)
+        macro_precision = sum_precision / n if n > 0 else 0.0
+        macro_recall = sum_recall / n if n > 0 else 0.0
+        macro_f1 = sum_f1 / n if n > 0 else 0.0
+        accuracy = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
+        report = {
+            "per_class": per_class,
+            "macro_avg": {"precision": macro_precision, "recall": macro_recall, "f1-score": macro_f1},
+            "accuracy": accuracy,
+            "confusion_matrix": cm,
+            "total_samples": int(len(y_true)),
+            "labels": label_order
+        }
+        return report
+
+    # ---------- Helper to persist transformer/model artifacts to MLflow ----------
+    def _save_and_log_artifact(obj, artifact_subpath, name):
+        """
+        Save object using joblib into a temporary dir and log as MLflow artifact.
+        Returns the path saved.
+        """
+        tmpd = tempfile.mkdtemp()
+        fname = os.path.join(tmpd, f"{name}.joblib")
+        joblib.dump(obj, fname)
+        mlflow.log_artifact(fname, artifact_path=artifact_subpath)
+        return fname
+
+    # ---------------------------
+    # pandas-friendly class distribution plot (replacement for spark version)
+    # ---------------------------
+    @staticmethod
+    def log_class_distribution_pandas(train_df, test_df, label_col: str = "behavior_type_label", artifact_dir: str = "artifacts/class_distribution"):
+        """
+        Creates and logs class-distribution bar charts for train & test pandas DataFrames.
+        Logs the images and a JSON with counts to MLflow under artifact_path "class_distribution".
+        Returns a dict with counts.
+        """
+        os.makedirs(artifact_dir, exist_ok=True)
+        try:
+            train_counts = train_df[label_col].value_counts(dropna=False).to_dict() if train_df is not None and label_col in train_df.columns else {}
+            test_counts = test_df[label_col].value_counts(dropna=False).to_dict() if test_df is not None and label_col in test_df.columns else {}
+
+            # ensure union of labels
+            labels = sorted(set(list(train_counts.keys()) + list(test_counts.keys())), key=lambda x: str(x))
+            train_vals = [int(train_counts.get(l, 0)) for l in labels]
+            test_vals = [int(test_counts.get(l, 0)) for l in labels]
+
+            # plot side-by-side bars
+            fig, ax = plt.subplots(figsize=(8, 4))
+            x = range(len(labels))
+            width = 0.35
+            ax.bar([i - width/2 for i in x], train_vals, width=width, label="train")
+            ax.bar([i + width/2 for i in x], test_vals, width=width, label="test")
+            ax.set_xticks(list(x))
+            ax.set_xticklabels([str(l) for l in labels], rotation=45, ha="right")
+            ax.set_ylabel("Count")
+            ax.set_title("Class distribution (train vs test)")
+            ax.legend()
+            plt.tight_layout()
+            img_path = os.path.join(artifact_dir, "class_distribution_train_test.png")
+            fig.savefig(img_path)
+            plt.close(fig)
+
+            # log JSON counts
+            counts_path = os.path.join(artifact_dir, "class_counts.json")
+            payload = {"labels": [str(l) for l in labels], "train_counts": train_counts, "test_counts": test_counts}
+            with open(counts_path, "w") as fh:
+                json.dump(payload, fh)
+
+            # MLflow log
+            mlflow.log_artifact(img_path, artifact_path="class_distribution")
+            mlflow.log_artifact(counts_path, artifact_path="class_distribution")
+
+            return {"labels": labels, "train_counts": train_counts, "test_counts": test_counts}
+        except Exception as e:
+            logger.exception("Error in log_class_distribution_pandas: %s", e)
+            return {"error": str(e)}
+    
+    
+    @staticmethod
+    def _make_iteration_points_int(max_value: int, max_points: int = 10) -> list:
+        """
+        Helper: create a small set of increasing integer checkpoints from 1..max_value.
+        Returns sorted unique ints (at most max_points long).
+        """
+        if max_value <= 0:
+            return [1]
+        n_points = min(max_points, max_value)
+        pts = np.unique(np.round(np.linspace(1, max_value, num=n_points)).astype(int)).tolist()
+        if pts[0] < 1:
+            pts[0] = 1
+        return pts
+
+
+    @staticmethod
+    def _plot_metrics_over_iterations(iter_x, metrics_by_name: dict, title: str, outpath: str):
+        """
+        Plot multiple metric curves (metrics_by_name: {name: list(values)}) vs iter_x and save to outpath.
+        """
+        plt.figure(figsize=(8, 5))
+        for name, vals in metrics_by_name.items():
+            plt.plot(iter_x, vals, marker='o', label=name)
+        plt.xlabel("Iteration / Trees")
+        plt.ylabel("Score")
+        plt.title(title)
+        plt.grid(True, linestyle=':', linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outpath)
+        plt.close()
+
+    @staticmethod
+    def plot_confusion_matrix_and_log_pandas_sklearn(report: dict, artifact_dir="artifacts/confusion_matrix"):
+        """
+        Confusion matrix plot (pandas/sklearn friendly).
+        - counts + row-% shown in every matrix cell,
+        - per-class Precision & Recall shown OUTSIDE the matrix in a left column with class names,
+        with P and R positioned *below* the class name to avoid overlap.
+        - saves PNG + JSON and logs artifacts to MLflow (best-effort).
+        Returns {"png": png_path, "json": json_path}
+        """
+        import numpy as _np
+        import json as _json
+        import matplotlib.pyplot as _plt
+        import os as _os
+        import mlflow as _mlflow
+
+        _os.makedirs(artifact_dir, exist_ok=True)
+
+        cm = report.get("confusion_matrix", [])
+        labels = report.get("labels", [])
+        per_class = report.get("per_class", {}) or {}
+
+        # safe conversion to numpy array
+        try:
+            cm_arr = _np.array(cm, dtype=float)
+        except Exception:
+            cm_arr = _np.zeros((0, 0), dtype=float)
+
+        # infer labels if missing
+        if not labels:
+            if cm_arr.size:
+                n = cm_arr.shape[0]
+                labels = [str(i) for i in range(n)]
+            else:
+                labels = []
+
+        # ensure square matrix if labels present
+        if cm_arr.size == 0 and labels:
+            n = len(labels)
+            cm_arr = _np.zeros((n, n), dtype=float)
+
+        n_rows = cm_arr.shape[0] if cm_arr.size else len(labels)
+        n_cols = cm_arr.shape[1] if cm_arr.size else len(labels)
+        if n_rows == 0 and n_cols == 0:
+            png_path = _os.path.join(artifact_dir, "confusion_matrix.png")
+            json_path = _os.path.join(artifact_dir, "confusion_matrix.json")
+            with open(json_path, "w") as fh:
+                _json.dump({"labels": [], "matrix": [], "per_class": {}}, fh)
+            return {"png": png_path, "json": json_path}
+
+        # sums for percentages and fallback safe denominators
+        row_sums = _np.sum(cm_arr, axis=1) if cm_arr.size else _np.zeros((n_rows,))
+        col_sums = _np.sum(cm_arr, axis=0) if cm_arr.size else _np.zeros((n_cols,))
+        diag = _np.diag(cm_arr) if cm_arr.size else _np.zeros((min(n_rows, n_cols),))
+
+        # compute precision / recall per class (fallback to report['per_class'] if present)
+        precision_arr = _np.zeros_like(diag, dtype=float)
+        recall_arr = _np.zeros_like(diag, dtype=float)
+        for idx in range(len(diag)):
+            if col_sums.size > idx and col_sums[idx] > 0:
+                precision_arr[idx] = float(diag[idx]) / float(col_sums[idx])
+            else:
+                metrics = per_class.get(labels[idx]) or per_class.get(str(labels[idx])) or {}
+                precision_arr[idx] = float(metrics.get("precision") or 0.0)
+
+            if row_sums.size > idx and row_sums[idx] > 0:
+                recall_arr[idx] = float(diag[idx]) / float(row_sums[idx])
+            else:
+                metrics = per_class.get(labels[idx]) or per_class.get(str(labels[idx])) or {}
+                recall_arr[idx] = float(metrics.get("recall") or 0.0)
+
+        # prepare labels for display (we will show them in left column, so hide matrix yticklabels)
+        display_labels = [str(l) for l in labels]
+        display_labels = display_labels[:max(n_rows, n_cols)]
+        if len(display_labels) < max(n_rows, n_cols):
+            display_labels += [f"lbl_{i}" for i in range(len(display_labels), max(n_rows, n_cols))]
+
+        # Layout params: make wide + tall enough to avoid cropping and overlaps
+        left_width = max(2.4, 1.0 + 0.12 * max(0, n_rows))   # PR column width (inches approx.)
+        right_width = max(6.0, 0.6 * n_cols)                # matrix width
+        total_width = left_width + right_width
+        height = max(7.0, 0.9 * n_rows + 1.5)               # taller so x labels not cut
+
+        fig = _plt.figure(figsize=(total_width, height), constrained_layout=False)
+        gs = fig.add_gridspec(1, 2, width_ratios=[left_width, right_width], wspace=0.05)
+
+        ax_pr = fig.add_subplot(gs[0, 0])   # left column for class names and precision/recall
+        ax = fig.add_subplot(gs[0, 1])      # main confusion matrix
+
+        # Plot confusion matrix on ax
+        im = ax.imshow(cm_arr, interpolation="nearest", cmap=_plt.cm.Blues)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.set_ylabel("Count", rotation=-90, va="bottom")
+
+        # hide matrix yticklabels (we'll show class names in the left column)
+        ax.set(xticks=list(range(n_cols)), yticks=list(range(n_rows)),
+            xticklabels=display_labels[:n_cols], yticklabels=[''] * n_rows,
+            ylabel="True label", xlabel="Predicted label",
+            title="Confusion matrix (test set)")
+        _plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+        # place ylabel slightly inside the matrix so it doesn't collide with left column
+        ax.yaxis.set_label_coords(-0.06, 0.5)
+
+        # threshold for text color
+        try:
+            vmax = float(cm_arr.max()) if cm_arr.size else 1.0
+        except Exception:
+            vmax = 1.0
+        thresh = vmax / 2.0 if vmax else 0.0
+
+        # annotate counts + percentages inside cells
+        for i in range(n_rows):
+            for j in range(n_cols):
+                try:
+                    val = float(cm_arr[i, j])
+                    cnt_text = f"{int(val)}"
+                except Exception:
+                    val = cm_arr[i, j]
+                    cnt_text = str(val)
+
+                pct = (val / row_sums[i]) if (row_sums.size and row_sums[i] > 0) else 0.0
+                pct_text = f"{pct:.1%}"
+
+                text_color = "white" if (isinstance(val, (int, float)) and val > thresh) else "black"
+
+                ax.text(j, i - 0.18, cnt_text, ha="center", va="center", color=text_color, fontsize=11, fontweight="bold")
+                ax.text(j, i + 0.02, pct_text, ha="center", va="center", color=text_color, fontsize=9)
+
+        # Prepare left PR column: clean layout and alignment
+        ax_pr.axis("off")
+        ax_pr.set_xlim(0, 1)
+
+        # Align ax_pr y-range with ax so labels align with rows
+        ax_pr.set_ylim(ax.get_ylim())
+
+        # compute y positions from ax (these correspond to row centers)
+        y_positions = ax.get_yticks().tolist()
+        # fallback if not present
+        if len(y_positions) < n_rows:
+            y_positions = list(range(n_rows))
+
+        # Place class name and P/R (P and R positioned below the class name)
+        # We'll render class name slightly above center, P below center, R further below.
+        class_x = 0.02
+        pr_x = 0.62
+        for idx, y in enumerate(y_positions[:n_rows]):
+            class_name = display_labels[idx] if idx < len(display_labels) else f"lbl_{idx}"
+            prec = precision_arr[idx] if idx < len(precision_arr) else 0.0
+            rec = recall_arr[idx] if idx < len(recall_arr) else 0.0
+
+            # vertical offsets in data coordinates (row units)
+            class_y = y - 0.20   # slightly above center
+            p_y = y + 0.03       # slightly below center
+            r_y = y + 0.28       # further below
+
+            # class name (left)
+            ax_pr.text(class_x, class_y, class_name, ha="left", va="center", fontsize=10, fontweight="normal")
+
+            # Precision and Recall lines shown as percentages, below the class name
+            ax_pr.text(pr_x, p_y, f"P: {prec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
+            ax_pr.text(pr_x, r_y, f"R: {rec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
+
+        # Final layout tweaks: ensure enough bottom margin so x ticklabels show fully
+        fig.tight_layout()
+        fig.subplots_adjust(bottom=0.20, left=0.09)
+
+        png_path = _os.path.join(artifact_dir, "confusion_matrix.png")
+        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        _plt.close(fig)
+
+        # Save JSON with matrix + per-class metrics (precision/recall as decimals)
+        json_path = _os.path.join(artifact_dir, "confusion_matrix.json")
+        try:
+            export_payload = {
+                "labels": display_labels[:max(n_rows, n_cols)],
+                "matrix": cm_arr.astype(int).tolist() if cm_arr.size else [],
+                "per_class": per_class,
+                "precision_by_class": precision_arr.tolist(),
+                "recall_by_class": recall_arr.tolist()
+            }
+            with open(json_path, "w") as fh:
+                _json.dump(export_payload, fh)
+        except Exception:
+            logger.exception("Failed writing confusion matrix JSON.")
+
+        # Log artifacts to MLflow (best-effort)
+        try:
+            _mlflow.log_artifacts(artifact_dir, artifact_path="confusion_matrix")
+            logger.info("Saved and logged confusion matrix artifact to MLflow.")
+        except Exception:
+            logger.debug("Could not log confusion matrix artifacts to MLflow (no active run or other error).")
+
+        return {"png": png_path, "json": json_path}
+
+
+    # ---------- Main training functions (pandas/sklearn). Each coexists with Spark ones ----------
+    @staticmethod
+    def train_loitering_transshipment_svm_pandas_sklearn_model(per_label_n=None, test_size=0.20, random_state=42,
+                                                    max_iteration_steps=1000, C=1.0,
+                                                    experiment_name=None, register_model_name=None,
+                                                    number_of_folds: int = 5,
+                                                    impute_strategy: str = "median",
+                                                    histogram_bins: int = 30,
+                                                    histogram_sample_size: Optional[int] = 20000):
+        """
+        Train OneVsRest LinearSVC using pandas/sklearn with step-by-step metric charts based on max_iteration_steps.
+        """
+        logger.info("=== START train_loitering_transshipment_svm_pandas_sklearn_model ===")
+        try:
+            cols = ["behavior_type_label"] + FEATURE_COLUMNS
+            df = TrainModelService.read_aggregated_table_pandas(selected_cols=cols)
+            original_labels = ["LOITERING", "TRANSSHIPMENT"]
+            df_filtered = df[df["behavior_type_label"].isin(original_labels)].copy()
+            counts = {lbl: int(df_filtered[df_filtered["behavior_type_label"]==lbl].shape[0]) for lbl in original_labels}
+            min_count = min(counts.values()) if counts else 0
+            if min_count == 0:
+                logger.warning("One or more classes have zero rows: %s", counts)
+                return {"error": "One of the classes has zero rows", "counts": counts}
+            if per_label_n is None:
+                per_label_n = int(min_count)
+            else:
+                per_label_n = int(per_label_n)
+                if per_label_n > min_count:
+                    logger.warning("Requested per_label_n=%d greater than smallest class count=%d", per_label_n, min_count)
+                    return {"error": "per_label_n greater than smallest class count", "smallest_label_count": min_count}
+
+            sampled = TrainModelService.sample_random_balanced_pandas(df_filtered, original_labels, per_label_n, label_col="behavior_type_label", random_state=int(random_state))
+            if sampled.shape[0] == 0:
+                logger.warning("No rows sampled")
+                return {"error": "No rows sampled", "counts": counts}
+
+            train_df, test_df = TrainModelService.stratified_train_test_split_pandas(sampled, label_col="behavior_type_label", test_size=float(test_size), random_state=int(random_state))
+            TrainModelService.log_class_distribution_pandas(train_df, test_df, label_col="behavior_type_label")
+
+            # label encoding
+            le = LabelEncoder()
+            y_train = le.fit_transform(train_df["behavior_type_label"].astype(str))
+            y_test = le.transform(test_df["behavior_type_label"].astype(str))
+            label_order = list(le.classes_)
+
+            # clean + impute
+            train_imp, test_imp, used_features, imputer = TrainModelService.clean_and_impute_pandas(train_df, test_df, FEATURE_COLUMNS, impute_strategy=impute_strategy)
+            if not used_features:
+                return {"error": "No usable features after cleaning (all dropped or empty)."}
+
+            mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+            TrainModelService.log_feature_stats_histograms_pandas(train_imp, test_imp, used_features, bins=histogram_bins, histogram_sample_size=histogram_sample_size)
+
+            # scale
+            scaler = SklearnStandardScaler()
+            X_train = scaler.fit_transform(train_imp[used_features].values)
+            X_test = scaler.transform(test_imp[used_features].values)
+
+            # prepare iteration checkpoints (up to 10 points)
+            iter_points = TrainModelService._make_iteration_points_int(int(max_iteration_steps), max_points=20)
+
+            # cross-validation folds (StratifiedKFold)
+            skf = StratifiedKFold(n_splits=number_of_folds, shuffle=True, random_state=int(random_state))
+
+            # Container to accumulate CV metrics per iteration
+            iter_metrics = {"accuracy": [], "precision": [], "recall": [], "f1": []}
+
+            mlflow.set_experiment(experiment_name or f"SVM_Loitering_vs_Transshipment_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}")
+            ok_to_start_non_nested = TrainModelService._ensure_no_active_mlflow_run()
+            nested_flag = not ok_to_start_non_nested
+
+            with mlflow.start_run(run_name=f"SVM_Loitering_vs_Transshipment_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}", nested=nested_flag):
+                mlflow.log_param("model_type", "SVM_OneVsRest_LinearSVC_sklearn")
+                mlflow.log_param("labels_original", ",".join(original_labels))
+                mlflow.log_param("label_index_order", ",".join(label_order))
+                mlflow.log_param("per_label_n", per_label_n)
+                mlflow.log_param("test_size", test_size)
+                mlflow.log_param("random_state", random_state)
+                mlflow.log_param("max_iteration_steps", max_iteration_steps)
+                mlflow.log_param("impute_strategy", impute_strategy)
+                mlflow.log_param("used_features_count", len(used_features))
+
+                # For each iteration checkpoint, run CV and record average metrics across folds
+                for it in iter_points:
+                    fold_acc = []
+                    fold_prec = []
+                    fold_rec = []
+                    fold_f1 = []
+                    fold_idx = 0
+                    for train_idx, val_idx in skf.split(X_train, y_train):
+                        fold_idx += 1
+                        X_tr_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+                        y_tr_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+                        # instantiate classifier with current max_iter
+                        clf = OneVsRestClassifier(SklearnLinearSVC(max_iter=int(it), C=float(C), dual=False))
+                        clf.fit(X_tr_fold, y_tr_fold)
+                        y_val_pred = clf.predict(X_val_fold)
+
+                        # decode numeric indices back to original string labels before computing metrics
+                        y_val_fold_names = le.inverse_transform(y_val_fold)
+                        y_val_pred_names = le.inverse_transform(y_val_pred)
+
+                        report_cv = TrainModelService.compute_metrics_from_predictions(y_val_fold_names, y_val_pred_names, label_order)
+                        # record macro metrics (use macro avg)
+                        fold_acc.append(report_cv.get("accuracy", 0.0))
+                        fold_prec.append(report_cv.get("macro_avg", {}).get("precision", 0.0))
+                        fold_rec.append(report_cv.get("macro_avg", {}).get("recall", 0.0))
+                        fold_f1.append(report_cv.get("macro_avg", {}).get("f1-score", 0.0))
+
+                        # also log per-fold CV metrics as steps (optional)
+                        TrainModelService.log_metrics_from_report(report_cv, prefix=f"cv_iter_{it}_fold", step=fold_idx)
+
+                    # average across folds for this iteration
+                    iter_metrics["accuracy"].append(float(np.mean(fold_acc)) if fold_acc else 0.0)
+                    iter_metrics["precision"].append(float(np.mean(fold_prec)) if fold_prec else 0.0)
+                    iter_metrics["recall"].append(float(np.mean(fold_rec)) if fold_rec else 0.0)
+                    iter_metrics["f1"].append(float(np.mean(fold_f1)) if fold_f1 else 0.0)
+
+                    # log aggregated CV metrics for this checkpoint as MLflow metrics (tagged by iteration)
+                    mlflow.log_metric("cv_accuracy", iter_metrics["accuracy"][-1], step=int(it))
+                    mlflow.log_metric("cv_precision", iter_metrics["precision"][-1], step=int(it))
+                    mlflow.log_metric("cv_recall", iter_metrics["recall"][-1], step=int(it))
+                    mlflow.log_metric("cv_f1", iter_metrics["f1"][-1], step=int(it))
+
+                # Plot CV metric curves and log to MLflow
+                tmpdir = tempfile.mkdtemp()
+                plot_path = os.path.join(tmpdir, "svm_cv_metrics_over_iterations.png")
+                TrainModelService._plot_metrics_over_iterations(iter_points, iter_metrics, title="SVM CV metrics over max_iter", outpath=plot_path)
+                try:
+                    mlflow.log_artifact(plot_path, artifact_path="cv_metrics")
+                except Exception:
+                    logger.debug("Could not log CV metric plot to MLflow (maybe no active run permitted).")
+
+                # Train final model on full train with full max_iteration_steps
+                final_clf = OneVsRestClassifier(SklearnLinearSVC(max_iter=int(max_iteration_steps), C=float(C), dual=False))
+                final_clf.fit(X_train, y_train)
+
+                # Evaluate train
+                y_train_pred = final_clf.predict(X_train)
+                report_train = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_train), le.inverse_transform(y_train_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+
+                # plot & log confusion matrix for train
+                try:
+                    cm_paths_train = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_train, artifact_dir=os.path.join("artifacts", "confusion_matrix", "svm", "train"))
+                    logger.info("Confusion matrix (train) saved: %s", cm_paths_train)
+                except Exception:
+                    logger.exception("Failed plotting/logging train confusion matrix.")
+                
+                # Evaluate test
+                y_test_pred = final_clf.predict(X_test)
+                report_test = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_test), le.inverse_transform(y_test_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+
+                # plot & log confusion matrix for test
+                try:
+                    cm_paths_test = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_test, artifact_dir=os.path.join("artifacts", "confusion_matrix", "svm", "test"))
+                    logger.info("Confusion matrix (test) saved: %s", cm_paths_test)
+                except Exception:
+                    logger.exception("Failed plotting/logging test confusion matrix.")
+
+                # plot test/train single-point bars as a small chart too (optional)
+                tiny_plot = os.path.join(tmpdir, "svm_train_test_metrics.png")
+                combined = {
+                    "train_accuracy": report_train.get("accuracy", 0.0),
+                    "test_accuracy": report_test.get("accuracy", 0.0),
+                    "train_f1": report_train.get("macro_avg", {}).get("f1-score", 0.0),
+                    "test_f1": report_test.get("macro_avg", {}).get("f1-score", 0.0),
+                }
+                plt.figure(figsize=(6, 4))
+                names = list(combined.keys())
+                vals = [combined[n] for n in names]
+                plt.bar(range(len(names)), vals)
+                plt.xticks(range(len(names)), names, rotation=45, ha="right")
+                plt.ylabel("Score")
+                plt.title("Final train/test metrics")
+                plt.tight_layout()
+                plt.savefig(tiny_plot)
+                plt.close()
+                try:
+                    mlflow.log_artifact(tiny_plot, artifact_path="final_metrics")
+                except Exception:
+                    logger.debug("Could not log final metrics plot.")
+
+                # save artifacts
+                TrainModelService._save_and_log_artifact(imputer, "preprocessing", "imputer")
+                TrainModelService._save_and_log_artifact(scaler, "preprocessing", "scaler")
+                mlflow.sklearn.log_model(final_clf, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+
+                run_id = mlflow.active_run().info.run_id
+                if register_model_name:
+                    TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+
+            acc = float(report_test.get("accuracy", 0.0))
+            f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
+            prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
+            rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
+            logger.info("=== END train_loitering_transshipment_svm_pandas: accuracy=%.4f f1=%.4f ===", acc, f1)
+            return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id}
+
+        except Exception as e:
+            logger.exception("Error in train_loitering_transshipment_svm_pandas: %s", e)
+            TrainModelService._end_mlflow_if_active()
+            return {"error": str(e), "trace": traceback.format_exc()}
+
+    @staticmethod
+    def train_loitering_transshipment_rf_pandas_sklearn_model(per_label_n=None,
+                                        test_size=0.20,
+                                        random_state=42,
+                                        n_estimators: int = 200,
+                                        max_depth: int = None,
+                                        experiment_name: str = None,
+                                        register_model_name: str = None,
+                                        number_of_folds: int = 5,
+                                        impute_strategy: str = "median",
+                                        histogram_bins: int = 30,
+                                        histogram_sample_size: int = 20000):
+        """
+        Train RandomForest to discriminate LOITERING vs TRANSSHIPMENT using pandas/sklearn.
+        Tracks metrics as n_estimators increases and logs line charts.
+        """
+        logger.info("=== START train_loitering_transshipment_rf_pandas_sklearn_model ===")
+        try:
+            labels = ["LOITERING", "TRANSSHIPMENT"]
+            cols = ["behavior_type_label"] + FEATURE_COLUMNS
+            df = TrainModelService.read_aggregated_table_pandas(selected_cols=cols)
+            df_filtered = df[df["behavior_type_label"].isin(labels)].copy()
+
+            counts = {lbl: int(df_filtered[df_filtered["behavior_type_label"] == lbl].shape[0]) for lbl in labels}
+            min_count = min(counts.values()) if counts else 0
+            if min_count == 0:
+                logger.warning("One or more classes have zero rows: %s", counts)
+                return {"error": "One of the classes has zero rows", "counts": counts}
+
+            if per_label_n is None:
+                per_label_n = int(min_count)
+            else:
+                per_label_n = int(per_label_n)
+                if per_label_n > min_count:
+                    logger.warning("Requested per_label_n=%d greater than smallest class count=%d", per_label_n, min_count)
+                    return {"error": "per_label_n greater than smallest class count", "smallest_label_count": min_count}
+
+            sampled = TrainModelService.sample_random_balanced_pandas(df_filtered, labels, per_label_n, label_col="behavior_type_label", random_state=int(random_state))
+            if sampled.shape[0] == 0:
+                return {"error": "No rows sampled", "counts": counts}
+
+            train_df, test_df = TrainModelService.stratified_train_test_split_pandas(sampled, label_col="behavior_type_label", test_size=float(test_size), random_state=int(random_state))
+
+            TrainModelService.log_class_distribution_pandas(train_df, test_df, label_col="behavior_type_label")
+
+            # encode labels
+            le = LabelEncoder()
+            y_train = le.fit_transform(train_df["behavior_type_label"].astype(str))
+            y_test = le.transform(test_df["behavior_type_label"].astype(str))
+            label_order = list(le.classes_)
+
+            # clean + impute
+            train_imp, test_imp, used_features, imputer = TrainModelService.clean_and_impute_pandas(train_df, test_df, FEATURE_COLUMNS, impute_strategy=impute_strategy)
+            if not used_features:
+                return {"error": "No usable features after cleaning (all dropped or empty)."}
+
+            mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+            TrainModelService.log_feature_stats_histograms_pandas(train_imp, test_imp, used_features, bins=histogram_bins, histogram_sample_size=histogram_sample_size)
+
+            # scale
+            scaler = SklearnStandardScaler()
+            X_train = scaler.fit_transform(train_imp[used_features].values)
+            X_test = scaler.transform(test_imp[used_features].values)
+
+            # iteration checkpoints for number of trees
+            tree_points = TrainModelService._make_iteration_points_int(int(n_estimators), max_points=20)
+
+            skf = StratifiedKFold(n_splits=number_of_folds, shuffle=True, random_state=int(random_state))
+
+            iter_metrics = {"accuracy": [], "precision": [], "recall": [], "f1": []}
+
+            mlflow.set_experiment(experiment_name or f"RF_Loitering_vs_Transshipment_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}")
+            ok_to_start_non_nested = TrainModelService._ensure_no_active_mlflow_run()
+            nested_flag = not ok_to_start_non_nested
+
+            with mlflow.start_run(run_name=f"RF_Loitering_vs_Transshipment_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}", nested=nested_flag):
+                mlflow.log_param("model_type", "RandomForestClassifier")
+                mlflow.log_param("labels_original", ",".join(labels))
+                mlflow.log_param("label_index_order", ",".join(label_order))
+                mlflow.log_param("per_label_n", per_label_n)
+                mlflow.log_param("test_size", test_size)
+                mlflow.log_param("random_state", random_state)
+                mlflow.log_param("n_estimators", n_estimators)
+                mlflow.log_param("max_depth", max_depth)
+                mlflow.log_param("impute_strategy", impute_strategy)
+                mlflow.log_param("used_features_count", len(used_features))
+
+                for n_trees in tree_points:
+                    fold_acc = []
+                    fold_prec = []
+                    fold_rec = []
+                    fold_f1 = []
+                    fold_idx = 0
+                    for train_idx, val_idx in skf.split(X_train, y_train):
+                        fold_idx += 1
+                        X_tr_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+                        y_tr_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+                        clf = SklearnRandomForestClassifier(n_estimators=int(n_trees), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                        clf.fit(X_tr_fold, y_tr_fold)
+                        y_val_pred = clf.predict(X_val_fold)
+
+                        # decode before metrics
+                        y_val_fold_names = le.inverse_transform(y_val_fold)
+                        y_val_pred_names = le.inverse_transform(y_val_pred)
+                        report_cv = TrainModelService.compute_metrics_from_predictions(y_val_fold_names, y_val_pred_names, label_order)
+
+                        fold_acc.append(report_cv.get("accuracy", 0.0))
+                        fold_prec.append(report_cv.get("macro_avg", {}).get("precision", 0.0))
+                        fold_rec.append(report_cv.get("macro_avg", {}).get("recall", 0.0))
+                        fold_f1.append(report_cv.get("macro_avg", {}).get("f1-score", 0.0))
+
+                        TrainModelService.log_metrics_from_report(report_cv, prefix=f"cv_trees_{n_trees}_fold", step=fold_idx)
+
+                    iter_metrics["accuracy"].append(float(np.mean(fold_acc)) if fold_acc else 0.0)
+                    iter_metrics["precision"].append(float(np.mean(fold_prec)) if fold_prec else 0.0)
+                    iter_metrics["recall"].append(float(np.mean(fold_rec)) if fold_rec else 0.0)
+                    iter_metrics["f1"].append(float(np.mean(fold_f1)) if fold_f1 else 0.0)
+
+                    mlflow.log_metric("cv_accuracy", iter_metrics["accuracy"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_precision", iter_metrics["precision"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_recall", iter_metrics["recall"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_f1", iter_metrics["f1"][-1], step=int(n_trees))
+
+                # plot iteration curves
+                tmpdir = tempfile.mkdtemp()
+                plot_path = os.path.join(tmpdir, "rf_cv_metrics_over_trees.png")
+                TrainModelService._plot_metrics_over_iterations(tree_points, iter_metrics, title="RF CV metrics over n_estimators", outpath=plot_path)
+                try:
+                    mlflow.log_artifact(plot_path, artifact_path="cv_metrics")
+                except Exception:
+                    logger.debug("Could not log RF CV metric plot to MLflow.")
+
+                # final model
+                final_clf = SklearnRandomForestClassifier(n_estimators=int(n_estimators), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                final_clf.fit(X_train, y_train)
+
+                y_train_pred = final_clf.predict(X_train)
+                report_train = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_train), le.inverse_transform(y_train_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+
+                try:
+                    cm_paths_train = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_train, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_loitering_stopping", "train"))
+                    logger.info("Confusion matrix (train) saved: %s", cm_paths_train)
+                except Exception:
+                    logger.exception("Failed plotting/logging train confusion matrix.")
+
+                y_test_pred = final_clf.predict(X_test)
+                report_test = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_test), le.inverse_transform(y_test_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+
+                try:
+                    cm_paths_test = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_test, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_loitering_stopping", "test"))
+                    logger.info("Confusion matrix (test) saved: %s", cm_paths_test)
+                except Exception:
+                    logger.exception("Failed plotting/logging test confusion matrix.")
+
+                TrainModelService._save_and_log_artifact(imputer, "preprocessing", "imputer")
+                TrainModelService._save_and_log_artifact(scaler, "preprocessing", "scaler")
+                mlflow.sklearn.log_model(final_clf, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+                run_id = mlflow.active_run().info.run_id
+
+                if register_model_name:
+                    TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+
+            acc = float(report_test.get("accuracy", 0.0))
+            f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
+            prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
+            rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
+            logger.info("=== END train_loitering_stopping_pandas: accuracy=%.4f f1=%.4f ===", acc, f1)
+            return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id}
+
+        except Exception as e:
+            logger.exception("Error in train_loitering_stopping_pandas: %s", e)
+            TrainModelService._end_mlflow_if_active()
+            return {"error": str(e), "trace": traceback.format_exc()}
+
+    @staticmethod
+    def train_loitering_stopping_rf_pandas_sklearn_model(per_label_n=None,
+                                        test_size=0.20,
+                                        random_state=42,
+                                        n_estimators: int = 200,
+                                        max_depth: int = None,
+                                        experiment_name: str = None,
+                                        register_model_name: str = None,
+                                        number_of_folds: int = 5,
+                                        impute_strategy: str = "median",
+                                        histogram_bins: int = 30,
+                                        histogram_sample_size: int = 20000):
+        """
+        Train RandomForest to discriminate LOITERING vs STOPPING using pandas/sklearn.
+        Tracks metrics as n_estimators increases and logs line charts.
+        """
+        logger.info("=== START train_loitering_stopping_rf_pandas_sklearn_model ===")
+        try:
+            labels = ["LOITERING", "STOPPING"]
+            cols = ["behavior_type_label"] + FEATURE_COLUMNS
+            df = TrainModelService.read_aggregated_table_pandas(selected_cols=cols)
+            df_filtered = df[df["behavior_type_label"].isin(labels)].copy()
+
+            counts = {lbl: int(df_filtered[df_filtered["behavior_type_label"] == lbl].shape[0]) for lbl in labels}
+            min_count = min(counts.values()) if counts else 0
+            if min_count == 0:
+                logger.warning("One or more classes have zero rows: %s", counts)
+                return {"error": "One of the classes has zero rows", "counts": counts}
+
+            if per_label_n is None:
+                per_label_n = int(min_count)
+            else:
+                per_label_n = int(per_label_n)
+                if per_label_n > min_count:
+                    logger.warning("Requested per_label_n=%d greater than smallest class count=%d", per_label_n, min_count)
+                    return {"error": "per_label_n greater than smallest class count", "smallest_label_count": min_count}
+
+            sampled = TrainModelService.sample_random_balanced_pandas(df_filtered, labels, per_label_n, label_col="behavior_type_label", random_state=int(random_state))
+            if sampled.shape[0] == 0:
+                return {"error": "No rows sampled", "counts": counts}
+
+            train_df, test_df = TrainModelService.stratified_train_test_split_pandas(sampled, label_col="behavior_type_label", test_size=float(test_size), random_state=int(random_state))
+
+            TrainModelService.log_class_distribution_pandas(train_df, test_df, label_col="behavior_type_label")
+
+            # encode labels
+            le = LabelEncoder()
+            y_train = le.fit_transform(train_df["behavior_type_label"].astype(str))
+            y_test = le.transform(test_df["behavior_type_label"].astype(str))
+            label_order = list(le.classes_)
+
+            # clean + impute
+            train_imp, test_imp, used_features, imputer = TrainModelService.clean_and_impute_pandas(train_df, test_df, FEATURE_COLUMNS, impute_strategy=impute_strategy)
+            if not used_features:
+                return {"error": "No usable features after cleaning (all dropped or empty)."}
+
+            mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+            TrainModelService.log_feature_stats_histograms_pandas(train_imp, test_imp, used_features, bins=histogram_bins, histogram_sample_size=histogram_sample_size)
+
+            # scale
+            scaler = SklearnStandardScaler()
+            X_train = scaler.fit_transform(train_imp[used_features].values)
+            X_test = scaler.transform(test_imp[used_features].values)
+
+            # iteration checkpoints for number of trees
+            tree_points = TrainModelService._make_iteration_points_int(int(n_estimators), max_points=20)
+
+            skf = StratifiedKFold(n_splits=number_of_folds, shuffle=True, random_state=int(random_state))
+
+            iter_metrics = {"accuracy": [], "precision": [], "recall": [], "f1": []}
+
+            mlflow.set_experiment(experiment_name or f"RF_Loitering_vs_Stopping_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}")
+            ok_to_start_non_nested = TrainModelService._ensure_no_active_mlflow_run()
+            nested_flag = not ok_to_start_non_nested
+
+            with mlflow.start_run(run_name=f"RF_Loitering_vs_Stopping_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}", nested=nested_flag):
+                mlflow.log_param("model_type", "RandomForestClassifier")
+                mlflow.log_param("labels_original", ",".join(labels))
+                mlflow.log_param("label_index_order", ",".join(label_order))
+                mlflow.log_param("per_label_n", per_label_n)
+                mlflow.log_param("test_size", test_size)
+                mlflow.log_param("random_state", random_state)
+                mlflow.log_param("n_estimators", n_estimators)
+                mlflow.log_param("max_depth", max_depth)
+                mlflow.log_param("impute_strategy", impute_strategy)
+                mlflow.log_param("used_features_count", len(used_features))
+
+                for n_trees in tree_points:
+                    fold_acc = []
+                    fold_prec = []
+                    fold_rec = []
+                    fold_f1 = []
+                    fold_idx = 0
+                    for train_idx, val_idx in skf.split(X_train, y_train):
+                        fold_idx += 1
+                        X_tr_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+                        y_tr_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+                        clf = SklearnRandomForestClassifier(n_estimators=int(n_trees), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                        clf.fit(X_tr_fold, y_tr_fold)
+                        y_val_pred = clf.predict(X_val_fold)
+
+                        # decode before metrics
+                        y_val_fold_names = le.inverse_transform(y_val_fold)
+                        y_val_pred_names = le.inverse_transform(y_val_pred)
+                        report_cv = TrainModelService.compute_metrics_from_predictions(y_val_fold_names, y_val_pred_names, label_order)
+
+                        fold_acc.append(report_cv.get("accuracy", 0.0))
+                        fold_prec.append(report_cv.get("macro_avg", {}).get("precision", 0.0))
+                        fold_rec.append(report_cv.get("macro_avg", {}).get("recall", 0.0))
+                        fold_f1.append(report_cv.get("macro_avg", {}).get("f1-score", 0.0))
+
+                        TrainModelService.log_metrics_from_report(report_cv, prefix=f"cv_trees_{n_trees}_fold", step=fold_idx)
+
+                    iter_metrics["accuracy"].append(float(np.mean(fold_acc)) if fold_acc else 0.0)
+                    iter_metrics["precision"].append(float(np.mean(fold_prec)) if fold_prec else 0.0)
+                    iter_metrics["recall"].append(float(np.mean(fold_rec)) if fold_rec else 0.0)
+                    iter_metrics["f1"].append(float(np.mean(fold_f1)) if fold_f1 else 0.0)
+
+                    mlflow.log_metric("cv_accuracy", iter_metrics["accuracy"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_precision", iter_metrics["precision"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_recall", iter_metrics["recall"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_f1", iter_metrics["f1"][-1], step=int(n_trees))
+
+                # plot iteration curves
+                tmpdir = tempfile.mkdtemp()
+                plot_path = os.path.join(tmpdir, "rf_cv_metrics_over_trees.png")
+                TrainModelService._plot_metrics_over_iterations(tree_points, iter_metrics, title="RF CV metrics over n_estimators", outpath=plot_path)
+                try:
+                    mlflow.log_artifact(plot_path, artifact_path="cv_metrics")
+                except Exception:
+                    logger.debug("Could not log RF CV metric plot to MLflow.")
+
+                # final model
+                final_clf = SklearnRandomForestClassifier(n_estimators=int(n_estimators), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                final_clf.fit(X_train, y_train)
+
+                y_train_pred = final_clf.predict(X_train)
+                report_train = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_train), le.inverse_transform(y_train_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+
+                try:
+                    cm_paths_train = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_train, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_loitering_stopping", "train"))
+                    logger.info("Confusion matrix (train) saved: %s", cm_paths_train)
+                except Exception:
+                    logger.exception("Failed plotting/logging train confusion matrix.")
+
+                y_test_pred = final_clf.predict(X_test)
+                report_test = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_test), le.inverse_transform(y_test_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+
+                try:
+                    cm_paths_test = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_test, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_loitering_stopping", "test"))
+                    logger.info("Confusion matrix (test) saved: %s", cm_paths_test)
+                except Exception:
+                    logger.exception("Failed plotting/logging test confusion matrix.")
+
+                TrainModelService._save_and_log_artifact(imputer, "preprocessing", "imputer")
+                TrainModelService._save_and_log_artifact(scaler, "preprocessing", "scaler")
+                mlflow.sklearn.log_model(final_clf, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+                run_id = mlflow.active_run().info.run_id
+
+                if register_model_name:
+                    TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+
+            acc = float(report_test.get("accuracy", 0.0))
+            f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
+            prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
+            rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
+            logger.info("=== END train_loitering_stopping_pandas: accuracy=%.4f f1=%.4f ===", acc, f1)
+            return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id}
+
+        except Exception as e:
+            logger.exception("Error in train_loitering_stopping_pandas: %s", e)
+            TrainModelService._end_mlflow_if_active()
+            return {"error": str(e), "trace": traceback.format_exc()}
+
+
+    @staticmethod
+    def train_multiclass_behavior_type_svm_pandas_sklearn_model(per_label_n=None, test_size=0.20, random_state=42,
+                                                    max_iteration_steps=1000, C=1.0,
+                                                    experiment_name=None, register_model_name=None,
+                                                    number_of_folds: int = 5,
+                                                    impute_strategy: str = "median",
+                                                    histogram_bins: int = 30,
+                                                    histogram_sample_size: Optional[int] = 20000):
+        """
+        Train OneVsRest LinearSVC using pandas/sklearn with step-by-step metric charts based on max_iteration_steps.
+        """
+        logger.info("=== START train_multiclass_behavior_type_svm_pandas_sklearn_model ===")
+        try:
+            labels = list(ALLOWED_LABELS)
+            cols = ["behavior_type_label"] + FEATURE_COLUMNS
+            df = TrainModelService.read_aggregated_table_pandas(selected_cols=cols)
+            df_filtered = df[df["behavior_type_label"].isin(labels)].copy()
+            counts = {lbl: int(df_filtered[df_filtered["behavior_type_label"]==lbl].shape[0]) for lbl in labels}
+            min_count = min(counts.values()) if counts else 0
+            if min_count == 0:
+                logger.warning("One or more classes have zero rows: %s", counts)
+                return {"error": "One of the classes has zero rows", "counts": counts}
+            if per_label_n is None:
+                per_label_n = int(min_count)
+            else:
+                per_label_n = int(per_label_n)
+                if per_label_n > min_count:
+                    logger.warning("Requested per_label_n=%d greater than smallest class count=%d", per_label_n, min_count)
+                    return {"error": "per_label_n greater than smallest class count", "smallest_label_count": min_count}
+
+            sampled = TrainModelService.sample_random_balanced_pandas(df_filtered, labels, per_label_n, label_col="behavior_type_label", random_state=int(random_state))
+            if sampled.shape[0] == 0:
+                logger.warning("No rows sampled")
+                return {"error": "No rows sampled", "counts": counts}
+
+            train_df, test_df = TrainModelService.stratified_train_test_split_pandas(sampled, label_col="behavior_type_label", test_size=float(test_size), random_state=int(random_state))
+            TrainModelService.log_class_distribution_pandas(train_df, test_df, label_col="behavior_type_label")
+
+            # label encoding
+            le = LabelEncoder()
+            y_train = le.fit_transform(train_df["behavior_type_label"].astype(str))
+            y_test = le.transform(test_df["behavior_type_label"].astype(str))
+            label_order = list(le.classes_)
+
+            # clean + impute
+            train_imp, test_imp, used_features, imputer = TrainModelService.clean_and_impute_pandas(train_df, test_df, FEATURE_COLUMNS, impute_strategy=impute_strategy)
+            if not used_features:
+                return {"error": "No usable features after cleaning (all dropped or empty)."}
+
+            mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+            TrainModelService.log_feature_stats_histograms_pandas(train_imp, test_imp, used_features, bins=histogram_bins, histogram_sample_size=histogram_sample_size)
+
+            # scale
+            scaler = SklearnStandardScaler()
+            X_train = scaler.fit_transform(train_imp[used_features].values)
+            X_test = scaler.transform(test_imp[used_features].values)
+
+            # prepare iteration checkpoints (up to 10 points)
+            iter_points = TrainModelService._make_iteration_points_int(int(max_iteration_steps), max_points=20)
+
+            # cross-validation folds (StratifiedKFold)
+            skf = StratifiedKFold(n_splits=number_of_folds, shuffle=True, random_state=int(random_state))
+
+            # Container to accumulate CV metrics per iteration
+            iter_metrics = {"accuracy": [], "precision": [], "recall": [], "f1": []}
+
+            mlflow.set_experiment(experiment_name or f"SVM_Multiclass_Behavior_Type_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}")
+            ok_to_start_non_nested = TrainModelService._ensure_no_active_mlflow_run()
+            nested_flag = not ok_to_start_non_nested
+
+            with mlflow.start_run(run_name=f"SVM_Multiclass_Behavior_Type_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}", nested=nested_flag):
+                mlflow.log_param("model_type", "SVM_OneVsRest_LinearSVC_sklearn")
+                mlflow.log_param("labels_original", ",".join(labels))
+                mlflow.log_param("label_index_order", ",".join(label_order))
+                mlflow.log_param("per_label_n", per_label_n)
+                mlflow.log_param("test_size", test_size)
+                mlflow.log_param("random_state", random_state)
+                mlflow.log_param("max_iteration_steps", max_iteration_steps)
+                mlflow.log_param("impute_strategy", impute_strategy)
+                mlflow.log_param("used_features_count", len(used_features))
+
+                # For each iteration checkpoint, run CV and record average metrics across folds
+                for it in iter_points:
+                    fold_acc = []
+                    fold_prec = []
+                    fold_rec = []
+                    fold_f1 = []
+                    fold_idx = 0
+                    for train_idx, val_idx in skf.split(X_train, y_train):
+                        fold_idx += 1
+                        X_tr_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+                        y_tr_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+                        # instantiate classifier with current max_iter
+                        clf = OneVsRestClassifier(SklearnLinearSVC(max_iter=int(it), C=float(C), dual=False))
+                        clf.fit(X_tr_fold, y_tr_fold)
+                        y_val_pred = clf.predict(X_val_fold)
+
+                        # decode numeric indices back to original string labels before computing metrics
+                        y_val_fold_names = le.inverse_transform(y_val_fold)
+                        y_val_pred_names = le.inverse_transform(y_val_pred)
+
+                        report_cv = TrainModelService.compute_metrics_from_predictions(y_val_fold_names, y_val_pred_names, label_order)
+                        # record macro metrics (use macro avg)
+                        fold_acc.append(report_cv.get("accuracy", 0.0))
+                        fold_prec.append(report_cv.get("macro_avg", {}).get("precision", 0.0))
+                        fold_rec.append(report_cv.get("macro_avg", {}).get("recall", 0.0))
+                        fold_f1.append(report_cv.get("macro_avg", {}).get("f1-score", 0.0))
+
+                        # also log per-fold CV metrics as steps (optional)
+                        TrainModelService.log_metrics_from_report(report_cv, prefix=f"cv_iter_{it}_fold", step=fold_idx)
+
+                    # average across folds for this iteration
+                    iter_metrics["accuracy"].append(float(np.mean(fold_acc)) if fold_acc else 0.0)
+                    iter_metrics["precision"].append(float(np.mean(fold_prec)) if fold_prec else 0.0)
+                    iter_metrics["recall"].append(float(np.mean(fold_rec)) if fold_rec else 0.0)
+                    iter_metrics["f1"].append(float(np.mean(fold_f1)) if fold_f1 else 0.0)
+
+                    # log aggregated CV metrics for this checkpoint as MLflow metrics (tagged by iteration)
+                    mlflow.log_metric("cv_accuracy", iter_metrics["accuracy"][-1], step=int(it))
+                    mlflow.log_metric("cv_precision", iter_metrics["precision"][-1], step=int(it))
+                    mlflow.log_metric("cv_recall", iter_metrics["recall"][-1], step=int(it))
+                    mlflow.log_metric("cv_f1", iter_metrics["f1"][-1], step=int(it))
+
+                # Plot CV metric curves and log to MLflow
+                tmpdir = tempfile.mkdtemp()
+                plot_path = os.path.join(tmpdir, "svm_cv_metrics_over_iterations.png")
+                TrainModelService._plot_metrics_over_iterations(iter_points, iter_metrics, title="SVM CV metrics over max_iter", outpath=plot_path)
+                try:
+                    mlflow.log_artifact(plot_path, artifact_path="cv_metrics")
+                except Exception:
+                    logger.debug("Could not log CV metric plot to MLflow (maybe no active run permitted).")
+
+                # Train final model on full train with full max_iteration_steps
+                final_clf = OneVsRestClassifier(SklearnLinearSVC(max_iter=int(max_iteration_steps), C=float(C), dual=False))
+                final_clf.fit(X_train, y_train)
+
+                # Evaluate train
+                y_train_pred = final_clf.predict(X_train)
+                report_train = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_train), le.inverse_transform(y_train_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+
+                # plot & log confusion matrix for train
+                try:
+                    cm_paths_train = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_train, artifact_dir=os.path.join("artifacts", "confusion_matrix", "svm", "train"))
+                    logger.info("Confusion matrix (train) saved: %s", cm_paths_train)
+                except Exception:
+                    logger.exception("Failed plotting/logging train confusion matrix.")
+                
+                # Evaluate test
+                y_test_pred = final_clf.predict(X_test)
+                report_test = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_test), le.inverse_transform(y_test_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+
+                # plot & log confusion matrix for test
+                try:
+                    cm_paths_test = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_test, artifact_dir=os.path.join("artifacts", "confusion_matrix", "svm", "test"))
+                    logger.info("Confusion matrix (test) saved: %s", cm_paths_test)
+                except Exception:
+                    logger.exception("Failed plotting/logging test confusion matrix.")
+
+                # plot test/train single-point bars as a small chart too (optional)
+                tiny_plot = os.path.join(tmpdir, "svm_train_test_metrics.png")
+                combined = {
+                    "train_accuracy": report_train.get("accuracy", 0.0),
+                    "test_accuracy": report_test.get("accuracy", 0.0),
+                    "train_f1": report_train.get("macro_avg", {}).get("f1-score", 0.0),
+                    "test_f1": report_test.get("macro_avg", {}).get("f1-score", 0.0),
+                }
+                plt.figure(figsize=(6, 4))
+                names = list(combined.keys())
+                vals = [combined[n] for n in names]
+                plt.bar(range(len(names)), vals)
+                plt.xticks(range(len(names)), names, rotation=45, ha="right")
+                plt.ylabel("Score")
+                plt.title("Final train/test metrics")
+                plt.tight_layout()
+                plt.savefig(tiny_plot)
+                plt.close()
+                try:
+                    mlflow.log_artifact(tiny_plot, artifact_path="final_metrics")
+                except Exception:
+                    logger.debug("Could not log final metrics plot.")
+
+                # save artifacts
+                TrainModelService._save_and_log_artifact(imputer, "preprocessing", "imputer")
+                TrainModelService._save_and_log_artifact(scaler, "preprocessing", "scaler")
+                mlflow.sklearn.log_model(final_clf, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+
+                run_id = mlflow.active_run().info.run_id
+                if register_model_name:
+                    TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+
+            acc = float(report_test.get("accuracy", 0.0))
+            f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
+            prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
+            rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
+            logger.info("=== END train_multiclass_behavior_type_svm_pandas: accuracy=%.4f f1=%.4f ===", acc, f1)
+            return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id}
+
+        except Exception as e:
+            logger.exception("Error in train_multiclass_behavior_type_svm_pandas: %s", e)
+            TrainModelService._end_mlflow_if_active()
+            return {"error": str(e), "trace": traceback.format_exc()}
+    
+    @staticmethod
+    def train_multiclass_behavior_type_rf_pandas_sklearn_model(per_label_n=None,
+                                test_size=0.20,
+                                random_state=42,
+                                n_estimators: int = 200,
+                                max_depth: int = None,
+                                experiment_name: str = None,
+                                register_model_name: str = None,
+                                number_of_folds: int = 5,
+                                impute_strategy: str = "median",
+                                histogram_bins: int = 30,
+                                histogram_sample_size: int = 20000):
+        """
+        Train RandomForest multiclass to classify among ALLOWED_LABELS using pandas/sklearn.
+        Tracks metrics as n_estimators increases and logs line charts.
+        """
+        logger.info("=== START train_multiclass_behavior_type_rf_pandas_sklearn_model ===")
+        try:
+            labels = list(ALLOWED_LABELS)
+            cols = ["behavior_type_label"] + FEATURE_COLUMNS
+            df = TrainModelService.read_aggregated_table_pandas(selected_cols=cols)
+            df_filtered = df[df["behavior_type_label"].isin(labels)].copy()
+
+            counts = {lbl: int(df_filtered[df_filtered["behavior_type_label"] == lbl].shape[0]) for lbl in labels}
+            min_count = min(counts.values()) if counts else 0
+            if min_count == 0:
+                logger.warning("One or more classes have zero rows: %s", counts)
+                return {"error": "One of the classes has zero rows", "counts": counts}
+
+            if per_label_n is None:
+                per_label_n = int(min_count)
+            else:
+                per_label_n = int(per_label_n)
+                if per_label_n > min_count:
+                    logger.warning("Requested per_label_n=%d greater than smallest class count=%d", per_label_n, min_count)
+                    return {"error": "per_label_n greater than smallest class count", "smallest_label_count": min_count}
+
+            sampled = TrainModelService.sample_random_balanced_pandas(df_filtered, labels, per_label_n, label_col="behavior_type_label", random_state=int(random_state))
+            if sampled.shape[0] == 0:
+                return {"error": "No rows sampled", "counts": counts}
+
+            train_df, test_df = TrainModelService.stratified_train_test_split_pandas(sampled, label_col="behavior_type_label", test_size=float(test_size), random_state=int(random_state))
+
+            TrainModelService.log_class_distribution_pandas(train_df, test_df, label_col="behavior_type_label")
+
+            # encode labels
+            le = LabelEncoder()
+            y_train = le.fit_transform(train_df["behavior_type_label"].astype(str))
+            y_test = le.transform(test_df["behavior_type_label"].astype(str))
+            label_order = list(le.classes_)
+
+            # clean + impute
+            train_imp, test_imp, used_features, imputer = TrainModelService.clean_and_impute_pandas(train_df, test_df, FEATURE_COLUMNS, impute_strategy=impute_strategy)
+            if not used_features:
+                return {"error": "No usable features after cleaning (all dropped or empty)."}
+
+            mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+            TrainModelService.log_feature_stats_histograms_pandas(train_imp, test_imp, used_features, bins=histogram_bins, histogram_sample_size=histogram_sample_size)
+
+            # scale
+            scaler = SklearnStandardScaler()
+            X_train = scaler.fit_transform(train_imp[used_features].values)
+            X_test = scaler.transform(test_imp[used_features].values)
+
+            tree_points = TrainModelService._make_iteration_points_int(int(n_estimators), max_points=20)
+            skf = StratifiedKFold(n_splits=number_of_folds, shuffle=True, random_state=int(random_state))
+
+            iter_metrics = {"accuracy": [], "precision": [], "recall": [], "f1": []}
+
+            mlflow.set_experiment(experiment_name or f"RF_Transshipment_Multiclass_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}")
+            ok_to_start_non_nested = TrainModelService._ensure_no_active_mlflow_run()
+            nested_flag = not ok_to_start_non_nested
+
+            with mlflow.start_run(run_name=f"RF_Transshipment_Multiclass_pandas_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}", nested=nested_flag):
+                mlflow.log_param("model_type", "RandomForestClassifier_multiclass")
+                mlflow.log_param("labels_original", ",".join(labels))
+                mlflow.log_param("label_index_order", ",".join(label_order))
+                mlflow.log_param("per_label_n", per_label_n)
+                mlflow.log_param("test_size", test_size)
+                mlflow.log_param("random_state", random_state)
+                mlflow.log_param("n_estimators", n_estimators)
+                mlflow.log_param("max_depth", max_depth)
+                mlflow.log_param("impute_strategy", impute_strategy)
+                mlflow.log_param("used_features_count", len(used_features))
+
+                for n_trees in tree_points:
+                    fold_acc = []
+                    fold_prec = []
+                    fold_rec = []
+                    fold_f1 = []
+                    fold_idx = 0
+                    for train_idx, val_idx in skf.split(X_train, y_train):
+                        fold_idx += 1
+                        X_tr_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+                        y_tr_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+                        clf = SklearnRandomForestClassifier(n_estimators=int(n_trees), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                        clf.fit(X_tr_fold, y_tr_fold)
+                        y_val_pred = clf.predict(X_val_fold)
+
+                        y_val_fold_names = le.inverse_transform(y_val_fold)
+                        y_val_pred_names = le.inverse_transform(y_val_pred)
+                        report_cv = TrainModelService.compute_metrics_from_predictions(y_val_fold_names, y_val_pred_names, label_order)
+
+                        fold_acc.append(report_cv.get("accuracy", 0.0))
+                        fold_prec.append(report_cv.get("macro_avg", {}).get("precision", 0.0))
+                        fold_rec.append(report_cv.get("macro_avg", {}).get("recall", 0.0))
+                        fold_f1.append(report_cv.get("macro_avg", {}).get("f1-score", 0.0))
+
+                        TrainModelService.log_metrics_from_report(report_cv, prefix=f"cv_trees_{n_trees}_fold", step=fold_idx)
+
+                    iter_metrics["accuracy"].append(float(np.mean(fold_acc)) if fold_acc else 0.0)
+                    iter_metrics["precision"].append(float(np.mean(fold_prec)) if fold_prec else 0.0)
+                    iter_metrics["recall"].append(float(np.mean(fold_rec)) if fold_rec else 0.0)
+                    iter_metrics["f1"].append(float(np.mean(fold_f1)) if fold_f1 else 0.0)
+
+                    mlflow.log_metric("cv_accuracy", iter_metrics["accuracy"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_precision", iter_metrics["precision"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_recall", iter_metrics["recall"][-1], step=int(n_trees))
+                    mlflow.log_metric("cv_f1", iter_metrics["f1"][-1], step=int(n_trees))
+
+                # plot iteration curves
+                tmpdir = tempfile.mkdtemp()
+                plot_path = os.path.join(tmpdir, "rf_multiclass_behavior_type_cv_metrics_over_trees.png")
+                TrainModelService._plot_metrics_over_iterations(tree_points, iter_metrics, title="RF (multiclass) CV metrics over n_estimators", outpath=plot_path)
+                try:
+                    mlflow.log_artifact(plot_path, artifact_path="cv_metrics")
+                except Exception:
+                    logger.debug("Could not log RF multiclass CV metric plot to MLflow.")
+
+                # final model fit & eval
+                final_clf = SklearnRandomForestClassifier(n_estimators=int(n_estimators), max_depth=(None if max_depth is None else int(max_depth)), random_state=int(random_state), n_jobs=-1)
+                final_clf.fit(X_train, y_train)
+
+                y_train_pred = final_clf.predict(X_train)
+                report_train = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_train), le.inverse_transform(y_train_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_train, prefix="train", step=None)
+
+                try:
+                    cm_paths_train = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_train, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_multiclass_behavior_type", "train"))
+                    logger.info("Confusion matrix (train) saved: %s", cm_paths_train)
+                except Exception:
+                    logger.exception("Failed plotting/logging train confusion matrix.")
+
+                y_test_pred = final_clf.predict(X_test)
+                report_test = TrainModelService.compute_metrics_from_predictions(le.inverse_transform(y_test), le.inverse_transform(y_test_pred), label_order)
+                TrainModelService.log_metrics_from_report(report_test, prefix="test", step=None)
+
+                try:
+                    cm_paths_test = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report_test, artifact_dir=os.path.join("artifacts", "confusion_matrix", "rf_multiclass_behavior_type", "test"))
+                    logger.info("Confusion matrix (test) saved: %s", cm_paths_test)
+                except Exception:
+                    logger.exception("Failed plotting/logging test confusion matrix.")
+
+                TrainModelService._save_and_log_artifact(imputer, "preprocessing", "imputer")
+                TrainModelService._save_and_log_artifact(scaler, "preprocessing", "scaler")
+                mlflow.sklearn.log_model(final_clf, artifact_path="model")
+                mlflow.log_dict({"used_features": used_features}, "used_features/used_features.json")
+                run_id = mlflow.active_run().info.run_id
+
+                if register_model_name:
+                    TrainModelService.mlflow_register_model(run_id, "model", register_model_name)
+
+            acc = float(report_test.get("accuracy", 0.0))
+            f1 = float(report_test.get("macro_avg", {}).get("f1-score", 0.0))
+            prec = float(report_test.get("macro_avg", {}).get("precision", 0.0))
+            rec = float(report_test.get("macro_avg", {}).get("recall", 0.0))
+            logger.info("=== END train_multiclass_behavior_type_rf_pandas: accuracy=%.4f f1=%.4f ===", acc, f1)
+            return {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec, "mlflow_run_id": run_id}
+
+        except Exception as e:
+            logger.exception("Error in train_multiclass_behavior_type_rf_pandas: %s", e)
+            TrainModelService._end_mlflow_if_active()
+            return {"error": str(e), "trace": traceback.format_exc()}
+        
+    # TENSORFLOW-BASED METHODS BELOW
+    # optional plotting
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        _HAS_PLOTTING = True
+    except Exception:
+        _HAS_PLOTTING = False
+
+    logger = logging.getLogger(__name__)
+
+    # ---------------------------
+    # Helper: choose preprocess_input by model name
+    # ---------------------------
+    @staticmethod
+    def _get_preprocess_fn_for_model(model_name: str):
+        """
+        Return the appropriate preprocessing function for a given model name.
+        Handles MobileNet, MobileNetV2, MobileNetV3, EfficientNet, Xception, and VGG variants.
+        """
+        name = model_name.lower()
+        
+        # MobileNet variants
+        if "mobilenetv3small" in name or "mobilenet_v3_small" in name or "mobilenetv3small_model" in name:
+            return tf.keras.applications.mobilenet_v3.preprocess_input
+        if "mobilenetv3large" in name or "mobilenet_v3_large" in name or "mobilenetv3large_model" in name:
+            return tf.keras.applications.mobilenet_v3.preprocess_input
+        if "mobilenetv2" in name or "mobilenet_v2" in name or "mobilenetv2_model" in name:
+            return tf.keras.applications.mobilenet_v2.preprocess_input
+        if "mobilenet" in name and "v2" not in name and "v3" not in name:
+            return tf.keras.applications.mobilenet.preprocess_input
+        
+        # EfficientNet variants
+        if "efficientnet" in name:
+            return tf.keras.applications.efficientnet.preprocess_input
+        
+        # Xception
+        if "xception" in name:
+            return tf.keras.applications.xception.preprocess_input
+        
+        # VGG variants
+        if "vgg16" in name:
+            return tf.keras.applications.vgg16.preprocess_input
+        if "vgg19" in name:
+            return tf.keras.applications.vgg19.preprocess_input
+        
+        # Fallback: scale to 0-255 range
+        return lambda x: x * 255.0
+
+    # ---------------------------
+    # Helper: build tf.data dataset returning (image, label_int)
+    # ---------------------------
+    def _build_tf_dataset(filepaths, labels, preprocess_fn, img_size=(224, 224), batch_size=16, shuffle=True):
+        AUTOTUNE = tf.data.AUTOTUNE
+
+        filepaths = list(filepaths)
+        labels = list(labels)
+
+        def _load_and_preprocess(path, label):
+            # path: tf.string scalar
+            img = tf.io.read_file(path)
+            img = tf.image.decode_image(img, channels=3, expand_animations=False)
+            img = tf.image.convert_image_dtype(img, tf.float32)  # 0..1
+            img = tf.image.resize(img, img_size)
+            # many preprocess_input expect 0..255; our preprocess function multiplies accordingly
+            img = preprocess_fn(img)
+            return img, label
+
+        ds = tf.data.Dataset.from_tensor_slices((filepaths, labels))
+        if shuffle:
+            ds = ds.shuffle(buffer_size=len(filepaths), seed=42)
+        ds = ds.map(lambda p, l: tf.py_function(func=_load_and_preprocess, inp=[p, l], Tout=(tf.float32, tf.int32)),
+                    num_parallel_calls=AUTOTUNE)
+        ds = ds.map(lambda img, lbl: (tf.reshape(img, (img_size[0], img_size[1], 3)), tf.cast(lbl, tf.int32)), num_parallel_calls=AUTOTUNE)
+        ds = ds.batch(batch_size).prefetch(AUTOTUNE)
+        return ds
+
+    # ---------------------------
+    # Helper: Train & log one Keras model, ensuring class names are used in all CSVs & MLflow logs
+    # ---------------------------
+    def _train_and_log_keras_model_with_classnames(
+        base_model,
+        model_name: str,
+        X_train_paths, y_train_int,
+        X_test_paths, y_test_int,
+        label_encoder: LabelEncoder,
+        epochs=20,
+        batch_size=16,
+        learning_rate=0.001,
+        callbacks_list=None,
+        experiment_name=None,
+        register_model_name=None,
+        out_dir="artifacts/image_training"
+    ):
+        os.makedirs(out_dir, exist_ok=True)
+        num_classes = len(label_encoder.classes_)
+        preprocess_fn = TrainModelService._get_preprocess_fn_for_model(model_name)
+
+        # Datasets (labels remain integer indices that map to original class names via label_encoder)
+        train_ds = TrainModelService._build_tf_dataset(X_train_paths, y_train_int, preprocess_fn, img_size=(224, 224), batch_size=batch_size, shuffle=True)
+        test_ds = TrainModelService._build_tf_dataset(X_test_paths, y_test_int, preprocess_fn, img_size=(224, 224), batch_size=batch_size, shuffle=False)   
+        # Build model (attach pooling + softmax)
+        base_model.trainable = True
+        inputs = tf.keras.Input(shape=(224, 224, 3))
+        x = base_model(inputs, training=False)
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="predictions")(x)
+        model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"{model_name}_full")
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        loss = SparseCategoricalCrossentropy()
+        metrics = [SparseCategoricalAccuracy()]
+        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+
+        # Callbacks
+        cb = callbacks_list[:] if callbacks_list else []
+        # provide sensible defaults if nothing passed
+        if not callbacks_list:
+            cb = [EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
+                ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=2)]
+        csv_log_path = os.path.join(out_dir, f"{model_name}_epoch_history.csv")
+        cb.append(CSVLogger(csv_log_path))
+
+        # Start MLflow run
+        mlflow.set_experiment(experiment_name or f"image_training_{model_name}")
+        # Try to ensure nested runs behave as your environment expects - keep same approach as your repo
+        with mlflow.start_run(run_name=f"{model_name}_train_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"):
+            # log params
+            mlflow.log_param("model_base", model_name)
+            mlflow.log_param("num_classes", num_classes)
+            mlflow.log_param("epochs", epochs)
+            mlflow.log_param("batch_size", batch_size)
+            mlflow.log_param("learning_rate", learning_rate)
+
+            # Train (use test_ds as validation so Keras shows val metrics)
+            history = model.fit(
+                train_ds,
+                epochs=epochs,
+                validation_data=test_ds,
+                callbacks=cb,
+                verbose=1
+            )
+
+            # Evaluate on test set
+            eval_res = model.evaluate(test_ds, verbose=1)
+            # Typically eval_res = [loss, sparse_categorical_accuracy]
+            mlflow.log_metric("test_loss", float(eval_res[0]))
+            # Save accuracy metric with clear name
+            if len(eval_res) >= 2:
+                mlflow.log_metric("test_sparse_categorical_accuracy", float(eval_res[1]))
+
+            # Predictions & y_true collection
+            y_true = []
+            y_pred = []
+            for batch_images, batch_labels in test_ds:
+                preds = model.predict(batch_images)
+                pred_ints = np.argmax(preds, axis=1)
+                y_pred.extend(pred_ints.tolist())
+                y_true.extend([int(x) for x in batch_labels.numpy().tolist()])
+
+            y_true = np.array(y_true, dtype=int)
+            y_pred = np.array(y_pred, dtype=int)
+
+            # Confusion matrix (use original class names in CSV)
+            cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+            cm_csv = os.path.join(out_dir, f"{model_name}_confusion_matrix.csv")
+            with open(cm_csv, "w", newline="") as fh:
+                writer = csv.writer(fh)
+                header = [""] + list(label_encoder.classes_)
+                writer.writerow(header)
+                for i, row in enumerate(cm):
+                    writer.writerow([label_encoder.classes_[i]] + row.tolist())
+
+            # Optional PNG plot using seaborn if available (also saved)
+            cm_png = os.path.join(out_dir, f"{model_name}_confusion_matrix.png")
+            if _HAS_PLOTTING:
+                try:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                                xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+                    ax.set_xlabel("Predicted")
+                    ax.set_ylabel("True")
+                    fig.savefig(cm_png, bbox_inches="tight")
+                    plt.close(fig)
+                except Exception:
+                    logger.exception("Failed plotting confusion matrix PNG for %s", model_name)
+
+            # Per-class precision/recall/f1 support (use original class names when writing CSV and logging to MLflow)
+            precision, recall, f1, support = precision_recall_fscore_support(y_true, y_pred, labels=list(range(num_classes)), zero_division=0)
+            per_class_csv = os.path.join(out_dir, f"{model_name}_per_class_metrics.csv")
+            with open(per_class_csv, "w", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["class_name", "precision", "recall", "f1", "support"])
+                for i, class_name in enumerate(label_encoder.classes_):
+                    writer.writerow([class_name, float(precision[i]), float(recall[i]), float(f1[i]), int(support[i])])
+
+            # Log per-class metrics to MLflow using class names in metric keys
+            for i, class_name in enumerate(label_encoder.classes_):
+                mlflow.log_metric(f"precision_{class_name}", float(precision[i]))
+                mlflow.log_metric(f"recall_{class_name}", float(recall[i]))
+                mlflow.log_metric(f"f1_{class_name}", float(f1[i]))
+                mlflow.log_metric(f"support_{class_name}", int(support[i]))
+
+            # Save epoch history CSV that was produced by CSVLogger; ensure we also include a header with class list for clarity
+            # We'll augment the CSV with a short metadata file listing the class names for human readers
+            classes_meta = os.path.join(out_dir, f"{model_name}_class_names.txt")
+            with open(classes_meta, "w") as fh:
+                fh.write("\n".join(label_encoder.classes_))
+
+            # Save history to our own CSV too (with the exact keys)
+            metrics_csv = os.path.join(out_dir, f"{model_name}_metrics_per_epoch.csv")
+            with open(metrics_csv, "w", newline="") as fh:
+                writer = csv.writer(fh)
+                # header contains epoch + all history keys
+                header = ["epoch"] + list(history.history.keys())
+                writer.writerow(header)
+                n_epochs_recorded = len(history.history[next(iter(history.history))])
+                for e in range(n_epochs_recorded):
+                    row = [e + 1] + [history.history[k][e] for k in header[1:]]
+                    writer.writerow(row)
+
+            # Log artifacts to MLflow (confusion matrix CSV + PNG, per-class CSV, epoch metrics CSV, class names text)
+            try:
+                mlflow.log_artifact(cm_csv, artifact_path="confusion_matrix")
+                if os.path.exists(cm_png):
+                    mlflow.log_artifact(cm_png, artifact_path="confusion_matrix")
+                mlflow.log_artifact(per_class_csv, artifact_path="per_class_metrics")
+                mlflow.log_artifact(metrics_csv, artifact_path="metrics")
+                mlflow.log_artifact(classes_meta, artifact_path="metadata")
+            except Exception:
+                logger.exception("Failed to log artifacts for %s", model_name)
+
+            # Save Keras model to MLflow
+            try:
+                mlflow.keras.log_model(model, artifact_path="model")
+            except Exception:
+                logger.exception("Failed to log Keras model to MLflow for %s", model_name)
+
+            # optional registry register
+            if register_model_name:
+                try:
+                    run_id = mlflow.active_run().info.run_id
+                    # The repository may have a helper to register; keep your project's pattern if available.
+                    # Example: TrainModelService.mlflow_register_model(run_id, "model", f"{register_model_name}_{model_name}")
+                except Exception:
+                    logger.exception("Failed registering model to MLflow registry for %s", model_name)
+
+        # Return structured result
+        return {
+            "history": history.history,
+            "confusion_matrix": cm,
+            "per_class_metrics": {
+                "class_names": list(label_encoder.classes_),
+                "precision": precision.tolist(),
+                "recall": recall.tolist(),
+                "f1": f1.tolist(),
+                "support": support.tolist()
+            },
+            "eval": eval_res
+        }
+
+    # ---------------------------
+    # Top-level: LOITERING vs TRANSSHIPMENT training
+    # ---------------------------
+    def train_loitering_transshipment_image_models(
+        dataset_dir: str = "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224",
+        models_dict: dict = None,
+        per_label_n: int = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        epochs: int = 20,
+        batch_size: int = 16,
+        learning_rate: float = 0.001,
+        callbacks_list: list = None,
+        experiment_name: str = None,
+        register_model_name: str = None
+    ):
+        """
+        Train models for LOITERING vs TRANSSHIPMENT; ensures all CSVs and MLflow logs include original class names.
+        """
+        base = pathlib.Path(dataset_dir)
+        labels = ["LOITERING", "TRANSSHIPMENT"]
+        rows = []
+        for lab in labels:
+            d = base / lab
+            if d.exists():
+                for p in d.iterdir():
+                    if p.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+                        rows.append({"path": str(p.resolve()), "label": lab})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"error": "No images found under dataset_dir for desired labels."}
+
+        # Determine how many per label to use
+        counts = df["label"].value_counts().to_dict()
+        min_count = min(counts.values())
+        if per_label_n is None:
+            per_label_n = min_count
+        else:
+            per_label_n = min(per_label_n, min_count)
+
+        sampled_parts = []
+        for lab in labels:
+            sub = df[df["label"] == lab]
+            if sub.shape[0] == 0:
+                return {"error": f"No images for label {lab}"}
+            sampled_parts.append(sub.sample(n=per_label_n, random_state=int(random_state)))
+        df_sampled = pd.concat(sampled_parts).reset_index(drop=True)
+
+        # Stratified split
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        X = df_sampled["path"].values
+        y = df_sampled["label"].values
+        train_idx, test_idx = next(sss.split(X, y))
+        X_train_paths, X_test_paths = X[train_idx].tolist(), X[test_idx].tolist()
+        y_train_labels, y_test_labels = y[train_idx].tolist(), y[test_idx].tolist()
+
+        # Label encoder fit on original labels (ensures inverse_transform returns original names)
+        le = LabelEncoder().fit(labels)
+        y_train_int = le.transform(y_train_labels)
+        y_test_int = le.transform(y_test_labels)
+
+        results = {}
+        for model_name, base_model in (models_dict or {}).items():
+            logger.info("Training image model: %s", model_name)
+            out_dir = os.path.join("artifacts", "image_models", model_name)
+            res = TrainModelService._train_and_log_keras_model_with_classnames(
+                base_model=base_model,
+                model_name=model_name,
+                X_train_paths=X_train_paths,
+                y_train_int=y_train_int,
+                X_test_paths=X_test_paths,
+                y_test_int=y_test_int,
+                label_encoder=le,
+                epochs=epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                callbacks_list=callbacks_list,
+                experiment_name=experiment_name,
+                register_model_name=register_model_name,
+                out_dir=out_dir
+            )
+            results[model_name] = res
+        return results
+
+    # ---------------------------
+    # Top-level: LOITERING vs STOPPING training
+    # ---------------------------
+    def train_loitering_stopping_image_models(
+        dataset_dir: str = "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224",
+        models_dict: dict = None,
+        per_label_n: int = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        **kwargs
+    ):
+        # identical pipeline but labels ["LOITERING", "STOPPING"]
+        base = pathlib.Path(dataset_dir)
+        labels = ["LOITERING", "STOPPING"]
+        rows = []
+        for lab in labels:
+            d = base / lab
+            if d.exists():
+                for p in d.iterdir():
+                    if p.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+                        rows.append({"path": str(p.resolve()), "label": lab})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"error": "No images found under dataset_dir for desired labels."}
+
+        counts = df["label"].value_counts().to_dict()
+        min_count = min(counts.values())
+        if per_label_n is None:
+            per_label_n = min_count
+        else:
+            per_label_n = min(per_label_n, min_count)
+
+        sampled_parts = []
+        for lab in labels:
+            sub = df[df["label"] == lab]
+            if sub.shape[0] == 0:
+                return {"error": f"No images for label {lab}"}
+            sampled_parts.append(sub.sample(n=per_label_n, random_state=int(random_state)))
+        df_sampled = pd.concat(sampled_parts).reset_index(drop=True)
+
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        X = df_sampled["path"].values
+        y = df_sampled["label"].values
+        train_idx, test_idx = next(sss.split(X, y))
+        X_train_paths, X_test_paths = X[train_idx].tolist(), X[test_idx].tolist()
+        y_train_labels, y_test_labels = y[train_idx].tolist(), y[test_idx].tolist()
+
+        le = LabelEncoder().fit(labels)
+        y_train_int = le.transform(y_train_labels)
+        y_test_int = le.transform(y_test_labels)
+
+        results = {}
+        for model_name, base_model in (models_dict or {}).items():
+            logger.info("Training image model: %s", model_name)
+            out_dir = os.path.join("artifacts", "image_models", model_name)
+            res = _train_and_log_keras_model_with_classnames(
+                base_model=base_model,
+                model_name=model_name,
+                X_train_paths=X_train_paths,
+                y_train_int=y_train_int,
+                X_test_paths=X_test_paths,
+                y_test_int=y_test_int,
+                label_encoder=le,
+                epochs=kwargs.get("epochs", 20),
+                batch_size=kwargs.get("batch_size", 16),
+                learning_rate=kwargs.get("learning_rate", 0.001),
+                callbacks_list=kwargs.get("callbacks_list", None),
+                experiment_name=kwargs.get("experiment_name", None),
+                register_model_name=kwargs.get("register_model_name", None),
+                out_dir=out_dir
+            )
+            results[model_name] = res
+        return results
+
+    # ---------------------------
+    # Defensive GPU configuration helper (English logs)
+    # ---------------------------
+    @staticmethod
+    def _configure_gpu_defensively():
+        """
+        Detect GPUs and configure TensorFlow memory growth defensively.
+        Returns True if a GPU is available/configured, False otherwise.
+        All log messages are in English.
+        """
+        gpus = tf.config.list_physical_devices('GPU')
+        if not gpus:
+            logger.warning("No GPU devices detected. Training will run on CPU.")
+            return False
+
+        try:
+            for gpu in gpus:
+                # Prevent TensorFlow from pre-allocating all GPU memory
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.list_logical_devices('GPU')
+            logger.info(f"Detected {len(gpus)} physical GPU(s) and {len(logical_gpus)} logical GPU(s).")
+            return True
+        except RuntimeError as e:
+            # Happens if GPUs were already initialized when this code runs
+            logger.warning(f"Could not set memory growth for GPU(s) (they may already be initialized): {e}")
+            # We still return True because GPUs exist and TF will choose what it can
+            return True
+        
+    # ---------------------------
+    # Top-level: LOITERING vs TRANSSHIPMENT training
+    # ---------------------------
+    def train_loitering_transshipment_image_models(
+        dataset_dir: str = "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224",
+        models_dict: dict = None,
+        per_label_n: int = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        epochs: int = 20,
+        batch_size: int = 16,
+        learning_rate: float = 0.001,
+        callbacks_list: list = None,
+        experiment_name: str = None,
+        register_model_name: str = None
+    ):
+        """
+        Train models for LOITERING vs TRANSSHIPMENT; ensures all CSVs and MLflow logs include original class names.
+        """
+        # defensive GPU configuration
+        try:
+            use_gpu = TrainModelService._configure_gpu_defensively()
+        except Exception as e:
+            logger.warning("GPU configuration helper failed; falling back to CPU. Error: %s", e)
+            use_gpu = False
+
+        device = "/GPU:0" if use_gpu else "/CPU:0"
+        # small debug log in English immediately after GPU configuration
+        try:
+            logger.info("tf.config.list_physical_devices('GPU') -> %s; chosen device -> %s", tf.config.list_physical_devices('GPU'), device)
+        except Exception:
+            logger.info("Could not list physical devices; chosen device -> %s", device)
+
+        base = pathlib.Path(dataset_dir)
+        logger.info("Debug: pathing dataset_dir=%s", dataset_dir)
+        labels = ["LOITERING", "TRANSSHIPMENT"]
+        rows = []
+        for lab in labels:
+            d = os.path.join(base, lab)
+            logger.info("Debug: processing label=%s at dir=%s", lab, d)
+            if os.path.isdir(d):
+                for fname in os.listdir(d):
+                    p = os.path.join(d, fname)
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in [".png", ".jpg", ".jpeg"] and os.path.isfile(p):
+                        rows.append({"path": os.path.abspath(p), "label": lab})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"error": "No images found under dataset_dir for desired labels."}
+
+        # Determine how many per label to use
+        counts = df["label"].value_counts().to_dict()
+        min_count = min(counts.values())
+        if per_label_n is None:
+            per_label_n = min_count
+        else:
+            per_label_n = min(per_label_n, min_count)
+
+        sampled_parts = []
+        for lab in labels:
+            sub = df[df["label"] == lab]
+            if sub.shape[0] == 0:
+                return {"error": f"No images for label {lab}"}
+            sampled_parts.append(sub.sample(n=per_label_n, random_state=int(random_state)))
+        df_sampled = pd.concat(sampled_parts).reset_index(drop=True)
+
+        # Stratified split
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        X = df_sampled["path"].values
+        y = df_sampled["label"].values
+        train_idx, test_idx = next(sss.split(X, y))
+        X_train_paths, X_test_paths = X[train_idx].tolist(), X[test_idx].tolist()
+        y_train_labels, y_test_labels = y[train_idx].tolist(), y[test_idx].tolist()
+
+        # Label encoder fit on original labels (ensures inverse_transform returns original names)
+        le = LabelEncoder().fit(labels)
+        y_train_int = le.transform(y_train_labels)
+        y_test_int = le.transform(y_test_labels)
+
+        results = {}
+        for model_name, base_model in (models_dict or {}).items():
+            logger.info("Training image model: %s", model_name)
+            out_dir = os.path.join("artifacts", "image_models", model_name)
+            # run training under preferred device context
+            try:
+                with tf.device(device):
+                    res = TrainModelService._train_and_log_keras_model_with_classnames(
+                        base_model=base_model,
+                        model_name=model_name,
+                        X_train_paths=X_train_paths,
+                        y_train_int=y_train_int,
+                        X_test_paths=X_test_paths,
+                        y_test_int=y_test_int,
+                        label_encoder=le,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        learning_rate=learning_rate,
+                        callbacks_list=callbacks_list,
+                        experiment_name=experiment_name,
+                        register_model_name=register_model_name,
+                        out_dir=out_dir
+                    )
+            except Exception as e:
+                # If explicit device placement fails for any reason, fall back to calling without device context
+                logger.warning("Device context failed for model %s with device %s, falling back to default device. Error: %s", model_name, device, str(e))
+                res = TrainModelService._train_and_log_keras_model_with_classnames(
+                    base_model=base_model,
+                    model_name=model_name,
+                    X_train_paths=X_train_paths,
+                    y_train_int=y_train_int,
+                    X_test_paths=X_test_paths,
+                    y_test_int=y_test_int,
+                    label_encoder=le,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    callbacks_list=callbacks_list,
+                    experiment_name=experiment_name,
+                    register_model_name=register_model_name,
+                    out_dir=out_dir
+                )
+            results[model_name] = res
+        return results
+
+
+    # ---------------------------
+    # Top-level: LOITERING vs STOPPING training
+    # ---------------------------
+    def train_loitering_stopping_image_models(
+        dataset_dir: str = "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224",
+        models_dict: dict = None,
+        per_label_n: int = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        **kwargs
+    ):
+        # defensive GPU configuration
+        try:
+            use_gpu = TrainModelService._configure_gpu_defensively()
+        except Exception as e:
+            logger.warning("GPU configuration helper failed; falling back to CPU. Error: %s", e)
+            use_gpu = False
+
+        device = "/GPU:0" if use_gpu else "/CPU:0"
+        # small debug log in English immediately after GPU configuration
+        try:
+            logger.info("tf.config.list_physical_devices('GPU') -> %s; chosen device -> %s", tf.config.list_physical_devices('GPU'), device)
+        except Exception:
+            logger.info("Could not list physical devices; chosen device -> %s", device)
+
+        # identical pipeline but labels ["LOITERING", "STOPPING"]
+        base = pathlib.Path(dataset_dir)
+        logger.info("Debug: pathing dataset_dir=%s", dataset_dir)
+        labels = ["LOITERING", "STOPPING"]
+        rows = []
+        for lab in labels:
+            d = os.path.join(base, lab)
+            logger.info("Debug: processing label=%s at dir=%s", lab, d)
+            if os.path.isdir(d):
+                for fname in os.listdir(d):
+                    p = os.path.join(d, fname)
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in [".png", ".jpg", ".jpeg"] and os.path.isfile(p):
+                        rows.append({"path": os.path.abspath(p), "label": lab})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"error": "No images found under dataset_dir for desired labels."}
+
+        counts = df["label"].value_counts().to_dict()
+        min_count = min(counts.values())
+        if per_label_n is None:
+            per_label_n = min_count
+        else:
+            per_label_n = min(per_label_n, min_count)
+
+        sampled_parts = []
+        for lab in labels:
+            sub = df[df["label"] == lab]
+            if sub.shape[0] == 0:
+                return {"error": f"No images for label {lab}"}
+            sampled_parts.append(sub.sample(n=per_label_n, random_state=int(random_state)))
+        df_sampled = pd.concat(sampled_parts).reset_index(drop=True)
+
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        X = df_sampled["path"].values
+        y = df_sampled["label"].values
+        train_idx, test_idx = next(sss.split(X, y))
+        X_train_paths, X_test_paths = X[train_idx].tolist(), X[test_idx].tolist()
+        y_train_labels, y_test_labels = y[train_idx].tolist(), y[test_idx].tolist()
+
+        le = LabelEncoder().fit(labels)
+        y_train_int = le.transform(y_train_labels)
+        y_test_int = le.transform(y_test_labels)
+
+        results = {}
+        for model_name, base_model in (models_dict or {}).items():
+            logger.info("Training image model: %s", model_name)
+            out_dir = os.path.join("artifacts", "image_models", model_name)
+            try:
+                with tf.device(device):
+                    res = _train_and_log_keras_model_with_classnames(
+                        base_model=base_model,
+                        model_name=model_name,
+                        X_train_paths=X_train_paths,
+                        y_train_int=y_train_int,
+                        X_test_paths=X_test_paths,
+                        y_test_int=y_test_int,
+                        label_encoder=le,
+                        epochs=kwargs.get("epochs", 20),
+                        batch_size=kwargs.get("batch_size", 16),
+                        learning_rate=kwargs.get("learning_rate", 0.001),
+                        callbacks_list=kwargs.get("callbacks_list", None),
+                        experiment_name=kwargs.get("experiment_name", None),
+                        register_model_name=kwargs.get("register_model_name", None),
+                        out_dir=out_dir
+                    )
+            except Exception as e:
+                logger.warning("Device context failed for model %s with device %s, falling back to default device. Error: %s", model_name, device, str(e))
+                res = _train_and_log_keras_model_with_classnames(
+                    base_model=base_model,
+                    model_name=model_name,
+                    X_train_paths=X_train_paths,
+                    y_train_int=y_train_int,
+                    X_test_paths=X_test_paths,
+                    y_test_int=y_test_int,
+                    label_encoder=le,
+                    epochs=kwargs.get("epochs", 20),
+                    batch_size=kwargs.get("batch_size", 16),
+                    learning_rate=kwargs.get("learning_rate", 0.001),
+                    callbacks_list=kwargs.get("callbacks_list", None),
+                    experiment_name=kwargs.get("experiment_name", None),
+                    register_model_name=kwargs.get("register_model_name", None),
+                    out_dir=out_dir
+                )
+            results[model_name] = res
+        return results
+
+
+    # ---------------------------
+    # Top-level: Multi-class training for all allowed labels
+    # ---------------------------
+    def train_all_behavior_types_image_models(
+        dataset_dir: str = "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224",
+        models_dict: dict = None,
+        allowed_labels: list = None,
+        per_label_n: int = None,
+        test_size: float = 0.2,
+        random_state: int = 42,
+        **kwargs
+    ):
+        """
+        Train models for all provided allowed_labels (e.g. ["LOITERING","NORMAL","STOPPING","TRANSSHIPMENT"]).
+        Ensures CSVs and MLflow use original class names.
+        """
+        # defensive GPU configuration
+        try:
+            use_gpu = TrainModelService._configure_gpu_defensively()
+        except Exception as e:
+            logger.warning("GPU configuration helper failed; falling back to CPU. Error: %s", e)
+            use_gpu = False
+
+        device = "/GPU:0" if use_gpu else "/CPU:0"
+        # small debug log in English immediately after GPU configuration
+        try:
+            logger.info("tf.config.list_physical_devices('GPU') -> %s; chosen device -> %s", tf.config.list_physical_devices('GPU'), device)
+        except Exception:
+            logger.info("Could not list physical devices; chosen device -> %s", device)
+
+        if allowed_labels is None:
+            allowed_labels = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+
+        base = pathlib.Path(dataset_dir)
+        logger.info("Debug: pathing dataset_dir=%s", dataset_dir)
+        labels = allowed_labels
+        rows = []
+        for lab in labels:
+            d = os.path.join(base, lab)
+            logger.info("Debug: processing label=%s at dir=%s", lab, d)
+            if os.path.isdir(d):
+                for fname in os.listdir(d):
+                    p = os.path.join(d, fname)
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in [".png", ".jpg", ".jpeg"] and os.path.isfile(p):
+                        rows.append({"path": os.path.abspath(p), "label": lab})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"error": "No images found under dataset_dir for desired labels."}
+
+        counts = df["label"].value_counts().to_dict()
+        min_count = min(counts.values())
+        if per_label_n is None:
+            per_label_n = min_count
+        else:
+            per_label_n = min(per_label_n, min_count)
+
+        sampled_parts = []
+        for lab in labels:
+            sub = df[df["label"] == lab]
+            if sub.shape[0] == 0:
+                return {"error": f"No images for label {lab}"}
+            sampled_parts.append(sub.sample(n=per_label_n, random_state=int(random_state)))
+        df_sampled = pd.concat(sampled_parts).reset_index(drop=True)
+
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=float(test_size), random_state=int(random_state))
+        X = df_sampled["path"].values
+        y = df_sampled["label"].values
+        train_idx, test_idx = next(sss.split(X, y))
+        X_train_paths, X_test_paths = X[train_idx].tolist(), X[test_idx].tolist()
+        y_train_labels, y_test_labels = y[train_idx].tolist(), y[test_idx].tolist()
+
+        le = LabelEncoder().fit(labels)
+        y_train_int = le.transform(y_train_labels)
+        y_test_int = le.transform(y_test_labels)
+
+        results = {}
+        for model_name, base_model in (models_dict or {}).items():
+            logger.info("Training image model: %s", model_name)
+            out_dir = os.path.join("artifacts", "image_models", model_name)
+            try:
+                with tf.device(device):
+                    res = _train_and_log_keras_model_with_classnames(
+                        base_model=base_model,
+                        model_name=model_name,
+                        X_train_paths=X_train_paths,
+                        y_train_int=y_train_int,
+                        X_test_paths=X_test_paths,
+                        y_test_int=y_test_int,
+                        label_encoder=le,
+                        epochs=kwargs.get("epochs", 20),
+                        batch_size=kwargs.get("batch_size", 16),
+                        learning_rate=kwargs.get("learning_rate", 0.001),
+                        callbacks_list=kwargs.get("callbacks_list", None),
+                        experiment_name=kwargs.get("experiment_name", None),
+                        register_model_name=kwargs.get("register_model_name", None),
+                        out_dir=out_dir
+                    )
+            except Exception as e:
+                logger.warning("Device context failed for model %s with device %s, falling back to default device. Error: %s", model_name, device, str(e))
+                res = _train_and_log_keras_model_with_classnames(
+                    base_model=base_model,
+                    model_name=model_name,
+                    X_train_paths=X_train_paths,
+                    y_train_int=y_train_int,
+                    X_test_paths=X_test_paths,
+                    y_test_int=y_test_int,
+                    label_encoder=le,
+                    epochs=kwargs.get("epochs", 20),
+                    batch_size=kwargs.get("batch_size", 16),
+                    learning_rate=kwargs.get("learning_rate", 0.001),
+                    callbacks_list=kwargs.get("callbacks_list", None),
+                    experiment_name=kwargs.get("experiment_name", None),
+                    register_model_name=kwargs.get("register_model_name", None),
+                    out_dir=out_dir
+                )
+            results[model_name] = res
+        return results

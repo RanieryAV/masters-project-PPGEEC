@@ -12,3 +12,4 @@ matplotlib==3.7.5
 folium==0.17.0
 pyspark==3.5.1
 psutil
+pillow

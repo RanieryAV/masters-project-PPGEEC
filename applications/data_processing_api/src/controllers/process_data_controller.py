@@ -834,8 +834,64 @@ def write_agg_Pitsikalis_2019_AIS_data_in_database():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@swag_from(path.join(path.dirname(__file__), '../docs/generate_image_trajectory_dataset_for_all_behavior_types.yml'))
+@preprocess_data_bp.route('/generate-image-trajectory-dataset-for-all-behavior-types', methods=['POST'])
+def generate_image_trajectory_dataset_for_all_behavior_types():
+    """
+    Generates grayscale image trajectory datasets (in .png format) for all behavior types using Spark.
+    The image resolutions used are 120x120, 128x128, 224x224, 256x256, 299x299, 384x384, 512x512, and 640x640 pixels.
+    The resulting grayscale images are saved in this structure:
+    - output_directory/
+        - image_resolution_120x120/
+            - behavior_type_1/
+                - image_1.png
+                - image_2.png
+                - ...
+            - behavior_type_2/
+                - image_1.png
+                - image_2.png
+                - ...
+            - ...
+        - ...
+    Returns:
+        Flask Response: JSON object with status and message indicating success or failure.
+    """
+    logger.info("Received request at /generate-image-trajectory-dataset-for-all-behavior-types")
 
+    behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
 
+    try:
+        spark = SparkSessionInitializer.init_spark_session("Generate_Image_Trajectory_Dataset_[Data_Processing_API]")
+
+        is_container = ProcessDataService._is_running_in_container()
+
+        if is_container:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
+
+        output_dir = os.path.join(base_output_dir, "image_trajectory_datasets_all_behavior_types")
+
+        ProcessDataService.generate_image_trajectory_dataset_for_all_behavior_types_with_spark(
+            spark=spark,
+            output_dir=output_dir,
+            behavior_types_to_generate_dataset=behavior_types_to_generate_dataset,
+            max_rows_per_behavior=800
+        )
+
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "Image trajectory datasets for all behavior types generated and saved.",
+            "output_path": output_dir
+        }), 200
+
+    except Exception as e:
+        logger.error("Error generating image trajectory datasets", exc_info=True)
+        traceback_str = traceback.format_exc()
+        return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
 
     
 # @swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED.yml'))
