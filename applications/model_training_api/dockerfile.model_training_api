@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     libffi-dev \
-    openjdk-21-jdk && \
+    openjdk-21-jdk \
+    cuda-nvcc-11-8 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
@@ -34,6 +35,7 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV TF_FORCE_GPU_ALLOW_GROWTH=true
+ENV XLA_FLAGS=--xla_gpu_cuda_data_dir=/usr/local/cuda
 
 WORKDIR /app
 

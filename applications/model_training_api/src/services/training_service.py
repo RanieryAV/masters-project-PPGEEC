@@ -3125,7 +3125,7 @@ Notes:
     # ---------------------------
     # Helper: build tf.data dataset returning (image, label_int)
     # ---------------------------
-    def _build_tf_dataset(filepaths, labels, preprocess_fn, img_size=(224, 224), batch_size=16, shuffle=True):
+    def _build_tf_dataset(filepaths, labels, preprocess_fn, img_size=(120, 120), batch_size=16, shuffle=True):
         AUTOTUNE = tf.data.AUTOTUNE
 
         filepaths = list(filepaths)
@@ -3171,167 +3171,179 @@ Notes:
         num_classes = len(label_encoder.classes_)
         preprocess_fn = TrainModelService._get_preprocess_fn_for_model(model_name)
 
-        # Datasets (labels remain integer indices that map to original class names via label_encoder)
-        train_ds = TrainModelService._build_tf_dataset(X_train_paths, y_train_int, preprocess_fn, img_size=(224, 224), batch_size=batch_size, shuffle=True)
-        test_ds = TrainModelService._build_tf_dataset(X_test_paths, y_test_int, preprocess_fn, img_size=(224, 224), batch_size=batch_size, shuffle=False)   
-        # Build model (attach pooling + softmax)
-        base_model.trainable = True
-        inputs = tf.keras.Input(shape=(224, 224, 3))
+        # Build datasets
+        train_ds = TrainModelService._build_tf_dataset(
+            X_train_paths, y_train_int, preprocess_fn,
+            img_size=(120, 120), batch_size=batch_size, shuffle=True
+        )
+        test_ds = TrainModelService._build_tf_dataset(
+            X_test_paths, y_test_int, preprocess_fn,
+            img_size=(120, 120), batch_size=batch_size, shuffle=False
+        )
+
+        # ----------------------------
+        # Model architecture
+        # ----------------------------
+        base_model.trainable = False  # Phase 1: freeze backbone
+
+        inputs = tf.keras.Input(shape=(120, 120, 3))
         x = base_model(inputs, training=False)
         x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="predictions")(x)
-        model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f"{model_name}_full")
+        x = tf.keras.layers.Dense(256, activation="relu")(x)
+        x = tf.keras.layers.Dropout(0.5)(x)
+        outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+        model = tf.keras.Model(inputs, outputs, name=f"{model_name}_full")
 
-        optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-        loss = SparseCategoricalCrossentropy()
-        metrics = [SparseCategoricalAccuracy()]
-        model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-
+        # ----------------------------
         # Callbacks
-        cb = callbacks_list[:] if callbacks_list else []
-        # provide sensible defaults if nothing passed
-        if not callbacks_list:
-            cb = [EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
-                ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=2)]
+        # ----------------------------
+        cb = callbacks_list[:] if callbacks_list else [
+            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=2),
+        ]
         csv_log_path = os.path.join(out_dir, f"{model_name}_epoch_history.csv")
-        cb.append(CSVLogger(csv_log_path))
+        cb.append(tf.keras.callbacks.CSVLogger(csv_log_path))
 
-        # Start MLflow run
+        # ----------------------------
+        # MLflow setup
+        # ----------------------------
         mlflow.set_experiment(experiment_name or f"image_training_{model_name}")
-        # Try to ensure nested runs behave as your environment expects - keep same approach as your repo
         with mlflow.start_run(run_name=f"{model_name}_train_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"):
-            # log params
+
             mlflow.log_param("model_base", model_name)
             mlflow.log_param("num_classes", num_classes)
             mlflow.log_param("epochs", epochs)
             mlflow.log_param("batch_size", batch_size)
-            mlflow.log_param("learning_rate", learning_rate)
 
-            # Train (use test_ds as validation so Keras shows val metrics)
-            history = model.fit(
+            # ----------------------------
+            # Phase 1 — train head only
+            # ----------------------------
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+                loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+            )
+
+            history_phase1 = model.fit(
+                train_ds,
+                epochs=max(3, epochs // 4),
+                validation_data=test_ds,
+                callbacks=cb,
+                verbose=1,
+            )
+
+            # ----------------------------
+            # Phase 2 — fine-tune top backbone layers
+            # ----------------------------
+            base_model.trainable = True
+            for layer in base_model.layers[:-20]:
+                layer.trainable = False
+
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+                loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+            )
+
+            history_phase2 = model.fit(
                 train_ds,
                 epochs=epochs,
                 validation_data=test_ds,
                 callbacks=cb,
-                verbose=1
+                verbose=1,
             )
 
-            # Evaluate on test set
+            # ----------------------------
+            # Merge histories
+            # ----------------------------
+            history = {}
+            for k in history_phase1.history:
+                history[k] = history_phase1.history[k] + history_phase2.history.get(k, [])
+
+            # ----------------------------
+            # Evaluation
+            # ----------------------------
             eval_res = model.evaluate(test_ds, verbose=1)
-            # Typically eval_res = [loss, sparse_categorical_accuracy]
             mlflow.log_metric("test_loss", float(eval_res[0]))
-            # Save accuracy metric with clear name
             if len(eval_res) >= 2:
                 mlflow.log_metric("test_sparse_categorical_accuracy", float(eval_res[1]))
 
-            # Predictions & y_true collection
-            y_true = []
-            y_pred = []
-            for batch_images, batch_labels in test_ds:
-                preds = model.predict(batch_images)
-                pred_ints = np.argmax(preds, axis=1)
-                y_pred.extend(pred_ints.tolist())
-                y_true.extend([int(x) for x in batch_labels.numpy().tolist()])
+            # ----------------------------
+            # Predictions
+            # ----------------------------
+            y_true, y_pred = [], []
+            for imgs, labels in test_ds:
+                preds = model.predict(imgs)
+                y_pred.extend(np.argmax(preds, axis=1).tolist())
+                y_true.extend(labels.numpy().tolist())
 
             y_true = np.array(y_true, dtype=int)
             y_pred = np.array(y_pred, dtype=int)
 
-            # Confusion matrix (use original class names in CSV)
             cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
             cm_csv = os.path.join(out_dir, f"{model_name}_confusion_matrix.csv")
             with open(cm_csv, "w", newline="") as fh:
                 writer = csv.writer(fh)
-                header = [""] + list(label_encoder.classes_)
-                writer.writerow(header)
+                writer.writerow([""] + list(label_encoder.classes_))
                 for i, row in enumerate(cm):
                     writer.writerow([label_encoder.classes_[i]] + row.tolist())
 
-            # Optional PNG plot using seaborn if available (also saved)
-            cm_png = os.path.join(out_dir, f"{model_name}_confusion_matrix.png")
-            if _HAS_PLOTTING:
-                try:
-                    fig, ax = plt.subplots(figsize=(6, 6))
-                    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
-                                xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
-                    ax.set_xlabel("Predicted")
-                    ax.set_ylabel("True")
-                    fig.savefig(cm_png, bbox_inches="tight")
-                    plt.close(fig)
-                except Exception:
-                    logger.exception("Failed plotting confusion matrix PNG for %s", model_name)
+            precision, recall, f1, support = precision_recall_fscore_support(
+                y_true, y_pred, labels=list(range(num_classes)), zero_division=0
+            )
 
-            # Per-class precision/recall/f1 support (use original class names when writing CSV and logging to MLflow)
-            precision, recall, f1, support = precision_recall_fscore_support(y_true, y_pred, labels=list(range(num_classes)), zero_division=0)
             per_class_csv = os.path.join(out_dir, f"{model_name}_per_class_metrics.csv")
             with open(per_class_csv, "w", newline="") as fh:
                 writer = csv.writer(fh)
                 writer.writerow(["class_name", "precision", "recall", "f1", "support"])
-                for i, class_name in enumerate(label_encoder.classes_):
-                    writer.writerow([class_name, float(precision[i]), float(recall[i]), float(f1[i]), int(support[i])])
+                for i, name in enumerate(label_encoder.classes_):
+                    writer.writerow([name, float(precision[i]), float(recall[i]), float(f1[i]), int(support[i])])
 
-            # Log per-class metrics to MLflow using class names in metric keys
-            for i, class_name in enumerate(label_encoder.classes_):
-                mlflow.log_metric(f"precision_{class_name}", float(precision[i]))
-                mlflow.log_metric(f"recall_{class_name}", float(recall[i]))
-                mlflow.log_metric(f"f1_{class_name}", float(f1[i]))
-                mlflow.log_metric(f"support_{class_name}", int(support[i]))
+            for i, name in enumerate(label_encoder.classes_):
+                mlflow.log_metric(f"precision_{name}", float(precision[i]))
+                mlflow.log_metric(f"recall_{name}", float(recall[i]))
+                mlflow.log_metric(f"f1_{name}", float(f1[i]))
+                mlflow.log_metric(f"support_{name}", int(support[i]))
 
-            # Save epoch history CSV that was produced by CSVLogger; ensure we also include a header with class list for clarity
-            # We'll augment the CSV with a short metadata file listing the class names for human readers
             classes_meta = os.path.join(out_dir, f"{model_name}_class_names.txt")
             with open(classes_meta, "w") as fh:
                 fh.write("\n".join(label_encoder.classes_))
 
-            # Save history to our own CSV too (with the exact keys)
             metrics_csv = os.path.join(out_dir, f"{model_name}_metrics_per_epoch.csv")
             with open(metrics_csv, "w", newline="") as fh:
                 writer = csv.writer(fh)
-                # header contains epoch + all history keys
-                header = ["epoch"] + list(history.history.keys())
+                header = ["epoch"] + list(history.keys())
                 writer.writerow(header)
-                n_epochs_recorded = len(history.history[next(iter(history.history))])
-                for e in range(n_epochs_recorded):
-                    row = [e + 1] + [history.history[k][e] for k in header[1:]]
-                    writer.writerow(row)
+                n = len(next(iter(history.values())))
+                for e in range(n):
+                    writer.writerow([e + 1] + [history[k][e] for k in history])
 
-            # Log artifacts to MLflow (confusion matrix CSV + PNG, per-class CSV, epoch metrics CSV, class names text)
             try:
-                mlflow.log_artifact(cm_csv, artifact_path="confusion_matrix")
-                if os.path.exists(cm_png):
-                    mlflow.log_artifact(cm_png, artifact_path="confusion_matrix")
-                mlflow.log_artifact(per_class_csv, artifact_path="per_class_metrics")
-                mlflow.log_artifact(metrics_csv, artifact_path="metrics")
-                mlflow.log_artifact(classes_meta, artifact_path="metadata")
-            except Exception:
-                logger.exception("Failed to log artifacts for %s", model_name)
-
-            # Save Keras model to MLflow
-            try:
+                mlflow.log_artifact(cm_csv, "confusion_matrix")
+                mlflow.log_artifact(per_class_csv, "per_class_metrics")
+                mlflow.log_artifact(metrics_csv, "metrics")
+                mlflow.log_artifact(classes_meta, "metadata")
                 mlflow.keras.log_model(model, artifact_path="model")
             except Exception:
-                logger.exception("Failed to log Keras model to MLflow for %s", model_name)
+                logger.exception("Failed to log artifacts or model for %s", model_name)
 
-            # optional registry register
             if register_model_name:
                 try:
                     run_id = mlflow.active_run().info.run_id
-                    # The repository may have a helper to register; keep your project's pattern if available.
-                    # Example: TrainModelService.mlflow_register_model(run_id, "model", f"{register_model_name}_{model_name}")
                 except Exception:
-                    logger.exception("Failed registering model to MLflow registry for %s", model_name)
+                    logger.exception("Failed registering model for %s", model_name)
 
-        # Return structured result
         return {
-            "history": history.history,
+            "history": history,
             "confusion_matrix": cm,
             "per_class_metrics": {
                 "class_names": list(label_encoder.classes_),
                 "precision": precision.tolist(),
                 "recall": recall.tolist(),
                 "f1": f1.tolist(),
-                "support": support.tolist()
+                "support": support.tolist(),
             },
-            "eval": eval_res
+            "eval": eval_res,
         }
 
     # ---------------------------
@@ -3520,6 +3532,20 @@ Notes:
             # We still return True because GPUs exist and TF will choose what it can
             return True
         
+    def make_json_safe(obj):
+        if isinstance(obj, dict):
+            return {k: TrainModelService.make_json_safe(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [TrainModelService.make_json_safe(v) for v in obj]
+        elif hasattr(obj, "tolist"):  # numpy arrays
+            return obj.tolist()
+        elif isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        else:
+            return obj
+    
     # ---------------------------
     # Top-level: LOITERING vs TRANSSHIPMENT training
     # ---------------------------

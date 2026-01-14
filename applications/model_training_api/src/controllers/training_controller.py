@@ -9,28 +9,28 @@ from ..services.training_service import TrainModelService
 import tensorflow as tf
 
 models_dict = {
-    'mobileNet_model': tf.keras.applications.MobileNet(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'mobileNetV2_model': tf.keras.applications.MobileNetV2(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'mobileNetV3Small_model': tf.keras.applications.MobileNetV3Small(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'mobileNetV3Large_model': tf.keras.applications.MobileNetV3Large(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'efficientNetB0_model': tf.keras.applications.EfficientNetB0(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    #'denseNet121_model': tf.keras.applications.DenseNet121(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'xception_model': tf.keras.applications.Xception(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    'vgg16_model': tf.keras.applications.VGG16(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    #'resNet152V2_model': tf.keras.applications.ResNet152V2(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
+    'mobileNet_model': tf.keras.applications.MobileNet(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'mobileNetV2_model': tf.keras.applications.MobileNetV2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'mobileNetV3Small_model': tf.keras.applications.MobileNetV3Small(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'mobileNetV3Large_model': tf.keras.applications.MobileNetV3Large(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'efficientNetB0_model': tf.keras.applications.EfficientNetB0(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'denseNet121_model': tf.keras.applications.DenseNet121(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'xception_model': tf.keras.applications.Xception(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'vgg16_model': tf.keras.applications.VGG16(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'resNet152V2_model': tf.keras.applications.ResNet152V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
     # More model options for quick testing
-    # 'resNet50_model': tf.keras.applications.ResNet50(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'inceptionV3_model': tf.keras.applications.InceptionV3(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'resNet101_model': tf.keras.applications.ResNet101(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'resNet152_model': tf.keras.applications.ResNet152(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'resNet50V2_model': tf.keras.applications.ResNet50V2(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'resNet101V2_model': tf.keras.applications.ResNet101V2(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'inceptionResNetV2_model': tf.keras.applications.InceptionResNetV2(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'vgg19_model': tf.keras.applications.VGG19(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'denseNet169_model': tf.keras.applications.DenseNet169(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'denseNet201_model': tf.keras.applications.DenseNet201(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'nasNetLarge_model': tf.keras.applications.NASNetLarge(input_shape=(224, 224, 3), include_top=False, weights='imagenet'),
-    # 'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
+    # 'resNet50_model': tf.keras.applications.ResNet50(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'inceptionV3_model': tf.keras.applications.InceptionV3(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'resNet101_model': tf.keras.applications.ResNet101(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'resNet152_model': tf.keras.applications.ResNet152(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'resNet50V2_model': tf.keras.applications.ResNet50V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'resNet101V2_model': tf.keras.applications.ResNet101V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'inceptionResNetV2_model': tf.keras.applications.InceptionResNetV2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'vgg19_model': tf.keras.applications.VGG19(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'denseNet169_model': tf.keras.applications.DenseNet169(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'denseNet201_model': tf.keras.applications.DenseNet201(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'nasNetLarge_model': tf.keras.applications.NASNetLarge(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
 }
 
 training_bp = Blueprint('model_controller', __name__, url_prefix='/models')
@@ -348,8 +348,10 @@ def train_loitering_transshipment_image_models_controller():
                 test_size=test_size
             )
 
-        logging.info("Training result: %s", result)
-        return jsonify({"message": "Image models trained and logged in MLflow", "details": result}), 200
+            safe_result = TrainModelService.make_json_safe(result)
+
+        logging.info("Training result: %s", safe_result)
+        return jsonify({"message": "Image models trained and logged in MLflow", "details": safe_result}), 200
 
     except Exception as e:
         logging.exception("Exception occurred in controller /train_loitering_transshipment_image_models")
@@ -376,8 +378,10 @@ def train_loitering_stopping_image_models_controller():
                 test_size=test_size
             )
 
-        logging.info("Training result: %s", result)
-        return jsonify({"message": "Image models trained and logged in MLflow", "details": result}), 200
+            safe_result = TrainModelService.make_json_safe(result)
+
+        logging.info("Training result: %s", safe_result)
+        return jsonify({"message": "Image models trained and logged in MLflow", "details": safe_result}), 200
 
     except Exception as e:
         logging.exception("Exception occurred in controller /train_loitering_stopping_image_models")
@@ -405,8 +409,10 @@ def train_all_behavior_types_image_models_controller():
                 test_size=test_size
             )
 
-        logging.info("Training result: %s", result)
-        return jsonify({"message": "Image models trained and logged in MLflow", "details": result}), 200
+            safe_result = TrainModelService.make_json_safe(result)
+
+        logging.info("Training result: %s", safe_result)
+        return jsonify({"message": "Image models trained and logged in MLflow", "details": safe_result}), 200
 
     except Exception as e:
         logging.exception("Exception occurred in controller /train_all_behavior_types_image_models")
