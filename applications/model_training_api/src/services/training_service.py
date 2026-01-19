@@ -3159,7 +3159,7 @@ Notes:
         X_train_paths, y_train_int,
         X_test_paths, y_test_int,
         label_encoder: LabelEncoder,
-        epochs=20,
+        epochs=100,
         batch_size=16,
         learning_rate=0.001,
         callbacks_list=None,
@@ -3184,7 +3184,7 @@ Notes:
         # ----------------------------
         # Model architecture
         # ----------------------------
-        base_model.trainable = False  # Phase 1: freeze backbone
+        base_model.trainable = False
 
         inputs = tf.keras.Input(shape=(120, 120, 3))
         x = base_model(inputs, training=False)
@@ -3198,8 +3198,8 @@ Notes:
         # Callbacks
         # ----------------------------
         cb = callbacks_list[:] if callbacks_list else [
-            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=2),
+            tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=5),
         ]
         csv_log_path = os.path.join(out_dir, f"{model_name}_epoch_history.csv")
         cb.append(tf.keras.callbacks.CSVLogger(csv_log_path))
@@ -3216,7 +3216,7 @@ Notes:
             mlflow.log_param("batch_size", batch_size)
 
             # ----------------------------
-            # Phase 1 — train head only
+            # Phase 1
             # ----------------------------
             model.compile(
                 optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
@@ -3233,7 +3233,7 @@ Notes:
             )
 
             # ----------------------------
-            # Phase 2 — fine-tune top backbone layers
+            # Phase 2
             # ----------------------------
             base_model.trainable = True
             for layer in base_model.layers[:-20]:
@@ -3304,6 +3304,28 @@ Notes:
                 mlflow.log_metric(f"recall_{name}", float(recall[i]))
                 mlflow.log_metric(f"f1_{name}", float(f1[i]))
                 mlflow.log_metric(f"support_{name}", int(support[i]))
+
+            # ----------------------------
+            # Confusion matrix plot (same folder as CSV)
+            # ----------------------------
+            report = {
+                "confusion_matrix": cm.tolist(),
+                "labels": list(label_encoder.classes_),
+                "per_class": {
+                    label_encoder.classes_[i]: {
+                        "precision": float(precision[i]),
+                        "recall": float(recall[i]),
+                        "f1": float(f1[i]),
+                        "support": int(support[i]),
+                    }
+                    for i in range(num_classes)
+                },  
+            }
+
+            TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(
+                report=report,
+                artifact_dir=out_dir
+            )
 
             classes_meta = os.path.join(out_dir, f"{model_name}_class_names.txt")
             with open(classes_meta, "w") as fh:
@@ -3485,7 +3507,7 @@ Notes:
         for model_name, base_model in (models_dict or {}).items():
             logger.info("Training image model: %s", model_name)
             out_dir = os.path.join("artifacts", "image_models", model_name)
-            res = _train_and_log_keras_model_with_classnames(
+            res = TrainModelService._train_and_log_keras_model_with_classnames(
                 base_model=base_model,
                 model_name=model_name,
                 X_train_paths=X_train_paths,
@@ -3532,6 +3554,7 @@ Notes:
             # We still return True because GPUs exist and TF will choose what it can
             return True
         
+    @staticmethod
     def make_json_safe(obj):
         if isinstance(obj, dict):
             return {k: TrainModelService.make_json_safe(v) for k, v in obj.items()}

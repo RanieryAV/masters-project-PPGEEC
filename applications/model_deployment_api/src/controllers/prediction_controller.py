@@ -52,8 +52,8 @@ def apply_loitering_equation_to_AIS_trajectories():
         logger.info("WARNING: Successfully received response from sliding window extraction!!!")
 
         # Test the loitering classification function
-        logger.info("Calling 'classify_trajectory_with_loitering_equation_Zhang_2022'...")
-        trajectories_processed_by_the_loitering_equation = PredictionService.classify_trajectory_with_loitering_equation_Zhang_2022(response_data)
+        logger.info("Calling 'classify_trajectory_with_loitering_equation_Wijaya_Nakamura_2022'...")
+        trajectories_processed_by_the_loitering_equation = PredictionService.classify_trajectory_with_loitering_equation_Wijaya_Nakamura_2022(response_data)
 
         # Show first rows of the response data (a Spark Dataframe) for debugging
         sample_first_row = trajectories_processed_by_the_loitering_equation.orderBy("window_index").limit(1).collect()

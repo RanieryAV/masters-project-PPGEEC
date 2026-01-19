@@ -18,7 +18,7 @@ parameters:
       properties:
         per_label_n:
           type: integer
-          example: 300
+          example: 800
         test_size:
           type: number
           format: float
@@ -47,10 +47,10 @@ parameters:
           example: 20000
         experiment_name:
           type: string
-          example: "RF_Loitering_vs_Stopping"
+          example: "RF_Loitering_vs_Transshipment"
         register_model_name:
           type: string
-          example: "rf_loitering_stopping"
+          example: "rf_loitering_transshipment"
 
 responses:
   200:
