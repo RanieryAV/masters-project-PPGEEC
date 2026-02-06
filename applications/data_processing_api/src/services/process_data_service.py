@@ -3594,6 +3594,129 @@ class ProcessDataService:
             logger.error(f"Error generating image trajectory datasets: {e}")
             raise
 
+    @staticmethod
+    def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
+        spark: SparkSession,
+        output_dir: str,
+        max_rows: Optional[int] = None
+    ):
+        """
+        Generates a CSV dataset for transshipment events with trajectory as image matrix data, COG/SOG arrays using Spark.
+        The output CSV will have columns:
+        ['id', 'event_index', 'trajectory_image_matrix', 'sog_array', 'cog_array']
+        
+        Args:
+            spark (SparkSession): The Spark session to use for processing.
+            output_dir (str): Directory where the resulting CSV dataset will be saved.
+            max_rows (Optional[int]): Maximum number of rows to process. If None, all rows are processed.
+        
+        Returns:
+            None: The function saves the resulting dataset to the specified output directory.
+        """
+        logger.info("generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark: start (max_rows=%s)", max_rows)
+        try:
+            # Load events from database or CSV
+            pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
+            pg_port = os.getenv("POSTGRES_PORT", "5432")
+            pg_db = os.getenv("POSTGRES_DB")
+            pg_user = os.getenv("POSTGRES_USER")
+            pg_pass = os.getenv("POSTGRES_PASSWORD")
+            ais_path = os.getenv("AIS_DATA_PATH", "./shared/utils/datasets/ais_data.csv")
+
+            if not (pg_db and pg_user and pg_pass):
+                raise ValueError("Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD).")
+
+            # Load transshipment events from database
+            jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+            schema = "captaima"
+            table = "events"
+
+            limit_clause = f" LIMIT {int(max_rows)}" if (max_rows is not None and int(max_rows) > 0) else ""
+            dbtable_subquery = (
+                f"(select event_index, t_start as T_start, t_end as T_end, category as Category, mmsi as MMSI, mmsi_2 as MMSI_2 "
+                f"from {schema}.{table} where category = 'TRANSSHIPMENT' {limit_clause}) as subq"
+            )
+
+            transshipment_events_df = (
+                spark.read
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", dbtable_subquery)
+                .option("user", pg_user)
+                .option("password", pg_pass)
+                .option("driver", "org.postgresql.Driver")
+                .option("fetchsize", "1000")
+                .load()
+            )
+
+            logger.info("Loaded transshipment events from database")
+
+            # Create aggregated DataFrame for transshipment events
+            aggregated_df = ProcessDataService.create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+                events_df=transshipment_events_df,
+                ais_path=ais_path,
+                spark=spark
+            )
+
+            # Select only required columns and generate trajectory as image matrix
+            def trajectory_to_image_matrix(trajectory_wkt):
+                """Convert trajectory WKT to grayscale image matrix (120x120) and return as string"""
+                try:
+                    coords = ProcessDataService._parse_linestring_wkt_to_coords(trajectory_wkt)
+                    if not coords or len(coords) == 0:
+                        return "[]"
+                    
+                    pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, 120, 120, pad_frac=0.03, upscale=4)
+                    W = 120 * upscale
+                    H = 120 * upscale
+
+                    img = Image.new("L", (W, H), 255)
+                    draw = ImageDraw.Draw(img)
+
+                    base_line_width = max(1, int(round(min(W, H) / 120.0)))
+                    if len(pixels) >= 2:
+                        draw.line(pixels, fill=0, width=base_line_width, joint="curve")
+                    else:
+                        x0, y0 = pixels[0]
+                        r = max(1, base_line_width * 2)
+                        draw.ellipse((x0-r, y0-r, x0+r, y0+r), fill=0)
+
+                    final_img = img.resize((120, 120), resample=Image.LANCZOS)
+                    matrix = list(final_img.getdata())
+                    return str(matrix)
+                except Exception as e:
+                    logger.warning(f"Failed to convert trajectory to image matrix: {e}")
+                    return "[]"
+
+            # Register UDF for trajectory to image matrix conversion
+            trajectory_to_matrix_udf = F.udf(trajectory_to_image_matrix, StringType())
+
+            # Select and transform columns
+            result_df = aggregated_df.select(
+                F.col("id"),
+                F.col("event_index"),
+                trajectory_to_matrix_udf(F.col("trajectory")).alias("trajectory_image_matrix"),
+                F.col("sog_array"),
+                F.col("cog_array")
+            )
+
+            # Save the resulting DataFrame to CSV
+            logger.info(f"Saving the resulting dataset to {output_dir}")
+            ProcessDataService.ensure_local_processed_dirs()
+            
+            ProcessDataService.save_spark_df_as_csv(
+                spark_df=result_df,
+                output_path=output_dir,
+                spark=spark,
+                allow_multiple_files=False
+            )
+
+            logger.info("generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark: finished")
+
+        except Exception as e:
+            logger.error(f"Error generating CSV dataset for transshipment events: {e}")
+            raise
+
     # def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
     #     events_df: DataFrame,
     #     ais_path: str,

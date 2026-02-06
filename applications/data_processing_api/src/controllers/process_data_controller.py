@@ -892,6 +892,49 @@ def generate_image_trajectory_dataset_for_all_behavior_types():
         logger.error("Error generating image trajectory datasets", exc_info=True)
         traceback_str = traceback.format_exc()
         return jsonify({"status": "error", "message": str(e), "traceback": traceback_str}), 500
+    
+@swag_from(path.join(path.dirname(__file__), '../docs/generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events.yml'))
+@preprocess_data_bp.route('/generate-csv-image-trajectory-and-cog-sog-timestamp-arrays-dataset-for-transshipment-events', methods=['POST'])
+def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events():
+    """
+    Generates a CSV dataset containing image trajectory arrays and corresponding COG/SOG/timestamp arrays for transshipment events.
+    The dataset is created using Spark and saved as a CSV file in the specified output directory.
+    Returns:
+        Flask Response: JSON object with status and message indicating success or failure, along with the output path of the generated CSV dataset.
+    """
+    logger.info("Received request at /generate-csv-image-trajectory-and-cog-sog-timestamp-arrays-dataset-for-transshipment-events")
+    try:
+        spark = SparkSessionInitializer.init_spark_session("Generate_CSV_Image_Trajectory_and_COG_SOG_Timestamp_Arrays_Dataset_[Data_Processing_API]")
+
+        is_container = ProcessDataService._is_running_in_container()
+
+        if is_container:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/app/processed_output")
+        else:
+            base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
+
+        output_dir = os.path.join(base_output_dir, "csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events")
+
+        ProcessDataService.generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
+            spark=spark,
+            output_dir=output_dir,
+            max_rows=1000
+        )
+
+        logger.info("Task finished. Stopping Spark session...")
+        spark.stop()
+
+        return jsonify({
+            "status": "success",
+            "message": "CSV dataset with image trajectory and COG/SOG/timestamp arrays for transshipment events generated and saved.",
+            "output_path": output_dir
+        }), 200
+
+    except Exception as e:
+        logger.error("Error generating CSV dataset with image trajectory and COG/SOG/timestamp arrays for transshipment events", exc_info=True)
+        traceback_str = traceback.format_exc()
+        return jsonify({"status": "error", "message": str(e), "traceback"
+                        : traceback_str}), 500
 
     
 # @swag_from(path.join(path.dirname(__file__), '../docs/process_Pitsikalis_2019_AIS_data_DEPRECATED_MUST_BE_SKIPPED.yml'))
