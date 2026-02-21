@@ -7,6 +7,12 @@ import socket
 import csv
 import gzip
 from typing import Optional
+from functools import reduce
+import gc
+
+import json
+import re
+from datetime import datetime
 
 from flask import Blueprint, request, jsonify, make_response
 from flasgger import swag_from
@@ -19,7 +25,7 @@ from pyspark.sql.types import (
     ArrayType, StructType, StructField, DoubleType, StringType, LongType, StructType, TimestampType, IntegerType
 )
 from pyspark.sql.window import Window
-from typing import Any, Tuple, List, Dict
+from typing import Any, Tuple, List, Dict, Optional
 
 # Image libs (Pillow). Shapely optional but recommended.
 try:
@@ -471,6 +477,9 @@ class ProcessDataService:
         # ----------------------------
         #  First: try the original fast path (either coalesced single-file or standard multi-file)
         # ----------------------------
+        # BEGIN MODIFICATION: ensure fast_exc is defined even if fast path does not throw
+        fast_exc = None
+        # END MODIFICATION
         try:
             if allow_multiple_files:
                 # Write multiple part-*.csv files (no coalesce) to avoid coalescing memory pressure,
@@ -634,7 +643,10 @@ class ProcessDataService:
                 logger.info("ATTENTION: Data saved successfully with correct file permissions (fast path).")
                 return
 
-        except Exception as fast_exc:
+        except Exception as fast_exc_local:
+            # BEGIN MODIFICATION: capture fast-path exception into stable variable for fallback logging
+            fast_exc = fast_exc_local
+            # END MODIFICATION
             logger.warning(
                 "Primary Spark write (allow_multiple_files=%s) failed for output_path=%s. Falling back to chunked driver streaming writer. Fast-path error: %s",
                 allow_multiple_files, output_path, fast_exc
@@ -692,6 +704,7 @@ class ProcessDataService:
                 output_path, fast_exc, fallback_exc
             )
             raise
+
 
     
     def save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
@@ -1868,7 +1881,7 @@ class ProcessDataService:
                         .option("user", pg_user)
                         .option("password", pg_pass)
                         .option("driver", "org.postgresql.Driver")
-                        .option("fetchsize", "1000")
+                        .option("fetchsize", "1000") # Reduce if OOM happens
                         .load()
                     )
                     row = bounds_df.limit(1).collect()
@@ -1899,7 +1912,7 @@ class ProcessDataService:
                             .option("user", pg_user)
                             .option("password", pg_pass)
                             .option("driver", "org.postgresql.Driver")
-                            .option("fetchsize", "1000")
+                            .option("fetchsize", "1000") # Reduce if OOM happens
                             .option("partitionColumn", "primary_key")
                             .option("lowerBound", str(min_int))
                             .option("upperBound", str(max_int))
@@ -1916,7 +1929,7 @@ class ProcessDataService:
                             .option("user", pg_user)
                             .option("password", pg_pass)
                             .option("driver", "org.postgresql.Driver")
-                            .option("fetchsize", "1000")
+                            .option("fetchsize", "1000") # Reduce if OOM happens
                             .load()
                         )
                 except Exception as e:
@@ -3598,124 +3611,637 @@ class ProcessDataService:
     def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
         spark: SparkSession,
         output_dir: str,
-        max_rows: Optional[int] = None
-    ):
+        behavior_types_to_generate_dataset: Optional[List[str]] = None,
+        max_rows_per_behavior: Optional[int] = None,
+        batch_rows: int = 100,
+        max_retries_on_iterator_failure: int = 10
+    ) -> None:
         """
-        Generates a CSV dataset for transshipment events with trajectory as image matrix data, COG/SOG arrays using Spark.
-        The output CSV will have columns:
-        ['id', 'event_index', 'trajectory_image_matrix', 'sog_array', 'cog_array']
-        
-        Args:
-            spark (SparkSession): The Spark session to use for processing.
-            output_dir (str): Directory where the resulting CSV dataset will be saved.
-            max_rows (Optional[int]): Maximum number of rows to process. If None, all rows are processed.
-        
-        Returns:
-            None: The function saves the resulting dataset to the specified output directory.
+        Safe version: processes records in small batches, processes each row on the driver,
+        and writes each batch directly to a single plain CSV (no compression) on the driver,
+        avoiding the need to create many Spark DataFrames and serialize large objects.
+
+        Main differences compared to the previous Spark implementation:
+        - Stream driver-side por batch (append) -> reduces serialization and avoids OOM/py4j drops.
+        - Retries for spark.read (JDBC) with backoff.
+        - CHUNK_SIZE e FETCHSIZE are smaller by default
+        - Aggressive cleanup in finally.
         """
-        logger.info("generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark: start (max_rows=%s)", max_rows)
+        import os, re, json, gc, time, csv, shutil
+        from functools import reduce
+        from datetime import datetime
         try:
-            # Load events from database or CSV
-            pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
-            pg_port = os.getenv("POSTGRES_PORT", "5432")
-            pg_db = os.getenv("POSTGRES_DB")
-            pg_user = os.getenv("POSTGRES_USER")
-            pg_pass = os.getenv("POSTGRES_PASSWORD")
-            ais_path = os.getenv("AIS_DATA_PATH", "./shared/utils/datasets/ais_data.csv")
+            from PIL import Image, ImageDraw
+        except Exception:
+            Image = None
+            ImageDraw = None
 
-            if not (pg_db and pg_user and pg_pass):
-                raise ValueError("Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD).")
+        logger.info(
+            "start generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark (max_rows=%s, batch_rows=%s, max_retries=%s)",
+            max_rows_per_behavior, batch_rows, max_retries_on_iterator_failure
+        )
 
-            # Load transshipment events from database
-            jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
-            schema = "captaima"
-            table = "events"
+        # Config / defaults
+        BATCH_ROWS = int(batch_rows)
+        if not behavior_types_to_generate_dataset:
+            behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+        TARGET_W, TARGET_H = 120, 120
 
-            limit_clause = f" LIMIT {int(max_rows)}" if (max_rows is not None and int(max_rows) > 0) else ""
-            dbtable_subquery = (
-                f"(select event_index, t_start as T_start, t_end as T_end, category as Category, mmsi as MMSI, mmsi_2 as MMSI_2 "
-                f"from {schema}.{table} where category = 'TRANSSHIPMENT' {limit_clause}) as subq"
-            )
+        # JDBC env
+        pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
+        pg_port = os.getenv("POSTGRES_PORT", "5432")
+        pg_db = os.getenv("POSTGRES_DB")
+        pg_user = os.getenv("POSTGRES_USER")
+        pg_pass = os.getenv("POSTGRES_PASSWORD")
 
-            transshipment_events_df = (
-                spark.read
-                .format("jdbc")
-                .option("url", jdbc_url)
-                .option("dbtable", dbtable_subquery)
-                .option("user", pg_user)
-                .option("password", pg_pass)
-                .option("driver", "org.postgresql.Driver")
-                .option("fetchsize", "1000")
-                .load()
-            )
+        if not (pg_db and pg_user and pg_pass):
+            msg = "Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD)."
+            logger.error(msg)
+            raise ValueError(msg)
 
-            logger.info("Loaded transshipment events from database")
+        jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+        schema = "captaima"
+        table = "aggregated_ais_data"
 
-            # Create aggregated DataFrame for transshipment events
-            aggregated_df = ProcessDataService.create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
-                events_df=transshipment_events_df,
-                ais_path=ais_path,
-                spark=spark
-            )
+        os.makedirs(output_dir, exist_ok=True)
 
-            # Select only required columns and generate trajectory as image matrix
-            def trajectory_to_image_matrix(trajectory_wkt):
-                """Convert trajectory WKT to grayscale image matrix (120x120) and return as string"""
+        _time_regex = re.compile(r"(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+
+        def parse_time_to_seconds_or_none(val: Any) -> Optional[int]:
+            try:
+                if val is None:
+                    return None
+                if isinstance(val, (int, float)):
+                    return int(val) % 86400
+                s = str(val).strip()
+                if s == "":
+                    return None
+                if s.isdigit():
+                    return int(s) % 86400
+                m = _time_regex.search(s)
+                if m:
+                    time_part = m.group(1)
+                    if "." in time_part:
+                        time_part = time_part.split(".", 1)[0]
+                    try:
+                        hh, mm, ss = [int(x) for x in time_part.split(":")]
+                        return (hh * 3600 + mm * 60 + ss) % 86400
+                    except Exception:
+                        return None
+                if "T" in s:
+                    try:
+                        time_part = s.split("T", 1)[1]
+                        time_part = time_part.split("+", 1)[0].split("Z", 1)[0].split(" ", 1)[0]
+                        if "." in time_part:
+                            time_part = time_part.split(".", 1)[0]
+                        hh, mm, ss = [int(x) for x in time_part.split(":")]
+                        return (hh * 3600 + mm * 60 + ss) % 86400
+                    except Exception:
+                        pass
                 try:
-                    coords = ProcessDataService._parse_linestring_wkt_to_coords(trajectory_wkt)
-                    if not coords or len(coords) == 0:
-                        return "[]"
-                    
-                    pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, 120, 120, pad_frac=0.03, upscale=4)
-                    W = 120 * upscale
-                    H = 120 * upscale
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    return (dt.hour * 3600 + dt.minute * 60 + dt.second) % 86400
+                except Exception:
+                    return None
+            except Exception:
+                return None
 
-                    img = Image.new("L", (W, H), 255)
-                    draw = ImageDraw.Draw(img)
+        def ensure_python_list(obj: Any) -> List[Any]:
+            if obj is None:
+                return []
+            if isinstance(obj, list):
+                return obj
+            if isinstance(obj, (tuple, set)):
+                return list(obj)
+            if isinstance(obj, str):
+                s = obj.strip()
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return parsed
+                    return [parsed]
+                except Exception:
+                    if "," in s:
+                        return [p.strip() for p in s.split(",")]
+                    return [s]
+            try:
+                return list(obj)
+            except Exception:
+                return [str(obj)]
 
-                    base_line_width = max(1, int(round(min(W, H) / 120.0)))
-                    if len(pixels) >= 2:
-                        draw.line(pixels, fill=0, width=base_line_width, joint="curve")
-                    else:
-                        x0, y0 = pixels[0]
-                        r = max(1, base_line_width * 2)
-                        draw.ellipse((x0-r, y0-r, x0+r, y0+r), fill=0)
+        def _ensure_json_array(obj: Any) -> str:
+            try:
+                if obj is None:
+                    return json.dumps([])
+                if isinstance(obj, str):
+                    try:
+                        loaded = json.loads(obj)
+                        if isinstance(loaded, list):
+                            return obj
+                        return json.dumps([loaded])
+                    except Exception:
+                        return json.dumps([obj])
+                return json.dumps(obj)
+            except Exception:
+                try:
+                    return json.dumps(list(obj))
+                except Exception:
+                    return json.dumps([])
 
-                    final_img = img.resize((120, 120), resample=Image.LANCZOS)
-                    matrix = list(final_img.getdata())
-                    return str(matrix)
+        def to_relative_seconds_list_using_first_non_null(timestamp_list_raw: Any) -> List[Optional[int]]:
+            ts_list = ensure_python_list(timestamp_list_raw)
+            if not ts_list:
+                return []
+            secs_or_none: List[Optional[int]] = [parse_time_to_seconds_or_none(t) for t in ts_list]
+            base_idx = next((i for i, s in enumerate(secs_or_none) if s is not None), None)
+            if base_idx is None:
+                return []
+            base = secs_or_none[base_idx]
+            rel: List[Optional[int]] = []
+            for s in secs_or_none:
+                if s is None:
+                    rel.append(None)
+                else:
+                    delta = s - base if s >= base else (s + 86400) - base
+                    rel.append(int(delta))
+            return rel
+
+        # result schema column order used for CSV header
+        result_columns = ["id", "mmsi", "event_index", "trajectory_image_matrix", "sog_array", "cog_array", "timestamp_array", "behavior_type_label"]
+
+        def _process_and_format_row_for_csv(row_obj, behavior_default: str) -> Optional[List[Any]]:
+            """
+            Process a row and return a list of values in the same order as result_columns,
+            or None to skip the row.
+            """
+            row = row_obj.asDict() if hasattr(row_obj, "asDict") else dict(row_obj)
+            pk = row.get("id")
+            traj_wkt = row.get("trajectory_wkt") or row.get("trajectory")
+            if pk is None or traj_wkt is None:
+                logger.debug("Skipping row with missing id or trajectory (id=%s)", pk)
+                return None
+
+            coords = ProcessDataService._parse_linestring_wkt_to_coords(traj_wkt)
+            if not coords:
+                logger.debug("No coords parsed for id=%s; skipping", pk)
+                return None
+
+            # render image
+            try:
+                if Image is None or ImageDraw is None:
+                    raise RuntimeError("PIL not available")
+                pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, TARGET_W, TARGET_H, pad_frac=0.03, upscale=4)
+                W = TARGET_W * upscale
+                H = TARGET_H * upscale
+
+                img = Image.new("L", (W, H), 255)
+                draw = ImageDraw.Draw(img)
+                base_line_width = max(1, int(round(min(W, H) / 120.0)))
+                if len(pixels) >= 2:
+                    draw.line(pixels, fill=0, width=base_line_width, joint="curve")
+                else:
+                    x0, y0 = pixels[0]
+                    rrad = max(1, base_line_width * 2)
+                    draw.ellipse((x0-rrad, y0-rrad, x0+rrad, y0+rrad), fill=0)
+                final_img = img.resize((TARGET_W, TARGET_H), resample=Image.LANCZOS)
+                flat = list(final_img.getdata())
+                matrix_2d = [flat[i * TARGET_W:(i + 1) * TARGET_W] for i in range(TARGET_H)]
+                matrix_json = json.dumps(matrix_2d)
+            except Exception as img_e:
+                logger.warning("Failed to render image for id=%s: %s", pk, img_e)
+                matrix_json = json.dumps([[]])
+                try:
+                    del img, draw, final_img, flat, matrix_2d
+                except Exception:
+                    pass
+
+            mmsi = row.get("mmsi")
+            event_index = row.get("event_index")
+            sog_json = _ensure_json_array(row.get("sog_array"))
+            cog_json = _ensure_json_array(row.get("cog_array"))
+            rel_seconds_list = to_relative_seconds_list_using_first_non_null(row.get("timestamp_array") or row.get("timestamps") or row.get("ts_array") or row.get("time_array") or row.get("times"))
+            timestamp_json = json.dumps(rel_seconds_list)
+            behavior_label = row.get("behavior_type_label") or behavior_default
+
+            # prepare values in consistent order
+            id_val = str(int(pk)) if (isinstance(pk, int) or (isinstance(pk, str) and pk.isdigit())) else str(pk)
+            mmsi_val = str(mmsi) if mmsi is not None else ""
+            try:
+                event_idx_val = int(event_index) if (event_index is not None and str(event_index).isdigit()) else (event_index if event_index is not None else "")
+            except Exception:
+                event_idx_val = event_index if event_index is not None else ""
+
+            row_values = [
+                id_val,
+                mmsi_val,
+                event_idx_val,
+                matrix_json,
+                sog_json,
+                cog_json,
+                timestamp_json,
+                behavior_label
+            ]
+
+            # cleanup image temporaries aggressively
+            try:
+                del matrix_2d, flat, final_img, img, draw, pixels, coords
+            except Exception:
+                pass
+
+            return row_values
+
+        # helper: read a JDBC selection with retries (returns DataFrame or raises)
+        def spark_read_jdbc_with_retries(dbtable_sql: str, max_attempts: int = 3, sleep_base: float = 0.8):
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    df_local = (
+                        spark.read
+                        .format("jdbc")
+                        .option("url", jdbc_url)
+                        .option("dbtable", dbtable_sql)
+                        .option("user", pg_user)
+                        .option("password", pg_pass)
+                        .option("driver", "org.postgresql.Driver")
+                        .option("fetchsize", "200")
+                        .load()
+                    )
+                    return df_local
                 except Exception as e:
-                    logger.warning(f"Failed to convert trajectory to image matrix: {e}")
-                    return "[]"
+                    last_exc = e
+                    logger.warning("spark.read JDBC attempt %d/%d failed for query [%s]: %s", attempt, max_attempts, dbtable_sql, e)
+                    time.sleep(sleep_base * attempt)
+            # final raise
+            raise last_exc
 
-            # Register UDF for trajectory to image matrix conversion
-            trajectory_to_matrix_udf = F.udf(trajectory_to_image_matrix, StringType())
+        # Main processing loop
+        created_tmp_dirs = []
+        try:
+            for behavior in behavior_types_to_generate_dataset:
+                logger.info("Processing behavior '%s' (max_rows_per_behavior=%s)", behavior, max_rows_per_behavior)
+                behavior_escaped = behavior.replace("'", "''")
+                limit_clause = f" LIMIT {int(max_rows_per_behavior)}" if (max_rows_per_behavior is not None and int(max_rows_per_behavior) > 0) else ""
 
-            # Select and transform columns
-            result_df = aggregated_df.select(
-                F.col("id"),
-                F.col("event_index"),
-                trajectory_to_matrix_udf(F.col("trajectory")).alias("trajectory_image_matrix"),
-                F.col("sog_array"),
-                F.col("cog_array")
-            )
+                base_db_where = f"behavior_type_label = '{behavior_escaped}'"
 
-            # Save the resulting DataFrame to CSV
-            logger.info(f"Saving the resulting dataset to {output_dir}")
-            ProcessDataService.ensure_local_processed_dirs()
-            
-            ProcessDataService.save_spark_df_as_csv(
-                spark_df=result_df,
-                output_path=output_dir,
-                spark=spark,
-                allow_multiple_files=False
-            )
+                # We'll stream output directly to a temp CSV file per behavior to avoid Spark-side merges.
+                now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                behavior_fname = re.sub(r"[^\w\-]+", "_", str(behavior))
+                filename = f"{behavior_fname}_dataset_{now}.csv"
+                output_path = os.path.join(output_dir, filename)
+                tmp_output_dir = f"{output_path}.part"
+                tmp_csv_path = os.path.join(tmp_output_dir, "part-00000.csv.part")
+                final_tmp_target = os.path.join(tmp_output_dir, "part-00000.csv")
 
-            logger.info("generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark: finished")
+                # create tmp dir
+                try:
+                    os.makedirs(tmp_output_dir, exist_ok=True)
+                    created_tmp_dirs.append(tmp_output_dir)
+                except Exception as e:
+                    logger.warning("Could not create tmp_output_dir %s: %s", tmp_output_dir, e)
 
-        except Exception as e:
-            logger.error(f"Error generating CSV dataset for transshipment events: {e}")
+                # open CSV file for append streaming (driver)
+                fh = open(tmp_csv_path, "w", newline="", encoding="utf-8")
+                writer = csv.writer(fh)
+                # write header
+                writer.writerow(result_columns)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
+
+                processed_for_behavior = 0
+                last_pk_processed = None
+                BATCH_WRITE_COUNT = 0
+
+                # attempt to get numeric bounds for chunking
+                min_pk = max_pk = None
+                try:
+                    bounds_tbl = (
+                        f"(select min(primary_key) as min_pk, max(primary_key) as max_pk from {schema}.{table} where {base_db_where}) as boundsq"
+                    )
+                    bounds_df = spark_read_jdbc_with_retries(bounds_tbl, max_attempts=2)
+                    rb = bounds_df.limit(1).collect()
+                    if rb:
+                        rb0 = rb[0].asDict()
+                        min_pk = rb0.get("min_pk", None)
+                        max_pk = rb0.get("max_pk", None)
+                except Exception as e:
+                    logger.debug("Unable to fetch partition bounds for behavior %s (non-fatal): %s", behavior, e)
+                    min_pk = max_pk = None
+
+                # chunk parameters (smaller to reduce pressure)
+                CHUNK_SIZE = int(os.getenv("CSV_JDBC_CHUNK_SIZE", "8"))  # smaller chunks
+                FETCHSIZE = int(os.getenv("CSV_JDBC_FETCHSIZE", "50"))
+
+                if min_pk is not None and max_pk is not None:
+                    try:
+                        min_int = int(min_pk)
+                        max_int = int(max_pk)
+                        start_pk = min_int
+                        while start_pk <= max_int:
+                            end_pk = start_pk + CHUNK_SIZE - 1
+                            where_extra = f" AND primary_key BETWEEN {start_pk} AND {end_pk}"
+                            db_chunk_subq = (
+                                f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                                f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                                f"from {schema}.{table} where {base_db_where} {where_extra} ORDER BY primary_key ASC) as subq"
+                            )
+                            # read with retries
+                            try:
+                                df_chunk = spark_read_jdbc_with_retries(db_chunk_subq, max_attempts=3, sleep_base=0.5)
+                            except Exception as e_chunk_read:
+                                logger.error("Chunk read failed for behavior %s on PK range %s..%s: %s", behavior, start_pk, end_pk, e_chunk_read)
+                                # advance to next chunk to avoid infinite loop
+                                start_pk = end_pk + 1
+                                continue
+
+                            # process rows in the chunk using toLocalIterator where possible but catch errors
+                            try:
+                                try:
+                                    rows_iter = df_chunk.toLocalIterator()
+                                except Exception:
+                                    rows_iter = iter(df_chunk.collect())
+                            except Exception as e_iter:
+                                logger.error("Failed to materialize df_chunk rows for behavior %s chunk %s..%s: %s", behavior, start_pk, end_pk, e_iter)
+                                try:
+                                    del df_chunk
+                                except Exception:
+                                    pass
+                                start_pk = end_pk + 1
+                                continue
+
+                            # iterate and process
+                            for r in rows_iter:
+                                try:
+                                    values = _process_and_format_row_for_csv(r, behavior)
+                                    if values is None:
+                                        continue
+                                    writer.writerow(values)
+                                    BATCH_WRITE_COUNT += 1
+                                    processed_for_behavior += 1
+                                    last_pk_processed = values[0]
+                                except Exception as row_e:
+                                    logger.exception("Error processing row in chunk %s..%s for behavior %s: %s", start_pk, end_pk, behavior, row_e)
+                                    continue
+
+                                # flush periodically to reduce memory pressure and ensure partial progress on disk
+                                if BATCH_WRITE_COUNT >= BATCH_ROWS:
+                                    try:
+                                        fh.flush()
+                                        try:
+                                            os.fsync(fh.fileno())
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    BATCH_WRITE_COUNT = 0
+                                    gc.collect()
+
+                                if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                                    logger.info("Reached max_rows_per_behavior=%s for behavior %s during chunk processing; stopping.", max_rows_per_behavior, behavior)
+                                    break
+
+                            # cleanup chunk df
+                            try:
+                                del df_chunk, rows_iter
+                            except Exception:
+                                pass
+
+                            if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                                break
+
+                            start_pk = end_pk + 1
+
+                    except Exception as e_chunk_main:
+                        logger.exception("Chunked processing failed for behavior %s: %s. Falling back to iterator strategy.", behavior, e_chunk_main)
+                        # fallthrough to iterator below
+
+                # if no numeric bounds or chunking failed or not enough processed, fallback: simple select (safe, but may be heavier)
+                if (min_pk is None or max_pk is None) and (max_rows_per_behavior is None or processed_for_behavior < int(max_rows_per_behavior)):
+                    select_q = (
+                        f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                        f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                        f"from {schema}.{table} where {base_db_where} {limit_clause} ORDER BY primary_key ASC) as subq"
+                    )
+                    try:
+                        df_full = spark_read_jdbc_with_retries(select_q, max_attempts=3, sleep_base=0.5)
+                    except Exception as e_read_full:
+                        logger.error("Failed initial JDBC read for behavior %s: %s", behavior, e_read_full)
+                        # close writer and continue to next behavior
+                        try:
+                            fh.flush()
+                            try:
+                                os.fsync(fh.fileno())
+                            except Exception:
+                                pass
+                            fh.close()
+                        except Exception:
+                            pass
+                        continue
+
+                    # prefer streaming iterator
+                    try:
+                        iterator = df_full.toLocalIterator()
+                    except Exception:
+                        iterator = iter(df_full.collect())
+
+                    while True:
+                        try:
+                            r = next(iterator)
+                        except StopIteration:
+                            break
+                        except EOFError:
+                            logger.warning("toLocalIterator() failed mid-iteration for behavior %s with EOFError; attempting to re-read remaining rows", behavior)
+                            # attempt to resume by re-querying > last_pk_processed
+                            if last_pk_processed is None:
+                                # nothing processed; give up on this behavior
+                                break
+                            where_extra = f" AND primary_key > {last_pk_processed}"
+                            resume_q = (
+                                f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                                f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                                f"from {schema}.{table} where {base_db_where} {where_extra} {limit_clause} ORDER BY primary_key ASC) as subq"
+                            )
+                            try:
+                                df_resume = spark_read_jdbc_with_retries(resume_q, max_attempts=3, sleep_base=0.5)
+                                try:
+                                    iterator = df_resume.toLocalIterator()
+                                except Exception:
+                                    iterator = iter(df_resume.collect())
+                                continue
+                            except Exception:
+                                logger.exception("Resume attempt failed for behavior %s after toLocalIterator EOF", behavior)
+                                break
+                        except Exception as iter_e:
+                            logger.exception("Iterator raised unexpected exception for behavior %s: %s", behavior, iter_e)
+                            break
+
+                        try:
+                            values = _process_and_format_row_for_csv(r, behavior)
+                            if values is None:
+                                continue
+                            writer.writerow(values)
+                            BATCH_WRITE_COUNT += 1
+                            processed_for_behavior += 1
+                            last_pk_processed = values[0]
+                        except Exception as row_e:
+                            logger.exception("Error processing row for behavior %s: %s", behavior, row_e)
+
+                        if BATCH_WRITE_COUNT >= BATCH_ROWS:
+                            try:
+                                fh.flush()
+                                try:
+                                    os.fsync(fh.fileno())
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            BATCH_WRITE_COUNT = 0
+                            gc.collect()
+
+                        if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                            logger.info("Reached max_rows_per_behavior=%s for behavior %s; stopping.", max_rows_per_behavior, behavior)
+                            break
+
+                    try:
+                        del df_full
+                    except Exception:
+                        pass
+
+                # finalize CSV for this behavior: close .part file and move atomically to final place
+                try:
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+                # finalize inside tmp dir
+                try:
+                    if os.path.exists(final_tmp_target):
+                        try:
+                            os.remove(final_tmp_target)
+                        except Exception:
+                            pass
+                    os.replace(tmp_csv_path, final_tmp_target)
+                except Exception as e_inner:
+                    logger.warning("Could not finalize temp inner file for behavior %s: %s", behavior, e_inner)
+
+                # move to final output_path atomically
+                try:
+                    parent = os.path.dirname(output_path)
+                    os.makedirs(parent, exist_ok=True)
+                    if os.path.exists(output_path):
+                        try:
+                            if os.path.isdir(output_path):
+                                shutil.rmtree(output_path)
+                            else:
+                                os.remove(output_path)
+                        except Exception:
+                            pass
+                    os.replace(final_tmp_target, output_path)
+                    # cleanup tmp dir
+                    try:
+                        if os.path.exists(tmp_output_dir):
+                            shutil.rmtree(tmp_output_dir)
+                    except Exception:
+                        pass
+                    try:
+                        created_tmp_dirs.remove(tmp_output_dir)
+                    except Exception:
+                        pass
+                except Exception as e_move:
+                    logger.warning("Driver-merge move tmp->final failed for behavior %s: %s. Attempting copy.", behavior, e_move)
+                    try:
+                        shutil.copyfile(final_tmp_target, output_path)
+                        try:
+                            shutil.rmtree(tmp_output_dir)
+                        except Exception:
+                            pass
+                        try:
+                            created_tmp_dirs.remove(tmp_output_dir)
+                        except Exception:
+                            pass
+                    except Exception as e_copy:
+                        logger.exception("Driver-merge fallback copy also failed for behavior %s: %s", behavior, e_copy)
+                        raise
+
+                # best-effort adjust permissions if helper exists
+                try:
+                    ProcessDataService.adjust_file_permissions(output_path)
+                except Exception:
+                    pass
+
+                logger.info("Finished behavior %s: CSV written to %s (processed rows ~%d)", behavior, output_path, processed_for_behavior)
+                # small cleanup
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
+            logger.info("generate_csv: finished for all behaviors")
+
+        except Exception as main_e:
+            logger.exception("Error generating CSV dataset per behavior: %s", main_e)
             raise
+        finally:
+            # Final cleanup agressivo
+            try:
+                # close any open handles
+                try:
+                    if 'fh' in locals():
+                        fh_local = locals().get('fh')
+                        if fh_local and not fh_local.closed:
+                            try:
+                                fh_local.close()
+                            except Exception:
+                                pass
+                            try:
+                                del fh_local
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # remove any tmp dirs left
+                for td in list(created_tmp_dirs):
+                    try:
+                        if os.path.exists(td):
+                            shutil.rmtree(td, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                # delete big locals
+                big_names = ["df", "df_chunk", "rows", "iterator", "df_full", "df_resume", "rows_iter", "matrix_2d", "flat", "final_img", "img", "draw", "pixels"]
+                for n in big_names:
+                    try:
+                        if n in locals():
+                            del locals()[n]
+                    except Exception:
+                        try:
+                            if n in globals():
+                                del globals()[n]
+                        except Exception:
+                            pass
+
+                # force GC a few times
+                gc.collect()
+                time.sleep(0.01)
+                gc.collect()
+            except Exception as final_exc:
+                try:
+                    logger.warning("Exception during final cleanup: %s", final_exc)
+                except Exception:
+                    pass
+
 
     # def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
     #     events_df: DataFrame,

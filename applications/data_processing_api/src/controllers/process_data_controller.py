@@ -903,6 +903,9 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
         Flask Response: JSON object with status and message indicating success or failure, along with the output path of the generated CSV dataset.
     """
     logger.info("Received request at /generate-csv-image-trajectory-and-cog-sog-timestamp-arrays-dataset-for-transshipment-events")
+
+    behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+
     try:
         spark = SparkSessionInitializer.init_spark_session("Generate_CSV_Image_Trajectory_and_COG_SOG_Timestamp_Arrays_Dataset_[Data_Processing_API]")
 
@@ -918,7 +921,8 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
         ProcessDataService.generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
             spark=spark,
             output_dir=output_dir,
-            max_rows=1000
+            behavior_types_to_generate_dataset=behavior_types_to_generate_dataset,
+            max_rows_per_behavior=320
         )
 
         logger.info("Task finished. Stopping Spark session...")
