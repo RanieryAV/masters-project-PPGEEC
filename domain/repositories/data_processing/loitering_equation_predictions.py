@@ -3,15 +3,17 @@ from geoalchemy2 import Geometry
 from geoalchemy2.shape import to_shape
 from sqlalchemy import UniqueConstraint, ARRAY
 
-class AggregatedAISData(db.Model):
-    __tablename__ = 'aggregated_ais_data'
+class LoiteringEquationPredictions(db.Model):
+    __tablename__ = 'loitering_equation_predictions'
     # schema only; no extra columns beyond those requested
     __table_args__ = (
-        UniqueConstraint('mmsi', 'event_index', 'behavior_type_label', name='unique_mmsi_event_index_behavior_type_label'),
+        UniqueConstraint('mmsi', 'event_index', 'behavior_type_label', 'timestamp_array', name='unique_mmsi_event_index_behavior_type_label_timestamp_array'),
         {"schema": "captaima"},
     )
 
     primary_key = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Add foreign key to link to AggregatedAISData
+    aggregated_ais_data_id = db.Column(db.Integer, db.ForeignKey('captaima.aggregated_ais_data.primary_key'), nullable=False)
     mmsi = db.Column('mmsi', db.String(255), nullable=False)
     event_index = db.Column('event_index', db.Integer, nullable=False)
     trajectory = db.Column(Geometry(geometry_type='LINESTRING', srid=4326), nullable=False)
@@ -19,6 +21,8 @@ class AggregatedAISData(db.Model):
     sog_array = db.Column('sog_array', db.Text, nullable=False)   # speed array
     cog_array = db.Column('cog_array', db.Text, nullable=False)   # heading array
     behavior_type_label = db.Column('behavior_type_label', db.String(255), nullable=False)
+    behavior_type_by_loitering_equation = db.Column('behavior_type_by_loitering_equation', db.String(255), nullable=False)
+    trajectory_redundancy = db.Column('trajectory_redundancy', db.Float, nullable=False)
 
     average_speed = db.Column('average_speed', db.Float, nullable=False)
     min_speed = db.Column('min_speed', db.Float, nullable=False)
@@ -53,6 +57,7 @@ class AggregatedAISData(db.Model):
 
         return {
             'primary_key': self.primary_key,
+            'aggregated_ais_data_id': self.aggregated_ais_data_id,
             'mmsi': self.mmsi,
             'event_index': self.event_index,
             'trajectory': trajectory_wkt,
@@ -60,6 +65,8 @@ class AggregatedAISData(db.Model):
             'sog_array': self.sog_array,
             'cog_array': self.cog_array,
             'behavior_type_label': self.behavior_type_label,
+            'behavior_type_by_loitering_equation': self.behavior_type_by_loitering_equation,
+            'trajectory_redundancy': self.trajectory_redundancy,
 
             'average_speed': self.average_speed,
             'min_speed': self.min_speed,

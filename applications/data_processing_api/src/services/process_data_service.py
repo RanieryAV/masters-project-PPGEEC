@@ -1,13 +1,20 @@
 import os
 import traceback
 import logging
+import math
 import subprocess
 import socket
 import csv
 import gzip
 from typing import Optional
+from functools import reduce
+import gc
 
-from flask import Blueprint, request, jsonify
+import json
+import re
+from datetime import datetime
+
+from flask import Blueprint, request, jsonify, make_response
 from flasgger import swag_from
 from os import path
 from dotenv import load_dotenv
@@ -18,7 +25,16 @@ from pyspark.sql.types import (
     ArrayType, StructType, StructField, DoubleType, StringType, LongType, StructType, TimestampType, IntegerType
 )
 from pyspark.sql.window import Window
-from typing import Any, Tuple, List, Dict
+from typing import Any, Tuple, List, Dict, Optional
+
+# Image libs (Pillow). Shapely optional but recommended.
+try:
+    from shapely import wkt as shapely_wkt
+    SHAPELY_AVAILABLE = True
+except Exception:
+    SHAPELY_AVAILABLE = False
+
+from PIL import Image, ImageDraw
 
 preprocess_data_bp = Blueprint('process_data_bp', __name__)
 
@@ -43,7 +59,7 @@ logger = get_logger()
 # Load environment variables#move to services
 load_dotenv()#move to services
 
-class Process_Data_Service:
+class ProcessDataService:
     ######################## DOCKER DETECTION FUNCTIONS ########################
     @staticmethod
     def _is_running_in_container() -> bool:
@@ -329,14 +345,14 @@ class Process_Data_Service:
     #     # coalesce to 1 if you want one file, else multiple part-files
     #     spark_df.coalesce(1).write.mode("overwrite").option("header", True).csv(output_path)
 
-    #     moved = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, output_path)
+    #     moved = ProcessDataService.spark_func_promote_csv_from_temporary(spark, output_path)
     #     if not moved:
     #         logger.warning(f"Could not promote CSV from temporary for output path {output_path}")
     #     else:
     #         logger.info("CSV file promoted from temporary.")
         
     #     # Adjust permissions on moved files
-    #     Process_Data_Service.adjust_file_permissions(output_path)
+    #     ProcessDataService.adjust_file_permissions(output_path)
 
     #     logger.info("ATTENTION: Data saved successfully with correct file permissions!")
 
@@ -352,7 +368,7 @@ class Process_Data_Service:
         This branch now has extra safety: aggressive partitioning, driver disk pre-check, optional repartitioning.
         - If the fast write (either coalesced or multi-file) fails, automatically fall back to a robust
         driver-streaming writer that emits a single CSV by receiving chunked bytes from executors
-        (Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019).
+        (ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019).
         - In all cases we attempt to adjust file permissions before returning.
         """
         import os
@@ -384,7 +400,7 @@ class Process_Data_Service:
                 return None
 
         # Prefer module parser if available
-        parse_size = getattr(Process_Data_Service, "_parse_size_string", None) or _local_parse_size_string
+        parse_size = getattr(ProcessDataService, "_parse_size_string", None) or _local_parse_size_string
 
         # ----------------------------
         #  Determine default_parallelism robustly & target partitions
@@ -461,6 +477,9 @@ class Process_Data_Service:
         # ----------------------------
         #  First: try the original fast path (either coalesced single-file or standard multi-file)
         # ----------------------------
+        # BEGIN MODIFICATION: ensure fast_exc is defined even if fast path does not throw
+        fast_exc = None
+        # END MODIFICATION
         try:
             if allow_multiple_files:
                 # Write multiple part-*.csv files (no coalesce) to avoid coalescing memory pressure,
@@ -592,7 +611,7 @@ class Process_Data_Service:
 
                 # After successful partition writes, adjust permissions
                 try:
-                    Process_Data_Service.adjust_file_permissions(output_path)
+                    ProcessDataService.adjust_file_permissions(output_path)
                 except Exception as e_adj:
                     logger.warning("adjust_file_permissions failed after executor-side multi-file write: %s", e_adj)
 
@@ -606,7 +625,7 @@ class Process_Data_Service:
 
                 # try to promote/move the part-*.csv produced by Spark to the root of output_path
                 try:
-                    moved = Process_Data_Service.spark_func_promote_csv_from_temporary(spark, output_path)
+                    moved = ProcessDataService.spark_func_promote_csv_from_temporary(spark, output_path)
                     if not moved:
                         logger.warning(f"Could not promote CSV from temporary for output path {output_path}")
                     else:
@@ -617,14 +636,17 @@ class Process_Data_Service:
 
                 # Adjust permissions on moved files (best-effort)
                 try:
-                    Process_Data_Service.adjust_file_permissions(output_path)
+                    ProcessDataService.adjust_file_permissions(output_path)
                 except Exception as e_adj:
                     logger.warning("adjust_file_permissions failed after Spark coalesced write: %s", e_adj)
 
                 logger.info("ATTENTION: Data saved successfully with correct file permissions (fast path).")
                 return
 
-        except Exception as fast_exc:
+        except Exception as fast_exc_local:
+            # BEGIN MODIFICATION: capture fast-path exception into stable variable for fallback logging
+            fast_exc = fast_exc_local
+            # END MODIFICATION
             logger.warning(
                 "Primary Spark write (allow_multiple_files=%s) failed for output_path=%s. Falling back to chunked driver streaming writer. Fast-path error: %s",
                 allow_multiple_files, output_path, fast_exc
@@ -658,7 +680,7 @@ class Process_Data_Service:
                 output_path, chosen_chunk_bytes, compress
             )
 
-            Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
+            ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
                 spark_df=spark_df,
                 output_dir=output_path,
                 spark=spark,
@@ -669,7 +691,7 @@ class Process_Data_Service:
             )
 
             try:
-                Process_Data_Service.adjust_file_permissions(output_path)
+                ProcessDataService.adjust_file_permissions(output_path)
             except Exception as e_adj2:
                 logger.warning("adjust_file_permissions failed after fallback writer: %s", e_adj2)
 
@@ -682,6 +704,7 @@ class Process_Data_Service:
                 output_path, fast_exc, fallback_exc
             )
             raise
+
 
     
     def save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
@@ -926,7 +949,7 @@ class Process_Data_Service:
 
             # adjust permissions
             try:
-                Process_Data_Service.adjust_file_permissions(output_dir)
+                ProcessDataService.adjust_file_permissions(output_dir)
             except Exception as e:
                 logger.warning("adjust_file_permissions failed after chunked streaming save: %s", e)
 
@@ -1088,58 +1111,7 @@ class Process_Data_Service:
     
     ######################## END ########################
 
-    ############### SPARK SESSION HELPERS ###############
-    @staticmethod
-    def init_spark_session(spark_session_name):
-        """Initialize and return a SparkSession using environment vars."""
-        spark_master_rpc_port = os.getenv("SPARK_MASTER_RPC_PORT", "7077")
-        spark_master_url = os.getenv("SPARK_MASTER_URL", f"spark://spark-master:{spark_master_rpc_port}")
-        eventlog_dir = os.getenv("SPARK_EVENTLOG_DIR", "/opt/spark-events")
-
-        logger.info(f"Spark master URL: {spark_master_url}")
-        logger.info(f"Event log directory: {eventlog_dir}")
-
-        driver_host = os.getenv("SPARK_DRIVER_HOST")
-        if not driver_host:
-            try:
-                hostname = socket.gethostname()
-                driver_host = socket.gethostbyname(hostname)
-            except Exception:
-                # fallback razoável dentro de container
-                driver_host = "0.0.0.0"
-
-        # --- executor/driver resource tuning (read from env with sane defaults) ---
-        # These values allow the master/workers to allocate larger executors instead of the
-        # Spark default of 1g per executor. They are read from environment variables so
-        # you can override them in docker-compose/.env without changing code.
-        spark_cores_max = os.getenv("SPARK_CORES_MAX", "4")                 # total cores allowed for this app
-        spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor
-        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
-        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
-
-        spark = (
-            SparkSession.builder
-            .appName(spark_session_name)
-            .master(spark_master_url)
-            .config("spark.eventLog.enabled", "false")
-            .config("spark.eventLog.dir", eventlog_dir)
-            .config("spark.sql.shuffle.partitions", "60")  # adjust as needed
-            # resource-related configs (minimal additions)
-            .config("spark.cores.max", spark_cores_max)
-            .config("spark.executor.cores", spark_executor_cores)
-            .config("spark.executor.memory", spark_executor_memory)
-            .config("spark.driver.memory", spark_driver_memory)
-            .config("spark.driver.host", driver_host)
-            .config("spark.driver.bindAddress", "0.0.0.0")
-            .config("spark.local.dir", "/app/processed_output/spark_tmp")
-            .config("spark.executorEnv.SPARK_LOCAL_DIRS", "/app/processed_output/spark_tmp")
-            .config("spark.executor.extraJavaOptions", "-Djava.io.tmpdir=/app/processed_output/spark_tmp")
-            .config("spark.shuffle.compress", "true")
-            .config("spark.rdd.compress", "true")
-            .config("spark.shuffle.spill.compress", "true")
-            .getOrCreate()
-        )
-        return spark
+    ############### SPARK HELPERS ###############
     
     def save_spark_df_in_hash_partitions_and_promote_Pitsikalis_2019(
         spark_df,
@@ -1155,7 +1127,7 @@ class Process_Data_Service:
         max_buckets_to_process: int = 0,  # NEW: if >0, limit number of buckets to process then stop
     ):
         """
-        Write `spark_df` in multiple smaller files by splitting on a stable hash of EventIndex.
+        Write `spark_df` in multiple smaller files by splitting on a stable hash of event_index.
 
         Behavior notes:
         - For each bucket a part CSV is created and then compressed to part-{i:05d}.csv.gz.
@@ -1189,10 +1161,10 @@ class Process_Data_Service:
         except Exception as e:
             logger.warning("Could not create output_dir %s: %s", output_dir, e)
 
-        if "EventIndex" not in spark_df.columns:
-            raise ValueError("Input DataFrame must contain 'EventIndex' column")
+        if "event_index" not in spark_df.columns:
+            raise ValueError("Input DataFrame must contain 'event_index' column")
 
-        hash_col_expr = _F.abs(_F.hash(_F.col("EventIndex")))
+        hash_col_expr = _F.abs(_F.hash(_F.col("event_index")))
         total_buckets = int(num_buckets)
         produced_files = []
 
@@ -1356,7 +1328,7 @@ class Process_Data_Service:
                         except Exception:
                             logger.debug("Bucket %s: repartition before streaming fallback failed (non-fatal)", bucket_label)
 
-                        Process_Data_Service.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
+                        ProcessDataService.save_spark_df_as_single_csv_on_driver_chunked_Pitsikalis_2019(
                             spark_df=bucket_df,
                             output_dir=tmp_bucket_dir,
                             spark=spark,
@@ -1494,7 +1466,7 @@ class Process_Data_Service:
 
         # final chmod/chown best-effort
         try:
-            Process_Data_Service.adjust_file_permissions(output_dir)
+            ProcessDataService.adjust_file_permissions(output_dir)
         except Exception as e_adj:
             logger.warning("adjust_file_permissions failed after bucketed writes: %s", e_adj)
 
@@ -1552,15 +1524,15 @@ class Process_Data_Service:
         )
 
         # Correct windowing for row numbers
-        window_spec = Window.orderBy("EventIndexLong")
+        window_spec = Window.orderBy("event_indexLong")
         df_with_index = (
             df_transformed
-            .withColumn("EventIndexLong", F.monotonically_increasing_id())
+            .withColumn("event_indexLong", F.monotonically_increasing_id())
             .withColumn(
-                "EventIndex",
-                F.row_number().over(Window.orderBy("EventIndexLong"))
+                "event_index",
+                F.row_number().over(Window.orderBy("event_indexLong"))
             )
-            .drop("EventIndexLong")
+            .drop("event_indexLong")
         )
 
         return df_with_index
@@ -1736,6 +1708,341 @@ class Process_Data_Service:
             result.append(entry)
         return result
 
+    def _parse_linestring_wkt_to_coords(wkt_str: str):
+        """
+        Retorna lista de (lon, lat) a partir de LINESTRING WKT.
+        Tenta usar shapely quando disponível, senão faz parsing simples.
+        """
+        if not wkt_str:
+            return []
+
+        try:
+            if SHAPELY_AVAILABLE:
+                geom = shapely_wkt.loads(wkt_str)
+                # shapely LineString.coords yields (x, y) -> (lon, lat)
+                return [(float(x), float(y)) for x, y in geom.coords]
+            else:
+                # Exemplo LINESTRING: "LINESTRING(-17.0056 178.6708, -5.6758 11.9243, ...)"
+                s = wkt_str.strip()
+                if s.upper().startswith("LINESTRING"):
+                    inner = s[s.find("(")+1 : s.rfind(")")]
+                    pts = []
+                    for part in inner.split(","):
+                        part = part.strip()
+                        if part == "":
+                            continue
+                        # split por whitespace (lon lat)
+                        pieces = part.split()
+                        if len(pieces) >= 2:
+                            lon = float(pieces[0])
+                            lat = float(pieces[1])
+                            pts.append((lon, lat))
+                    return pts
+                else:
+                    return []
+        except Exception:
+            logger.debug("WKT parse failed for: %s\n%s", wkt_str, traceback.format_exc())
+            return []
+
+    def _coords_to_image_pixels(coords, width, height, pad_frac=0.03, upscale=4):
+        """
+        Takes coords: list[(lon, lat)] and returns a list of integer (x_pixel, y_pixel) tuples,
+        projecting to occupy the maximum image area while maintaining aspect ratio.
+        - pad_frac: fraction of padding relative to the larger side (e.g., 0.03 = 3%)
+        - upscale: factor to draw at higher resolution and then downscale (antialias)
+        """
+        if not coords:
+            return []
+
+        lons = [p[0] for p in coords]
+        lats = [p[1] for p in coords]
+        minx, maxx = min(lons), max(lons)
+        miny, maxy = min(lats), max(lats)
+
+        # if all equal (degenerate trajectory), expand by a small epsilon
+        if math.isclose(minx, maxx):
+            minx -= 1e-6
+            maxx += 1e-6
+        if math.isclose(miny, maxy):
+            miny -= 1e-6
+            maxy += 1e-6
+
+        # size/range/span (lon span, lat span)
+        span_x = maxx - minx
+        span_y = maxy - miny
+
+        # use available dimension (after upscale)
+        W = width * upscale
+        H = height * upscale
+
+        # padding in pixels
+        pad = max(W, H) * pad_frac
+
+        # scale to fit while maintaining aspect ratio and maximizing area usage
+        scale_x = (W - 2 * pad) / span_x
+        scale_y = (H - 2 * pad) / span_y
+        scale = min(scale_x, scale_y)
+
+        # offset to center
+        # mapping: lon -> x increases to the right
+        # lat -> y decreases upwards (higher latitude -> top) -> invert y
+        used_width = span_x * scale
+        used_height = span_y * scale
+
+        offset_x = (W - used_width) / 2.0
+        offset_y = (H - used_height) / 2.0
+
+        pixels = []
+        for lon, lat in coords:
+            x = (lon - minx) * scale + offset_x
+            y = (maxy - lat) * scale + offset_y  # invert lat -> y
+            pixels.append((int(round(x)), int(round(y))))
+        return pixels, upscale
+
+    def generate_image_trajectory_dataset_for_all_behavior_types_with_spark(
+            spark,
+            output_dir: str,
+            behavior_types_to_generate_dataset: List[str] = None,
+            max_rows_per_behavior: int = None,  # NEW parameter: limit rows per behavior (None => no limit)
+        ):
+        """
+        Generate grayscale image datasets (.png) for all behavior types.
+        Folder path as specified in the request.
+
+        The resulting grayscale images are saved in this structure:
+        - output_directory/
+            - image_resolution_120x120/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                ...
+        Returns: Flask JSON response (200 success or 500 error with message).
+        """
+        logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: start")
+
+        # Force the list as specified (controller)
+        behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+
+        image_resolutions = [(120, 120), (128, 128), (224, 224), (256, 256),
+                            (299, 299), (384, 384), (512, 512), (640, 640)]
+
+        # JDBC / Postgres connection via env vars (same convention already used in the project)
+        try:
+            pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
+            pg_port = os.getenv("POSTGRES_PORT", "5432")
+            pg_db = os.getenv("POSTGRES_DB")
+            pg_user = os.getenv("POSTGRES_USER")
+            pg_pass = os.getenv("POSTGRES_PASSWORD")
+
+            if not (pg_db and pg_user and pg_pass):
+                msg = "Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD)."
+                logger.error(msg)
+                return make_response(jsonify({"status": "error", "message": msg}), 500)
+
+            jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+            schema = "captaima"
+            table = "aggregated_ais_data"
+
+            # create base directory and per-resolution/behavior folders
+            os.makedirs(output_dir, exist_ok=True)
+            for width, height in image_resolutions:
+                for behavior in behavior_types_to_generate_dataset:
+                    out_path = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior)
+                    os.makedirs(out_path, exist_ok=True)
+
+            total_processed = 0
+
+            # Process each behavior separately so we can LIMIT rows per behavior
+            for behavior in behavior_types_to_generate_dataset:
+                logger.info("Generating images for behavior type '%s' (max rows per behavior = %s)", behavior, max_rows_per_behavior)
+
+                # Escape single quotes in behavior for SQL
+                behavior_escaped = behavior.replace("'", "''")
+
+                # Optional LIMIT clause
+                limit_clause = f" LIMIT {int(max_rows_per_behavior)}" if (max_rows_per_behavior is not None and int(max_rows_per_behavior) > 0) else ""
+
+                # Subquery: read only necessary columns and convert trajectory to WKT (per behavior)
+                dbtable_subquery = (
+                    f"(select primary_key, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, behavior_type_label "
+                    f"from {schema}.{table} where behavior_type_label = '{behavior_escaped}' {limit_clause}) as subq"
+                )
+
+                # try to determine bounds for partitioned read by primary_key (performance hint)
+                bounds_tbl = f"(select min(primary_key) as min_pk, max(primary_key) as max_pk from {schema}.{table} where behavior_type_label = '{behavior_escaped}'){'' if limit_clause=='' else ''} as boundsq"
+                min_pk = max_pk = None
+                try:
+                    bounds_df = (
+                        spark.read
+                        .format("jdbc")
+                        .option("url", jdbc_url)
+                        .option("dbtable", bounds_tbl)
+                        .option("user", pg_user)
+                        .option("password", pg_pass)
+                        .option("driver", "org.postgresql.Driver")
+                        .option("fetchsize", "1000") # Reduce if OOM happens
+                        .load()
+                    )
+                    row = bounds_df.limit(1).collect()
+                    if row:
+                        row0 = row[0].asDict()
+                        min_pk = row0.get("min_pk", None)
+                        max_pk = row0.get("max_pk", None)
+                except Exception as eb:
+                    logger.debug("Could not fetch bounds for partitioning for behavior %s (non-fatal): %s", behavior, eb)
+                    min_pk = max_pk = None
+
+                # decide whether to use partitioned read or single read for this behavior
+                num_partitions = None
+                try:
+                    min_int = int(min_pk) if min_pk is not None else None
+                    max_int = int(max_pk) if max_pk is not None else None
+                    if min_int is not None and max_int is not None and min_int < max_int:
+                        sc = spark.sparkContext
+                        default_parallel = getattr(sc, "defaultParallelism", None) or 8
+                        num_partitions = min(1000, max(8, int(default_parallel) * 2))
+                        logger.info("Using partitioned JDBC read on primary_key [%s..%s] with %d partitions for behavior %s", min_int, max_int, num_partitions, behavior)
+
+                        df = (
+                            spark.read
+                            .format("jdbc")
+                            .option("url", jdbc_url)
+                            .option("dbtable", dbtable_subquery)
+                            .option("user", pg_user)
+                            .option("password", pg_pass)
+                            .option("driver", "org.postgresql.Driver")
+                            .option("fetchsize", "1000") # Reduce if OOM happens
+                            .option("partitionColumn", "primary_key")
+                            .option("lowerBound", str(min_int))
+                            .option("upperBound", str(max_int))
+                            .option("numPartitions", str(num_partitions))
+                            .load()
+                        )
+                    else:
+                        logger.info("Using single JDBC read with fetchsize (no partitioning) for behavior %s.", behavior)
+                        df = (
+                            spark.read
+                            .format("jdbc")
+                            .option("url", jdbc_url)
+                            .option("dbtable", dbtable_subquery)
+                            .option("user", pg_user)
+                            .option("password", pg_pass)
+                            .option("driver", "org.postgresql.Driver")
+                            .option("fetchsize", "1000") # Reduce if OOM happens
+                            .load()
+                        )
+                except Exception as e:
+                    logger.exception("Failed to read aggregated_ais_data via JDBC for behavior %s: %s", behavior, e)
+                    return make_response(jsonify({"status": "error", "message": f"JDBC read failed for behavior {behavior}: {e}"}), 500)
+
+                # sanitize column names if needed (simple manner)
+                try:
+                    original_cols = list(df.columns)
+                    safe_names = []
+                    for i, cname in enumerate(original_cols):
+                        s = str(cname) if cname is not None else ""
+                        if s.strip() == "" or s.isdigit():
+                            s = f"col_{i}"
+                        if s in safe_names:
+                            s = f"{s}_{i}"
+                        safe_names.append(s)
+                    if safe_names != original_cols:
+                        df = df.toDF(*safe_names)
+                except Exception:
+                    logger.debug("Column sanitization failed for behavior %s (non-fatal).", behavior)
+
+                # iterate rows for this behavior; use toLocalIterator to avoid materializing everything
+                try:
+                    it = df.toLocalIterator()
+                except Exception:
+                    logger.warning("toLocalIterator() failed for behavior %s; falling back to collect(). Be careful of memory usage.", behavior)
+                    it = iter(df.collect())
+
+                processed_for_behavior = 0
+                for row in it:
+                    try:
+                        rowd = row.asDict() if hasattr(row, "asDict") else dict(row)
+                        pk = rowd.get("primary_key")
+                        mmsi = rowd.get("mmsi")
+                        event_index = rowd.get("event_index")
+                        traj_wkt = rowd.get("trajectory_wkt") or rowd.get("trajectory")
+                        behavior_label = rowd.get("behavior_type_label") or behavior  # fallback
+
+                        if pk is None or traj_wkt is None or behavior_label is None:
+                            logger.debug("Skipping row with missing pk/trajectory/behavior: %s", {k: rowd.get(k) for k in ("primary_key","mmsi","event_index","behavior_type_label")})
+                            continue
+
+                        coords = ProcessDataService._parse_linestring_wkt_to_coords(traj_wkt)
+                        if not coords or len(coords) == 0:
+                            logger.debug("No coordinates parsed for pk=%s; skipping.", pk)
+                            continue
+
+                        # for each resolution, generate and save image
+                        for (width, height) in image_resolutions:
+                            pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, width, height, pad_frac=0.03, upscale=4)
+                            W = width * upscale
+                            H = height * upscale
+
+                            img = Image.new("L", (W, H), 255)
+                            draw = ImageDraw.Draw(img)
+
+                            base_line_width = max(1, int(round(min(W, H) / 120.0)))
+                            if len(pixels) >= 2:
+                                draw.line(pixels, fill=0, width=base_line_width, joint="curve")
+                            else:
+                                x0, y0 = pixels[0]
+                                r = max(1, base_line_width * 2)
+                                draw.ellipse((x0-r, y0-r, x0+r, y0+r), fill=0)
+
+                            final_img = img.resize((width, height), resample=Image.LANCZOS)
+
+                            xx = str(int(pk)).zfill(6)
+                            yy = str(int(pk))
+                            zz = str(int(event_index)) if event_index is not None else "0"
+                            ww = str(mmsi)
+                            filename = f"im_{xx}_aggregated_ais_data_primary_key_{yy}_event_index_{zz}_mmsi_{ww}.png"
+
+                            out_dir = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior_label)
+                            os.makedirs(out_dir, exist_ok=True)
+                            save_path = os.path.join(out_dir, filename)
+
+                            final_img.save(save_path, format="PNG", optimize=True)
+
+                        processed_for_behavior += 1
+                        total_processed += 1
+                        if processed_for_behavior % 100 == 0:
+                            logger.info("Processed %d rows for behavior %s...", processed_for_behavior, behavior)
+                        # If max_rows_per_behavior is set, we can stop early (defensive check in case LIMIT didn't apply)
+                        if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                            logger.info("Reached max_rows_per_behavior=%s for behavior %s; stopping processing for this behavior.", max_rows_per_behavior, behavior)
+                            break
+                    except Exception as row_e:
+                        logger.exception("Failed processing row for behavior %s: %s", behavior, row_e)
+                        # continue with next row
+
+                logger.info("Finished behavior %s: processed %d rows", behavior, processed_for_behavior)
+
+            logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: finished; total_processed=%d", total_processed)
+
+            # delete auxiliary variables to free memory
+            del df
+            del final_img
+            del img
+            del draw
+            del pixels
+            del coords
+            del traj_wkt
+            del pk
+            del event_index
+            del behavior
+            del it
+
+            return make_response(jsonify({"status": "success", "message": f"Images generated under {output_dir}", "processed_rows": total_processed}), 200)
+
+        except Exception as e:
+            logger.exception("Error generating image trajectory datasets: %s", e)
+            return make_response(jsonify({"status": "error", "message": str(e)}), 500)
 
     # def process_ais_events_Pitsikalis_2019(
     #     spark: SparkSession,
@@ -1754,7 +2061,7 @@ class Process_Data_Service:
     #     - filter AIS rows by relevant MMSI set and global min/max event times to reduce data scanned
     #     - perform a join where (ais.id == events.MMSI) AND (ais.timestamp between events.T_start and events.T_end)
     #     - select and order the output columns:
-    #     ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','EventIndex','Category']
+    #     ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','event_index','Category']
     #     Returns the Spark DataFrame with the joined results ("result_df").
     #     """
     #     # read AIS CSV
@@ -1834,12 +2141,12 @@ class Process_Data_Service:
     #         "heading",
     #         "turn",
     #         "course",
-    #         "EventIndex",
+    #         "event_index",
     #         "Category",
     #     ]
 
-    #     # If EventIndex or Category are not present in events, ensure they exist (avoid exceptions)
-    #     for c in ["EventIndex", "Category"]:
+    #     # If event_index or Category are not present in events, ensure they exist (avoid exceptions)
+    #     for c in ["event_index", "Category"]:
     #         if c not in joined.columns:
     #             joined = joined.withColumn(c, F.lit(None))
 
@@ -1874,7 +2181,7 @@ class Process_Data_Service:
         -------
         (loitering_result_df, normal_result_df, stopping_result_df)
             Three Spark DataFrames with the selected columns:
-            ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','EventIndex','Category']
+            ['id','timestamp','longitude','latitude','annotation','speed','heading','turn','course','event_index','Category']
         """
         # --- read AIS CSV ---
         ais_df = spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
@@ -1955,12 +2262,12 @@ class Process_Data_Service:
                 "heading",
                 "turn",
                 "course",
-                "EventIndex",
+                "event_index",
                 "Category",
             ]
 
-            # Ensure EventIndex and Category exist in joined
-            for c in ["EventIndex", "Category"]:
+            # Ensure event_index and Category exist in joined
+            for c in ["event_index", "Category"]:
                 if c not in joined.columns:
                     joined = joined.withColumn(c, F.lit(None))
 
@@ -1981,11 +2288,11 @@ class Process_Data_Service:
     # ---------- Helper: build grouped points ----------
     def build_grouped_points_Pitsikalis_2019(df: DataFrame) -> DataFrame:
         """
-        Group input AIS Spark DataFrame by EventIndex and produce an array-of-structs 'points'
+        Group input AIS Spark DataFrame by event_index and produce an array-of-structs 'points'
         sorted by timestamp.
 
         The resulting DataFrame has columns:
-        - EventIndex
+        - event_index
         - mmsi (first id)
         - Category (first Category)
         - points: array<struct(ts: long, lat: double, lon: double, sog: double, cog: double)>
@@ -2008,7 +2315,7 @@ class Process_Data_Service:
         # note: use the raw columns while building the struct via SQL expression below for stable compatibility
         grouped = (
             df_ts
-            .groupBy("EventIndex")
+            .groupBy("event_index")
             .agg(
                 F.first(F.col("id")).alias("mmsi"),
                 F.first(F.col("Category")).alias("Category"),
@@ -2053,248 +2360,248 @@ class Process_Data_Service:
 
 
     # ---------- Compute event-level metrics using Spark ----------
-    def compute_event_metrics_spark_Pitsikalis_2019(grouped: DataFrame) -> DataFrame:
-        """
-        Given a grouped DataFrame (output of build_grouped_points_Pitsikalis_2019),
-        compute the derived columns using Spark higher-order functions:
+    # def DEPRECATED_compute_event_metrics_spark_Pitsikalis_2019(grouped: DataFrame) -> DataFrame:
+    #     """
+    #     Given a grouped DataFrame (output of build_grouped_points_Pitsikalis_2019),
+    #     compute the derived columns using Spark higher-order functions:
 
-        - timestamp_array (array of ISO strings "YYYY-MM-DD HH:MM:SS")
-        - average_time_diff_between_consecutive_points (seconds, float)
-        - sog_array, cog_array (arrays of doubles)
-        - average_sog, min_sog, max_sog, standard_deviation_sog (population std)
-        - average_cog, min_cog, max_cog, standard_deviation_cog (population std)
-        - trajectory (LINESTRING string using "lon lat" pairs)
-        - coord_pairs (array of structs lat1,lon1,lat2,lon2) for distance calculations
-        - distance_in_kilometers computed by a pure-Spark haversine aggregator
+    #     - timestamp_array (array of ISO strings "YYYY-MM-DD HH:MM:SS")
+    #     - average_time_diff_between_consecutive_points (seconds, float)
+    #     - sog_array, cog_array (arrays of doubles)
+    #     - average_sog, min_sog, max_sog, standard_deviation_sog (population std)
+    #     - average_cog, min_cog, max_cog, standard_deviation_cog (population std)
+    #     - trajectory (LINESTRING string using "lon lat" pairs)
+    #     - coord_pairs (array of structs lat1,lon1,lat2,lon2) for distance calculations
+    #     - distance_in_kilometers computed by a pure-Spark haversine aggregator
 
-        Returns:
-        - DataFrame with final event-level columns similar to original pandas output.
-        """
-        # 1) ts array and ISO formatted timestamp array
-        grouped2 = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)"))
+    #     Returns:
+    #     - DataFrame with final event-level columns similar to original pandas output.
+    #     """
+    #     # 1) ts array and ISO formatted timestamp array
+    #     grouped2 = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)"))
 
-        grouped2 = grouped2.withColumn(
-            "timestamp_array",
-            F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "timestamp_array",
+    #         F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")
+    #     )
 
-        # 2) time_diffs & average
-        grouped2 = grouped2.withColumn(
-            "time_diffs",
-            F.expr(
-                "CASE WHEN size(ts_array) <= 1 THEN array() "
-                "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
-            )
-        )
+    #     # 2) time_diffs & average
+    #     grouped2 = grouped2.withColumn(
+    #         "time_diffs",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_time_diff_between_consecutive_points",
-            F.expr(
-                "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE (aggregate(time_diffs, cast(0 as bigint), (acc, x) -> acc + x) / size(time_diffs)) END"
-            ).cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE (aggregate(time_diffs, cast(0 as bigint), (acc, x) -> acc + x) / size(time_diffs)) END"
+    #         ).cast(DoubleType())
+    #     )
 
-        # 3) SOG / COG arrays (force double cast to avoid datatype mismatches)
-        grouped2 = grouped2.withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))"))
-        grouped2 = grouped2.withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+    #     # 3) SOG / COG arrays (force double cast to avoid datatype mismatches)
+    #     grouped2 = grouped2.withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))"))
+    #     grouped2 = grouped2.withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # 4) SOG stats (population stddev)
-        # Use explicitly typed accumulator cast(0.0 as double) to avoid datatype mismatch
-        grouped2 = grouped2.withColumn(
-            "sum_sog",
-            F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "sumsq_sog",
-            F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "count_sog",
-            F.expr("aggregate(sog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
-        )
+    #     # 4) SOG stats (population stddev)
+    #     # Use explicitly typed accumulator cast(0.0 as double) to avoid datatype mismatch
+    #     grouped2 = grouped2.withColumn(
+    #         "sum_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "sumsq_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "count_sog",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_sog",
-            F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sum_sog / count_sog END").cast(DoubleType())
-        )
-        grouped2 = grouped2.withColumn("min_sog", F.expr("array_min(sog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn("max_sog", F.expr("array_max(sog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn(
-            "standard_deviation_sog",
-            F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sqrt( (sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2) ) END").cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_sog",
+    #         F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sum_sog / count_sog END").cast(DoubleType())
+    #     )
+    #     grouped2 = grouped2.withColumn("min_sog", F.expr("array_min(sog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn("max_sog", F.expr("array_max(sog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn(
+    #         "standard_deviation_sog",
+    #         F.expr("CASE WHEN count_sog = 0 THEN NULL ELSE sqrt( (sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2) ) END").cast(DoubleType())
+    #     )
 
-        # 5) COG stats (same treatment)
-        grouped2 = grouped2.withColumn(
-            "sum_cog",
-            F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "sumsq_cog",
-            F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
-        )
-        grouped2 = grouped2.withColumn(
-            "count_cog",
-            F.expr("aggregate(cog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
-        )
+    #     # 5) COG stats (same treatment)
+    #     grouped2 = grouped2.withColumn(
+    #         "sum_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "sumsq_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc, x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     )
+    #     grouped2 = grouped2.withColumn(
+    #         "count_cog",
+    #         F.expr("aggregate(cog_array, cast(0 as int), (acc, x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
 
-        grouped2 = grouped2.withColumn(
-            "average_cog",
-            F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sum_cog / count_cog END").cast(DoubleType())
-        )
-        grouped2 = grouped2.withColumn("min_cog", F.expr("array_min(cog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn("max_cog", F.expr("array_max(cog_array)").cast(DoubleType()))
-        grouped2 = grouped2.withColumn(
-            "standard_deviation_cog",
-            F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sqrt( (sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2) ) END").cast(DoubleType())
-        )
+    #     grouped2 = grouped2.withColumn(
+    #         "average_cog",
+    #         F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sum_cog / count_cog END").cast(DoubleType())
+    #     )
+    #     grouped2 = grouped2.withColumn("min_cog", F.expr("array_min(cog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn("max_cog", F.expr("array_max(cog_array)").cast(DoubleType()))
+    #     grouped2 = grouped2.withColumn(
+    #         "standard_deviation_cog",
+    #         F.expr("CASE WHEN count_cog = 0 THEN NULL ELSE sqrt( (sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2) ) END").cast(DoubleType())
+    #     )
 
-        # 6) trajectory LINESTRING
-        grouped2 = grouped2.withColumn(
-            "trajectory",
-            F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
-        )
+    #     # 6) trajectory LINESTRING
+    #     grouped2 = grouped2.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
+    #     )
 
-        # 7) coord_pairs array for distance calculation
-        grouped2 = grouped2.withColumn(
-            "coord_pairs",
-            F.expr(
-                "CASE WHEN size(points) <= 1 THEN array() ELSE transform(sequence(1, size(points)-1), i -> struct( element_at(points, i).lat as lat1, element_at(points, i).lon as lon1, element_at(points, i+1).lat as lat2, element_at(points, i+1).lon as lon2 )) END"
-            )
-        )
+    #     # 7) coord_pairs array for distance calculation
+    #     grouped2 = grouped2.withColumn(
+    #         "coord_pairs",
+    #         F.expr(
+    #             "CASE WHEN size(points) <= 1 THEN array() ELSE transform(sequence(1, size(points)-1), i -> struct( element_at(points, i).lat as lat1, element_at(points, i).lon as lon1, element_at(points, i+1).lat as lat2, element_at(points, i+1).lon as lon2 )) END"
+    #         )
+    #     )
 
-        # 8) compute Spark haversine sum (pure Spark; fast on executors)
-        haversine_expr = Process_Data_Service._spark_haversine_distance_expr_for_coord_pairs()
-        grouped2 = grouped2.withColumn("distance_in_kilometers", F.expr(haversine_expr).cast(DoubleType()))
+    #     # 8) compute Spark haversine sum (pure Spark; fast on executors)
+    #     haversine_expr = ProcessDataService._spark_haversine_distance_expr_for_coord_pairs()
+    #     grouped2 = grouped2.withColumn("distance_in_kilometers", F.expr(haversine_expr).cast(DoubleType()))
 
-        # 9) convert timestamp_array (ARRAY<STRING>) to a STRING that looks exactly like Python's list
-        # Format: ['YYYY-MM-DD HH:MM:SS', None, 'YYYY-...']
-        # Use a CASE to render NULL elements as the bare word None (no quotes) and present elements with single quotes.
-        ts_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE concat(\"'\", t, \"'\") END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+    #     # 9) convert timestamp_array (ARRAY<STRING>) to a STRING that looks exactly like Python's list
+    #     # Format: ['YYYY-MM-DD HH:MM:SS', None, 'YYYY-...']
+    #     # Use a CASE to render NULL elements as the bare word None (no quotes) and present elements with single quotes.
+    #     ts_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE concat(\"'\", t, \"'\") END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
 
-        # 10) convert sog_array (ARRAY<DOUBLE>) to STRING like [1.23, None, 4.56]
-        sog_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     # 10) convert sog_array (ARRAY<DOUBLE>) to STRING like [1.23, None, 4.56]
+    #     sog_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
 
-        # 11) convert cog_array (ARRAY<DOUBLE>) to STRING like [12.3, None, 45.6]
-        cog_array_to_str_expr = (
-            "concat('[', "
-            "array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
-            "']')"
-        )
-        grouped2 = grouped2.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+    #     # 11) convert cog_array (ARRAY<DOUBLE>) to STRING like [12.3, None, 45.6]
+    #     cog_array_to_str_expr = (
+    #         "concat('[', "
+    #         "array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), "
+    #         "']')"
+    #     )
+    #     grouped2 = grouped2.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
 
-        # 12) Select final columns keeping original numeric semantics/column names
-        result = grouped2.select(
-            F.col("mmsi").alias("mmsi"),
-            F.col("distance_in_kilometers").alias("distance_in_kilometers"),
-            F.col("EventIndex").alias("EventIndex"),
-            F.col("trajectory").alias("trajectory"),
-            F.col("timestamp_array_str").alias("timestamp_array"),  # <-- stringified version used here
-            F.col("average_time_diff_between_consecutive_points").alias("average_time_diff_between_consecutive_points"),
-            F.col("sog_array_str").alias("sog_array"),  # stringified
-            F.col("cog_array_str").alias("cog_array"),  # stringified
-            F.col("average_sog").alias("average_sog"),
-            F.col("min_sog").alias("min_sog"),
-            F.col("max_sog").alias("max_sog"),
-            F.col("standard_deviation_sog").alias("standard_deviation_sog"),
-            F.col("average_cog").alias("average_cog"),
-            F.col("min_cog").alias("min_cog"),
-            F.col("max_cog").alias("max_cog"),
-            F.col("standard_deviation_cog").alias("standard_deviation_cog"),
-            F.col("Category").alias("behavior_type_vector"),
-        )
+    #     # 12) Select final columns keeping original numeric semantics/column names
+    #     result = grouped2.select(
+    #         F.col("mmsi").alias("mmsi"),
+    #         F.col("distance_in_kilometers").alias("distance_in_kilometers"),
+    #         F.col("event_index").alias("event_index"),
+    #         F.col("trajectory").alias("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),  # <-- stringified version used here
+    #         F.col("average_time_diff_between_consecutive_points").alias("average_time_diff_between_consecutive_points"),
+    #         F.col("sog_array_str").alias("sog_array"),  # stringified
+    #         F.col("cog_array_str").alias("cog_array"),  # stringified
+    #         F.col("average_sog").alias("average_sog"),
+    #         F.col("min_sog").alias("min_sog"),
+    #         F.col("max_sog").alias("max_sog"),
+    #         F.col("standard_deviation_sog").alias("standard_deviation_sog"),
+    #         F.col("average_cog").alias("average_cog"),
+    #         F.col("min_cog").alias("min_cog"),
+    #         F.col("max_cog").alias("max_cog"),
+    #         F.col("standard_deviation_cog").alias("standard_deviation_cog"),
+    #         F.col("Category").alias("behavior_type_vector"),
+    #     )
 
-        return result
+    #     return result
 
     # ---------- Top-level orchestrator ----------
-    def OPTIONAL_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
-        """
-        Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by EventIndex.
+    # def DEPRECATED_MUST_BE_SKIPPED_convert_to_vessel_events_Pitsikalis_2019(df: DataFrame, spark: SparkSession) -> DataFrame:
+    #     """
+    #     Orchestrates conversion of an AIS Spark DataFrame to vessel-event summaries grouped by event_index.
 
-        Steps:
-        - logs partition counts and uses mapPartitionsWithIndex to emit per-partition start/finish messages
-        - aggregates points per EventIndex (ordered by timestamp) using pure Spark
-        - computes event-level metrics (timestamp arrays, average time diffs, SOG/COG arrays & stats, trajectory)
-        - computes total distance using a pure-Spark haversine aggregator
-        - logs progress and sample outputs for debugging
+    #     Steps:
+    #     - logs partition counts and uses mapPartitionsWithIndex to emit per-partition start/finish messages
+    #     - aggregates points per event_index (ordered by timestamp) using pure Spark
+    #     - computes event-level metrics (timestamp arrays, average time diffs, SOG/COG arrays & stats, trajectory)
+    #     - computes total distance using a pure-Spark haversine aggregator
+    #     - logs progress and sample outputs for debugging
 
-        Returns:
-        - the final Spark DataFrame (pre-save view) for further use.
-        """
-        # initial stats
-        try:
-            total_rows = df.count()
-        except Exception:
-            total_rows = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: starting pipeline. input rows={total_rows}")
+    #     Returns:
+    #     - the final Spark DataFrame (pre-save view) for further use.
+    #     """
+    #     # initial stats
+    #     try:
+    #         total_rows = df.count()
+    #     except Exception:
+    #         total_rows = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: starting pipeline. input rows={total_rows}")
 
-        # log partition counts for progress insight
-        try:
-            partition_count = df.rdd.getNumPartitions()
-            logger.info(f"convert_to_vessel_events_Pitsikalis_2019: input DataFrame partitions = {partition_count}")
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not get partition count")
+    #     # log partition counts for progress insight
+    #     try:
+    #         partition_count = df.rdd.getNumPartitions()
+    #         logger.info(f"convert_to_vessel_events_Pitsikalis_2019: input DataFrame partitions = {partition_count}")
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not get partition count")
 
-        # run partition-level logger to emit start/finish for each partition
-        #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(df)
+    #     # run partition-level logger to emit start/finish for each partition
+    #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(df)
 
-        # aggregate points per EventIndex
-        logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per EventIndex")
-        grouped = Process_Data_Service.build_grouped_points_Pitsikalis_2019(df)
+    #     # aggregate points per event_index
+    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: aggregating points per event_index")
+    #     grouped = ProcessDataService.build_grouped_points_Pitsikalis_2019(df)
 
-        # grouped count logging
-        try:
-            grouped_count = grouped.count()
-        except Exception:
-            grouped_count = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped EventIndex count = {grouped_count}")
+    #     # grouped count logging
+    #     try:
+    #         grouped_count = grouped.count()
+    #     except Exception:
+    #         grouped_count = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped event_index count = {grouped_count}")
 
-        # log partitions on grouped DataFrame as well
-        try:
-            grouped_partitions = grouped.rdd.getNumPartitions()
-            logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped DataFrame partitions = {grouped_partitions}")
-            #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(grouped)
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: failed grouped partition logging")
+    #     # log partitions on grouped DataFrame as well
+    #     try:
+    #         grouped_partitions = grouped.rdd.getNumPartitions()
+    #         logger.info(f"convert_to_vessel_events_Pitsikalis_2019: grouped DataFrame partitions = {grouped_partitions}")
+    #         #ProcessDataService.log_progress_partitions_Pitsikalis_2019(grouped)
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: failed grouped partition logging")
 
-        # compute metrics (pure Spark heavy-lifting)
-        logger.info("convert_to_vessel_events_Pitsikalis_2019: computing event metrics (Spark)")
-        metrics_df = Process_Data_Service.compute_event_metrics_spark_Pitsikalis_2019(grouped)
+    #     # compute metrics (pure Spark heavy-lifting)
+    #     logger.info("convert_to_vessel_events_Pitsikalis_2019: computing event metrics (Spark)")
+    #     metrics_df = ProcessDataService.DEPRECATED_compute_event_metrics_spark_Pitsikalis_2019(grouped)
 
-        # show a sample (safe attempt)
-        try:
-            sample_row = metrics_df.limit(1).collect()
-            if sample_row:
-                logger.info("convert_to_vessel_events_Pitsikalis_2019: sample row for debugging:\n%s", [row.asDict() for row in sample_row])
-            else:
-                logger.info("convert_to_vessel_events_Pitsikalis_2019: no sample row available")
-        except Exception:
-            logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not fetch sample row")
+    #     # show a sample (safe attempt)
+    #     try:
+    #         sample_row = metrics_df.limit(1).collect()
+    #         if sample_row:
+    #             logger.info("convert_to_vessel_events_Pitsikalis_2019: sample row for debugging:\n%s", [row.asDict() for row in sample_row])
+    #         else:
+    #             logger.info("convert_to_vessel_events_Pitsikalis_2019: no sample row available")
+    #     except Exception:
+    #         logger.debug("convert_to_vessel_events_Pitsikalis_2019: could not fetch sample row")
 
-        # final counts log
-        try:
-            final_count = metrics_df.count()
-        except Exception:
-            final_count = None
-        logger.info(f"convert_to_vessel_events_Pitsikalis_2019: finished. output event rows={final_count}")
+    #     # final counts log
+    #     try:
+    #         final_count = metrics_df.count()
+    #     except Exception:
+    #         final_count = None
+    #     logger.info(f"convert_to_vessel_events_Pitsikalis_2019: finished. output event rows={final_count}")
 
-        # # optionally log partition counts of final df
-        # try:
-        #     #Process_Data_Service.log_progress_partitions_Pitsikalis_2019(metrics_df)
-        # except Exception:
-        #     logger.debug("convert_to_vessel_events_Pitsikalis_2019: final partition logging failed")
+    #     # # optionally log partition counts of final df
+    #     # try:
+    #     #     #ProcessDataService.log_progress_partitions_Pitsikalis_2019(metrics_df)
+    #     # except Exception:
+    #     #     logger.debug("convert_to_vessel_events_Pitsikalis_2019: final partition logging failed")
 
-        return metrics_df
+    #     return metrics_df
 
         #### WARNING: UNTESTED!!! ####
     
@@ -2314,25 +2621,25 @@ class Process_Data_Service:
         - normalizes and explodes events' MMSI / MMSI_2 into one 'mmsi' column
         - reads AIS CSV with Spark and casts fields
         - joins AIS points to events by mmsi and timestamp window
-        - groups points into ordered arrays per (EventIndex, mmsi)
+        - groups points into ordered arrays per (event_index, mmsi)
         - computes the same metrics as the pandas implementation:
             trajectory, timestamp_array (array[str] -> then stringified),
             sog_array (array[double] -> then stringified),
             cog_array (array[double] -> then stringified),
             average_speed, min_speed, max_speed, average_heading, std_dev_heading,
             total_area_time, low_speed_percentage, stagnation_time
-        - writes the final CSV using Process_Data_Service.save_spark_df_as_csv which performs coalesce(1)
+        - writes the final CSV using ProcessDataService.save_spark_df_as_csv which performs coalesce(1)
             and subsequent promotion/permission adjustments.
 
         Parameters
         ----------
         events_df : DataFrame
-            Spark DataFrame with columns ['EventIndex', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
+            Spark DataFrame with columns ['event_index', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
         ais_path : str
             Path to AIS CSV (accessible by Spark).
         spark : SparkSession
         output_dir : str
-            Directory to write final CSV (passed to Process_Data_Service.save_spark_df_as_csv).
+            Directory to write final CSV (passed to ProcessDataService.save_spark_df_as_csv).
 
         Returns
         -------
@@ -2356,7 +2663,7 @@ class Process_Data_Service:
             F.explode(F.expr("filter(mmsi_array, x -> x is not null)"))
         ).drop("mmsi_array")
 
-        events_exp = events_exp.select("EventIndex", "T_start", "T_end", "Category", "mmsi")
+        events_exp = events_exp.select("event_index", "T_start", "T_end", "Category", "mmsi")
 
         # 2) Read AIS CSV
         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: reading AIS CSV from %s", ais_path)
@@ -2367,13 +2674,13 @@ class Process_Data_Service:
         ais = ais.toDF(*[c.strip() for c in ais.columns])
         ais = ais.withColumn("id", F.col("id").cast(StringType()))
 
-        # timestamp heuristic: numeric => ms => seconds; else unix_timestamp
+        # timestamp heuristic: numeric => already ms; else unix_timestamp * 1000 -> milliseconds
         ais = ais.withColumn(
-            "_ts_seconds",
+            "_ts_millis",
             F.when(
-                F.col("timestamp").cast("double").isNotNull() & F.col("timestamp").rlike("^[0-9]+$"),
-                (F.col("timestamp").cast("double") / F.lit(1000.0)).cast("long"),
-            ).otherwise(F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long"))
+                (F.col("timestamp").cast("double").isNotNull()) & F.col("timestamp").rlike("^[0-9]+$"),
+                F.col("timestamp").cast("long"),
+            ).otherwise((F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000)))
         ).withColumn("latitude", F.col("latitude").cast(DoubleType())) \
         .withColumn("longitude", F.col("longitude").cast(DoubleType())) \
         .withColumn("speed", F.col("speed").cast(DoubleType())) \
@@ -2386,30 +2693,36 @@ class Process_Data_Service:
             logger.debug("could not obtain ais partitions")
 
         # 3) Join AIS → events by mmsi and timestamp window
-        events_bounds = events_exp.withColumn("t_start_s", F.unix_timestamp(F.col("T_start")).cast(LongType())) \
-                                .withColumn("t_end_s", F.unix_timestamp(F.col("T_end")).cast(LongType()))
+        # use milliseconds for event bounds to match AIS _ts_millis
+        events_bounds = events_exp.withColumn(
+            "t_start_ms",
+            (F.unix_timestamp(F.col("T_start")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+        ).withColumn(
+            "t_end_ms",
+            (F.unix_timestamp(F.col("T_end")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+        )
 
         join_cond = (
             (ais.id == events_bounds.mmsi) &
-            (ais._ts_seconds >= events_bounds.t_start_s) &
-            (ais._ts_seconds <= events_bounds.t_end_s)
+            (ais._ts_millis >= events_bounds.t_start_ms) &
+            (ais._ts_millis <= events_bounds.t_end_ms)
         )
 
         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
         joined = ais.join(events_bounds, on=join_cond, how="inner").select(
-            events_bounds.EventIndex.alias("EventIndex"),
+            events_bounds.event_index.alias("event_index"),
             events_bounds.mmsi.alias("mmsi"),
             events_bounds.Category.alias("Category"),
-            ais._ts_seconds.alias("ts"),
+            ais._ts_millis.alias("ts"),
             ais.longitude.alias("lon"),
             ais.latitude.alias("lat"),
             ais.speed.alias("sog"),
             ais.heading.alias("cog")
         )
 
-        # 4) Group into ordered 'points' array per EventIndex,mmsi
-        logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (EventIndex, mmsi)")
-        grouped = joined.groupBy("EventIndex", "mmsi", "Category").agg(
+        # 4) Group into ordered 'points' array per event_index,mmsi
+        logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (event_index, mmsi)")
+        grouped = joined.groupBy("event_index", "mmsi", "Category").agg(
             F.expr(
                 "array_sort(collect_list(struct(ts as ts, lat as lat, lon as lon, sog as sog, cog as cog)),"
                 " (x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
@@ -2418,15 +2731,15 @@ class Process_Data_Service:
 
         # 5) Compute arrays and stats from points
         df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
-                    .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(t, 'yyyy-MM-dd HH:mm:ss') END)")) \
-                    .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
-                    .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+            .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")) \
+            .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+            .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # NEW: lat/lon arrays for distance computation (haversine)
+        # lat/lon arrays for distance computation (haversine)
         df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
                .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
 
-        # time diffs array (seconds)
+        # time diffs array (milliseconds)
         df = df.withColumn(
             "time_diffs",
             F.expr(
@@ -2458,6 +2771,7 @@ class Process_Data_Service:
             .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType())) \
             .withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2)) END").cast(DoubleType()))
 
+        
         # 6) Build trajectory as LINESTRING(lon lat, ...)
         df = df.withColumn(
             "trajectory",
@@ -2481,7 +2795,7 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
-        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        # distance_in_kilometers using haversine (Spark-only math)
         # Uses element_at(lat_array, i) 1-based indexing and sums distances between consecutive pairs
         df = df.withColumn(
             "distance_in_kilometers",
@@ -2492,7 +2806,58 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (seconds)
+        # --- displacement_ratio (haversine between first and last) ---
+        df = df.withColumn("first_lat", F.element_at(F.col("lat_array"), 1)) \
+               .withColumn("first_lon", F.element_at(F.col("lon_array"), 1)) \
+               .withColumn("last_lat", F.element_at(F.col("lat_array"), F.size(F.col("lat_array")))) \
+               .withColumn("last_lon", F.element_at(F.col("lon_array"), F.size(F.col("lon_array"))))
+
+        df = df.withColumn(
+            "displacement_km",
+            F.expr(
+                "CASE WHEN first_lat IS NULL OR last_lat IS NULL THEN 0.0 ELSE "
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(last_lat) - radians(first_lat)) / 2 ), 2 ) + "
+                "cos(radians(first_lat)) * cos(radians(last_lat)) * pow( sin( (radians(last_lon) - radians(first_lon)) / 2 ), 2 ) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "displacement_ratio",
+            F.when(F.col("distance_in_kilometers") > 0, F.col("displacement_km") / F.col("distance_in_kilometers")).otherwise(F.lit(0.0))
+        )
+
+        # --- cog_unit_range: time-weighted average of per-segment COG (degrees), normalized by 360 ---
+        # numerator = aggregate over i in 2..size(lat_array): cog_segment(i) * element_at(time_diffs, i-1)
+        # denom = aggregate over i in 2..size(lat_array): element_at(time_diffs, i-1)
+        df = df.withColumn(
+            "cog_unit_numer",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), "
+                "(acc, i) -> acc + ( ((degrees(atan2(element_at(lon_array, i) - element_at(lon_array, i-1), element_at(lat_array, i) - element_at(lat_array, i-1))) + 360) % 360) * element_at(time_diffs, i-1) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_denom",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc,i) -> acc + element_at(time_diffs, i-1)) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_range",
+            F.when(F.col("cog_unit_denom") == 0.0, F.lit(0.0)).otherwise(F.col("cog_unit_numer") / F.col("cog_unit_denom"))
+        ).withColumn(
+            "cog_unit_range_normalized",
+            (F.col("cog_unit_range") / F.lit(360.0)).cast(DoubleType())
+        ).drop("cog_unit_numer", "cog_unit_denom", "cog_unit_range")
+
+        # --- cog_ratio: proportion of consecutive COG changes > threshold (10 degrees) ---
+        df = df.withColumn(
+            "_cog_change_count",
+            F.expr(
+                "CASE WHEN size(cog_array) <= 1 THEN 0 ELSE aggregate(sequence(2, size(cog_array)), cast(0 as int), (acc,i) -> acc + CASE WHEN abs(element_at(cog_array,i) - element_at(cog_array,i-1)) > 10.0 THEN 1 ELSE 0 END) END"
+            )
+        ).withColumn(
+            "cog_ratio",
+            F.when(F.size(F.col("cog_array")) <= 1, F.lit(0.0)).otherwise(F.col("_cog_change_count") / (F.size(F.col("cog_array")) - 1))
+        ).drop("_cog_change_count")
+
+        # average_time_diff_between_consecutive_points (milliseconds)
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
@@ -2520,12 +2885,12 @@ class Process_Data_Service:
         # 9) Prepare final DataFrame with stringified arrays (so CSV writer won't error)
         result = df.select(
             F.col("mmsi"),
-            F.col("EventIndex"),
+            F.col("event_index"),
             F.col("trajectory"),
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
             F.col("cog_array_str").alias("cog_array"),
-            F.col("Category").alias("behavior_type_vector"),
+            F.col("Category").alias("behavior_type_label"),
             F.col("average_speed"),
             F.col("min_speed"),
             F.col("max_speed"),
@@ -2537,6 +2902,9 @@ class Process_Data_Service:
             # NEW fields included:
             F.col("distance_in_kilometers"),
             F.col("average_time_diff_between_consecutive_points"),
+            F.col("displacement_ratio"),
+            F.col("cog_unit_range_normalized").alias("cog_unit_range"),
+            F.col("cog_ratio"),
             F.col("min_heading"),
             F.col("max_heading"),
             F.col("std_dev_speed")
@@ -2544,8 +2912,262 @@ class Process_Data_Service:
 
         # Rename mmsi to id for consistency with NON-TRANSSHIPMENT
         result = result.withColumnRenamed("mmsi", "id")
-        
+
+        logger.info("create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
+
         return result
+
+    
+    # def create_aggregated_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+    #     events_df: DataFrame,
+    #     ais_path: str,
+    #     spark: SparkSession,
+    # ) -> DataFrame:
+    #     """
+    #     Pure-Spark replacement for the pandas `create_aux_dataframe_with_chunks`.
+
+    #     Steps:
+    #     - normalizes and explodes events' MMSI / MMSI_2 into one 'mmsi' column
+    #     - reads AIS CSV with Spark and casts fields
+    #     - joins AIS points to events by mmsi and timestamp window
+    #     - groups points into ordered arrays per (event_index, mmsi)
+    #     - computes the same metrics as the pandas implementation:
+    #         trajectory, timestamp_array (array[str] -> then stringified),
+    #         sog_array (array[double] -> then stringified),
+    #         cog_array (array[double] -> then stringified),
+    #         average_speed, min_speed, max_speed, average_heading, std_dev_heading,
+    #         total_area_time, low_speed_percentage, stagnation_time
+    #     - writes the final CSV using ProcessDataService.save_spark_df_as_csv which performs coalesce(1)
+    #         and subsequent promotion/permission adjustments.
+
+    #     Parameters
+    #     ----------
+    #     events_df : DataFrame
+    #         Spark DataFrame with columns ['event_index', 'T_start', 'T_end', 'Category', 'MMSI', 'MMSI_2'].
+    #     ais_path : str
+    #         Path to AIS CSV (accessible by Spark).
+    #     spark : SparkSession
+    #     output_dir : str
+    #         Directory to write final CSV (passed to ProcessDataService.save_spark_df_as_csv).
+
+    #     Returns
+    #     -------
+    #     DataFrame
+    #         The final Spark DataFrame (with array columns replaced by their stringified forms).
+    #     """
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: start")
+
+    #     # 1) Normalize events timestamps and explode MMSI/MMSI_2 into single 'mmsi'
+    #     events = (
+    #         events_df
+    #         .withColumn("T_start", F.to_timestamp(F.col("T_start")))
+    #         .withColumn("T_end", F.to_timestamp(F.col("T_end")))
+    #     )
+
+    #     events_exp = events.withColumn(
+    #         "mmsi_array",
+    #         F.array(F.col("MMSI").cast(StringType()), F.col("MMSI_2").cast(StringType()))
+    #     ).withColumn(
+    #         "mmsi",
+    #         F.explode(F.expr("filter(mmsi_array, x -> x is not null)"))
+    #     ).drop("mmsi_array")
+
+    #     events_exp = events_exp.select("event_index", "T_start", "T_end", "Category", "mmsi")
+
+    #     # 2) Read AIS CSV
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: reading AIS CSV from %s", ais_path)
+    #     ais = (
+    #         spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
+    #         .withColumnRenamed("Id", "id")
+    #     )
+    #     ais = ais.toDF(*[c.strip() for c in ais.columns])
+    #     ais = ais.withColumn("id", F.col("id").cast(StringType()))
+
+    #     # timestamp heuristic: numeric => already ms; else unix_timestamp * 1000 -> milliseconds
+    #     ais = ais.withColumn(
+    #         "_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & F.col("timestamp").rlike("^[0-9]+$"),
+    #             F.col("timestamp").cast("long"),
+    #         ).otherwise((F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000)))
+    #     ).withColumn("latitude", F.col("latitude").cast(DoubleType())) \
+    #     .withColumn("longitude", F.col("longitude").cast(DoubleType())) \
+    #     .withColumn("speed", F.col("speed").cast(DoubleType())) \
+    #     .withColumn("heading", F.col("heading").cast(DoubleType()))
+
+    #     try:
+    #         ais_parts = ais.rdd.getNumPartitions()
+    #         logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: AIS partitions = %s", ais_parts)
+    #     except Exception:
+    #         logger.debug("could not obtain ais partitions")
+
+    #     # 3) Join AIS → events by mmsi and timestamp window
+    #     # use milliseconds for event bounds to match AIS _ts_millis
+    #     events_bounds = events_exp.withColumn(
+    #         "t_start_ms",
+    #         (F.unix_timestamp(F.col("T_start")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+    #     ).withColumn(
+    #         "t_end_ms",
+    #         (F.unix_timestamp(F.col("T_end")).cast(LongType()) * F.lit(1000)).cast(LongType()),
+    #     )
+
+    #     join_cond = (
+    #         (ais.id == events_bounds.mmsi) &
+    #         (ais._ts_millis >= events_bounds.t_start_ms) &
+    #         (ais._ts_millis <= events_bounds.t_end_ms)
+    #     )
+
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: performing join (may shuffle)")
+    #     joined = ais.join(events_bounds, on=join_cond, how="inner").select(
+    #         events_bounds.event_index.alias("event_index"),
+    #         events_bounds.mmsi.alias("mmsi"),
+    #         events_bounds.Category.alias("Category"),
+    #         ais._ts_millis.alias("ts"),
+    #         ais.longitude.alias("lon"),
+    #         ais.latitude.alias("lat"),
+    #         ais.speed.alias("sog"),
+    #         ais.heading.alias("cog")
+    #     )
+
+    #     # 4) Group into ordered 'points' array per event_index,mmsi
+    #     logger.info("create_aggregated_dataframe_with_spark_Pitsikalis_2019: grouping points per (event_index, mmsi)")
+    #     grouped = joined.groupBy("event_index", "mmsi", "Category").agg(
+    #         F.expr(
+    #             "array_sort(collect_list(struct(ts as ts, lat as lat, lon as lon, sog as sog, cog as cog)),"
+    #             " (x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
+    #         ).alias("points")
+    #     )
+
+    #     # 5) Compute arrays and stats from points
+    #     df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
+    #         .withColumn("timestamp_array", F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")) \
+    #         .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+    #         .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+
+    #     # NEW: lat/lon arrays for distance computation (haversine)
+    #     df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+    #            .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
+    #     # time diffs array (milliseconds)
+    #     df = df.withColumn(
+    #         "time_diffs",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
+
+    #     # total_area_time
+    #     df = df.withColumn("total_area_time", F.expr("aggregate(time_diffs, cast(0.0 as double), (acc,x) -> acc + x)"))
+
+    #     # SOG statistics
+    #     df = df.withColumn("sum_sog", F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("sumsq_sog", F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("count_sog", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)"))
+
+    #     df = df.withColumn("average_speed", F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sum_sog / count_sog END").cast(DoubleType())) \
+    #         .withColumn("min_speed", F.expr("array_min(sog_array)").cast(DoubleType())) \
+    #         .withColumn("max_speed", F.expr("array_max(sog_array)").cast(DoubleType())) \
+    #         .withColumn("std_dev_speed", F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sqrt((sumsq_sog / count_sog) - POWER(sum_sog / count_sog, 2)) END").cast(DoubleType()))
+
+    #     # COG statistics
+    #     df = df.withColumn("sum_cog", F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("sumsq_cog", F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")) \
+    #         .withColumn("count_cog", F.expr("aggregate(cog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)"))
+
+    #     df = df.withColumn("average_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sum_cog / count_cog END").cast(DoubleType())) \
+    #         .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
+    #         .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType())) \
+    #         .withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / count_cog) - POWER(sum_cog / count_cog, 2)) END").cast(DoubleType()))
+
+    #     # 6) Build trajectory as LINESTRING(lon lat, ...)
+    #     df = df.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, x -> concat(cast(x.lon as string), ' ', cast(x.lat as string))), ', '), ')')")
+    #     )
+
+    #     # 7) low_speed_percentage and stagnation_time
+    #     df = df.withColumn("count_low_speed_2", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")) \
+    #         .withColumn("count_low_speed_0_5", F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 0.5 THEN 1 ELSE 0 END)")) \
+    #         .withColumn("count_sog_total", F.expr("size(sog_array)"))
+
+    #     df = df.withColumn(
+    #         "low_speed_percentage",
+    #         F.expr("CASE WHEN count_sog_total = 0 THEN 0.0 ELSE (count_low_speed_2 / cast(count_sog_total as double) * 100.0) END").cast(DoubleType())
+    #     )
+
+    #     df = df.withColumn(
+    #         "stagnation_time",
+    #         F.expr(
+    #             "CASE WHEN count_sog_total = 0 OR size(time_diffs) = 0 THEN 0.0 ELSE count_low_speed_0_5 * (CASE WHEN total_area_time IS NULL THEN 0.0 ELSE total_area_time END) / cast(count_sog_total as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: distance_in_kilometers using haversine (Spark-only math)
+    #     # Uses element_at(lat_array, i) 1-based indexing and sums distances between consecutive pairs
+    #     df = df.withColumn(
+    #         "distance_in_kilometers",
+    #         F.expr(
+    #             "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+    #             "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+    #             "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: average_time_diff_between_consecutive_points (milliseconds)
+    #     df = df.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs) = 0 THEN 0.0 ELSE aggregate(time_diffs, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs) as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # 8) Stringify array columns so CSV datasource accepts them:
+    #     # timestamp_array -> [YYYY-MM-DD HH:MM:SS, None, ...]  (no quotes around timestamps)
+    #     ts_array_to_str_expr = (
+    #         "concat('[', array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE t END), ', '), ']')"
+    #     )
+    #     df = df.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+
+    #     # sog_array and cog_array stringification: numbers as strings, nulls as None
+    #     sog_array_to_str_expr = (
+    #         "concat('[', array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     )
+    #     cog_array_to_str_expr = (
+    #         "concat('[', array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     )
+    #     df = df.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     df = df.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+
+    #     # 9) Prepare final DataFrame with stringified arrays (so CSV writer won't error)
+    #     result = df.select(
+    #         F.col("mmsi"),
+    #         F.col("event_index"),
+    #         F.col("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),
+    #         F.col("sog_array_str").alias("sog_array"),
+    #         F.col("cog_array_str").alias("cog_array"),
+    #         F.col("Category").alias("behavior_type_label"),
+    #         F.col("average_speed"),
+    #         F.col("min_speed"),
+    #         F.col("max_speed"),
+    #         F.col("average_heading"),
+    #         F.col("std_dev_heading"),
+    #         F.col("total_area_time"),
+    #         F.col("low_speed_percentage"),
+    #         F.col("stagnation_time"),
+    #         # NEW fields included:
+    #         F.col("distance_in_kilometers"),
+    #         F.col("average_time_diff_between_consecutive_points"),
+    #         F.col("min_heading"),
+    #         F.col("max_heading"),
+    #         F.col("std_dev_speed")
+    #     )
+
+    #     # Rename mmsi to id for consistency with NON-TRANSSHIPMENT
+    #     result = result.withColumnRenamed("mmsi", "id")
+        
+    #     return result
 
         
     def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
@@ -2556,19 +3178,19 @@ class Process_Data_Service:
         """
         Pure-Spark replacement for create_aux_dataframe_with_chunks_V2 (pandas).
 
-        - events_df must contain: ['EventIndex', 'timestamp', 'id', 'Category'] where
+        - events_df must contain: ['event_index', 'timestamp', 'id', 'Category'] where
         'timestamp' on events is the event timestamp (pandas used min(timestamp) per event).
         - ais_path is the path to the AIS CSV which contains ['id','timestamp','longitude','latitude','speed','heading'].
         - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
 
         Returns a Spark DataFrame with columns:
-        ['id','EventIndex','trajectory','timestamp_array','sog_array','cog_array','behavior_type_vector',
+        ['id','event_index','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
         'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
         'total_area_time','low_speed_percentage','stagnation_time']
         """
         logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: start")
 
-        # --- 1) Prepare events: compute event_time_ms (min timestamp per EventIndex,id) and keep Category ---
+        # --- 1) Prepare events: compute event_time_ms (min timestamp per event_index,id) and keep Category ---
         # Convert events timestamp to milliseconds (robust to numeric or string input)
         events_pre = events_df.withColumn(
             "_ev_ts_millis",
@@ -2581,9 +3203,9 @@ class Process_Data_Service:
             )
         )
 
-        # For each (EventIndex, id) compute min timestamp (ms) and pick first Category
+        # For each (event_index, id) compute min timestamp (ms) and pick first Category
         events_bounds = (
-            events_pre.groupBy("EventIndex", "id")
+            events_pre.groupBy("event_index", "id")
             .agg(
                 F.min(F.col("_ev_ts_millis")).alias("event_time_ms"),
                 F.first(F.col("Category")).alias("Category")
@@ -2620,7 +3242,7 @@ class Process_Data_Service:
         joined = (
             ais.join(events_bounds, on=join_cond, how="inner")
             .select(
-                events_bounds.EventIndex.alias("EventIndex"),
+                events_bounds.event_index.alias("event_index"),
                 events_bounds.vessel_id.alias("id"),
                 events_bounds.Category.alias("Category"),
                 ais._ts_millis.alias("ts"),
@@ -2631,16 +3253,16 @@ class Process_Data_Service:
             )
         )
 
-        #  --- 4) Build ordered 'points' per (EventIndex, id) ---
+        #  --- 4) Build ordered 'points' per (event_index, id) ---
         # collect_list struct and array_sort by ts
-        grouped = joined.groupBy("EventIndex", "id", "Category").agg(
+        grouped = joined.groupBy("event_index", "id", "Category").agg(
             F.expr(
                 "array_sort(collect_list(struct(ts as ts, lon as lon, lat as lat, sog as sog, cog as cog)), "
                 "(x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
             ).alias("points")
         )
 
-        # --- 5) Extract arrays and compute time_diffs (milliseconds) ---
+        # --- 5) Extract arrays and compute time_diffs_ms (milliseconds) ---
         df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
                     .withColumn(
                         "timestamp_array",
@@ -2650,7 +3272,7 @@ class Process_Data_Service:
                     .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
                     .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
 
-        # NEW: lat/lon arrays for distance computation (haversine)
+        # lat/lon arrays for distance computation (haversine)
         df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
                .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
 
@@ -2723,7 +3345,9 @@ class Process_Data_Service:
             .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
             .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType()))
 
-        # --- 8) low_speed_percentage and stagnation_time (pandas formula parity) ---
+        
+
+        # --- 8) low_speed_percentage and stagnation_time ---
         df = df.withColumn(
             "count_low_speed_2",
             F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")
@@ -2745,7 +3369,7 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
-        # NEW: distance_in_kilometers using haversine (Spark-only math)
+        # distance_in_kilometers using haversine (Spark-only math)
         df = df.withColumn(
             "distance_in_kilometers",
             F.expr(
@@ -2755,11 +3379,60 @@ class Process_Data_Service:
             ).cast(DoubleType())
         )
 
-        # NEW: average_time_diff_between_consecutive_points (seconds) — time_diffs_ms -> /1000.0
+        # --- displacement_ratio (first-last / total distance) ---
+        df = df.withColumn("first_lat", F.element_at(F.col("lat_array"), 1)) \
+               .withColumn("first_lon", F.element_at(F.col("lon_array"), 1)) \
+               .withColumn("last_lat", F.element_at(F.col("lat_array"), F.size(F.col("lat_array")))) \
+               .withColumn("last_lon", F.element_at(F.col("lon_array"), F.size(F.col("lon_array"))))
+
+        df = df.withColumn(
+            "displacement_km",
+            F.expr(
+                "CASE WHEN first_lat IS NULL OR last_lat IS NULL THEN 0.0 ELSE "
+                "2 * 6371.0 * asin( sqrt( pow( sin( (radians(last_lat) - radians(first_lat)) / 2 ), 2 ) + "
+                "cos(radians(first_lat)) * cos(radians(last_lat)) * pow( sin( (radians(last_lon) - radians(first_lon)) / 2 ), 2 ) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "displacement_ratio",
+            F.when(F.col("distance_in_kilometers") > 0, F.col("displacement_km") / F.col("distance_in_kilometers")).otherwise(F.lit(0.0))
+        )
+
+        # --- cog_unit_range using time_diffs_ms ---
+        df = df.withColumn(
+            "cog_unit_numer",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), "
+                "(acc, i) -> acc + ( ((degrees(atan2(element_at(lon_array, i) - element_at(lon_array, i-1), element_at(lat_array, i) - element_at(lat_array, i-1))) + 360) % 360) * element_at(time_diffs_ms, i-1) ) ) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_denom",
+            F.expr(
+                "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc,i) -> acc + element_at(time_diffs_ms, i-1)) END"
+            ).cast(DoubleType())
+        ).withColumn(
+            "cog_unit_range",
+            F.when(F.col("cog_unit_denom") == 0.0, F.lit(0.0)).otherwise(F.col("cog_unit_numer") / F.col("cog_unit_denom"))
+        ).withColumn(
+            "cog_unit_range_normalized",
+            (F.col("cog_unit_range") / F.lit(360.0)).cast(DoubleType())
+        ).drop("cog_unit_numer", "cog_unit_denom", "cog_unit_range")
+
+        # --- cog_ratio (threshold 10 degrees) ---
+        df = df.withColumn(
+            "_cog_change_count",
+            F.expr(
+                "CASE WHEN size(cog_array) <= 1 THEN 0 ELSE aggregate(sequence(2,size(cog_array)), cast(0 as int), (acc,i) -> acc + CASE WHEN abs(element_at(cog_array,i) - element_at(cog_array,i-1)) > 10.0 THEN 1 ELSE 0 END) END"
+            )
+        ).withColumn(
+            "cog_ratio",
+            F.when(F.size(F.col("cog_array")) <= 1, F.lit(0.0)).otherwise(F.col("_cog_change_count") / (F.size(F.col("cog_array")) - 1))
+        ).drop("_cog_change_count")
+
+        # average_time_diff_between_consecutive_points (milliseconds)
         df = df.withColumn(
             "average_time_diff_between_consecutive_points",
             F.expr(
-                "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE (aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double)) / 1000.0 END"
+                "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double) END"
             ).cast(DoubleType())
         )
 
@@ -2783,12 +3456,12 @@ class Process_Data_Service:
         # --- 11) Final select and rename to match pandas output keys ---
         result = df.select(
             F.col("id"),
-            F.col("EventIndex"),
+            F.col("event_index"),
             F.col("trajectory"),
             F.col("timestamp_array_str").alias("timestamp_array"),
             F.col("sog_array_str").alias("sog_array"),
             F.col("cog_array_str").alias("cog_array"),
-            F.col("Category").alias("behavior_type_vector"),
+            F.col("Category").alias("behavior_type_label"),
             F.col("average_speed"),
             F.col("min_speed"),
             F.col("max_speed"),
@@ -2800,6 +3473,9 @@ class Process_Data_Service:
             # NEW fields included:
             F.col("distance_in_kilometers"),
             F.col("average_time_diff_between_consecutive_points"),
+            F.col("displacement_ratio"),
+            F.col("cog_unit_range_normalized").alias("cog_unit_range"),
+            F.col("cog_ratio"),
             F.col("min_heading"),
             F.col("max_heading"),
             F.col("std_dev_speed"),
@@ -2808,6 +3484,1025 @@ class Process_Data_Service:
         logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
 
         return result
+
+    def generate_image_trajectory_dataset_for_all_behavior_types_with_spark_prototype(
+            spark,
+            output_dir: str,
+            behavior_types_to_generate_dataset: List[str],
+        ):
+        """
+        Generates grayscale image trajectory datasets (in .png format) for all behavior types using Spark.
+        The image resolutions used are 120x120, 128x128, 224x224, 256x256, 299x299, 384x384, 512x512, and 640x640 pixels.
+        The resulting grayscale images are saved in this structure:
+        - output_directory/
+            - image_resolution_120x120/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_128x128/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_224x224/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_256x256/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_299x299/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_384x384/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_512x512/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+            - image_resolution_640x640/
+                - behavior_type_1/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - behavior_type_2/
+                    - image_1.png
+                    - image_2.png
+                    - ...
+                - ...
+        Returns:
+            Flask Response: JSON object with status and message indicating success or failure.
+        """
+        logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: start")
+        image_resolutions = [(120, 120), (128, 128), (224, 224), (256, 256),
+                             (299, 299), (384, 384), (512, 512), (640, 640)]
+        
+        try:
+            # Ensure base output directory exists
+            os.makedirs(output_dir, exist_ok=True)
+
+            for behavior_type in behavior_types_to_generate_dataset:
+                for width, height in image_resolutions:
+                    logger.info(f"Generating images for behavior type '{behavior_type}' at resolution {width}x{height}")
+                    output_path = os.path.join(output_dir, f"image_resolution_{width}x{height}", behavior_type)
+                    # Create the folder for the image resolution and behavior type if it doesn't exist
+                    os.makedirs(output_path, exist_ok=True)
+
+                    # fetch trajectory data for the behavior type using Spark from aggregated_ais_data
+                    # For demonstration, we'll just log the intended actions
+                    logger.info(f"Fetching trajectory data for behavior type '{behavior_type}' using Spark")
+
+                    logger.info(f"Generating grayscale images at {width}x{height} and saving to {output_path}")
+
+                    logger.info(f"Finished generating images for behavior type '{behavior_type}' at resolution {width}x{height}")
+                    
+                    # actual grayscale image generation logic would go here
+            logger.info("generate_image_trajectory_dataset_for_all_behavior_types_with_spark: finished")
+        except Exception as e:
+            logger.error(f"Error generating image trajectory datasets: {e}")
+            raise
+
+    @staticmethod
+    def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
+        spark: SparkSession,
+        output_dir: str,
+        behavior_types_to_generate_dataset: Optional[List[str]] = None,
+        max_rows_per_behavior: Optional[int] = None,
+        batch_rows: int = 100,
+        max_retries_on_iterator_failure: int = 10
+    ) -> None:
+        """
+        Safe version: processes records in small batches, processes each row on the driver,
+        and writes each batch directly to a single plain CSV (no compression) on the driver,
+        avoiding the need to create many Spark DataFrames and serialize large objects.
+
+        Main differences compared to the previous Spark implementation:
+        - Stream driver-side por batch (append) -> reduces serialization and avoids OOM/py4j drops.
+        - Retries for spark.read (JDBC) with backoff.
+        - CHUNK_SIZE e FETCHSIZE are smaller by default
+        - Aggressive cleanup in finally.
+        """
+        import os, re, json, gc, time, csv, shutil
+        from functools import reduce
+        from datetime import datetime
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            Image = None
+            ImageDraw = None
+
+        logger.info(
+            "start generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark (max_rows=%s, batch_rows=%s, max_retries=%s)",
+            max_rows_per_behavior, batch_rows, max_retries_on_iterator_failure
+        )
+
+        # Config / defaults
+        BATCH_ROWS = int(batch_rows)
+        if not behavior_types_to_generate_dataset:
+            behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+        TARGET_W, TARGET_H = 120, 120
+
+        # JDBC env
+        pg_host = os.getenv("POSTGRES_CONTAINER_HOST", os.getenv("POSTGRES_HOST", "localhost"))
+        pg_port = os.getenv("POSTGRES_PORT", "5432")
+        pg_db = os.getenv("POSTGRES_DB")
+        pg_user = os.getenv("POSTGRES_USER")
+        pg_pass = os.getenv("POSTGRES_PASSWORD")
+
+        if not (pg_db and pg_user and pg_pass):
+            msg = "Missing Postgres connection env vars (POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD)."
+            logger.error(msg)
+            raise ValueError(msg)
+
+        jdbc_url = f"jdbc:postgresql://{pg_host}:{pg_port}/{pg_db}"
+        schema = "captaima"
+        table = "aggregated_ais_data"
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        _time_regex = re.compile(r"(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+
+        def parse_time_to_seconds_or_none(val: Any) -> Optional[int]:
+            try:
+                if val is None:
+                    return None
+                if isinstance(val, (int, float)):
+                    return int(val) % 86400
+                s = str(val).strip()
+                if s == "":
+                    return None
+                if s.isdigit():
+                    return int(s) % 86400
+                m = _time_regex.search(s)
+                if m:
+                    time_part = m.group(1)
+                    if "." in time_part:
+                        time_part = time_part.split(".", 1)[0]
+                    try:
+                        hh, mm, ss = [int(x) for x in time_part.split(":")]
+                        return (hh * 3600 + mm * 60 + ss) % 86400
+                    except Exception:
+                        return None
+                if "T" in s:
+                    try:
+                        time_part = s.split("T", 1)[1]
+                        time_part = time_part.split("+", 1)[0].split("Z", 1)[0].split(" ", 1)[0]
+                        if "." in time_part:
+                            time_part = time_part.split(".", 1)[0]
+                        hh, mm, ss = [int(x) for x in time_part.split(":")]
+                        return (hh * 3600 + mm * 60 + ss) % 86400
+                    except Exception:
+                        pass
+                try:
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    return (dt.hour * 3600 + dt.minute * 60 + dt.second) % 86400
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        def ensure_python_list(obj: Any) -> List[Any]:
+            if obj is None:
+                return []
+            if isinstance(obj, list):
+                return obj
+            if isinstance(obj, (tuple, set)):
+                return list(obj)
+            if isinstance(obj, str):
+                s = obj.strip()
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return parsed
+                    return [parsed]
+                except Exception:
+                    if "," in s:
+                        return [p.strip() for p in s.split(",")]
+                    return [s]
+            try:
+                return list(obj)
+            except Exception:
+                return [str(obj)]
+
+        def _ensure_json_array(obj: Any) -> str:
+            try:
+                if obj is None:
+                    return json.dumps([])
+                if isinstance(obj, str):
+                    try:
+                        loaded = json.loads(obj)
+                        if isinstance(loaded, list):
+                            return obj
+                        return json.dumps([loaded])
+                    except Exception:
+                        return json.dumps([obj])
+                return json.dumps(obj)
+            except Exception:
+                try:
+                    return json.dumps(list(obj))
+                except Exception:
+                    return json.dumps([])
+
+        def to_relative_seconds_list_using_first_non_null(timestamp_list_raw: Any) -> List[Optional[int]]:
+            ts_list = ensure_python_list(timestamp_list_raw)
+            if not ts_list:
+                return []
+            secs_or_none: List[Optional[int]] = [parse_time_to_seconds_or_none(t) for t in ts_list]
+            base_idx = next((i for i, s in enumerate(secs_or_none) if s is not None), None)
+            if base_idx is None:
+                return []
+            base = secs_or_none[base_idx]
+            rel: List[Optional[int]] = []
+            for s in secs_or_none:
+                if s is None:
+                    rel.append(None)
+                else:
+                    delta = s - base if s >= base else (s + 86400) - base
+                    rel.append(int(delta))
+            return rel
+
+        # result schema column order used for CSV header
+        result_columns = ["id", "mmsi", "event_index", "trajectory_image_matrix", "sog_array", "cog_array", "timestamp_array", "behavior_type_label"]
+
+        def _process_and_format_row_for_csv(row_obj, behavior_default: str) -> Optional[List[Any]]:
+            """
+            Process a row and return a list of values in the same order as result_columns,
+            or None to skip the row.
+            """
+            row = row_obj.asDict() if hasattr(row_obj, "asDict") else dict(row_obj)
+            pk = row.get("id")
+            traj_wkt = row.get("trajectory_wkt") or row.get("trajectory")
+            if pk is None or traj_wkt is None:
+                logger.debug("Skipping row with missing id or trajectory (id=%s)", pk)
+                return None
+
+            coords = ProcessDataService._parse_linestring_wkt_to_coords(traj_wkt)
+            if not coords:
+                logger.debug("No coords parsed for id=%s; skipping", pk)
+                return None
+
+            # render image
+            try:
+                if Image is None or ImageDraw is None:
+                    raise RuntimeError("PIL not available")
+                pixels, upscale = ProcessDataService._coords_to_image_pixels(coords, TARGET_W, TARGET_H, pad_frac=0.03, upscale=4)
+                W = TARGET_W * upscale
+                H = TARGET_H * upscale
+
+                img = Image.new("L", (W, H), 255)
+                draw = ImageDraw.Draw(img)
+                base_line_width = max(1, int(round(min(W, H) / 120.0)))
+                if len(pixels) >= 2:
+                    draw.line(pixels, fill=0, width=base_line_width, joint="curve")
+                else:
+                    x0, y0 = pixels[0]
+                    rrad = max(1, base_line_width * 2)
+                    draw.ellipse((x0-rrad, y0-rrad, x0+rrad, y0+rrad), fill=0)
+                final_img = img.resize((TARGET_W, TARGET_H), resample=Image.LANCZOS)
+                flat = list(final_img.getdata())
+                matrix_2d = [flat[i * TARGET_W:(i + 1) * TARGET_W] for i in range(TARGET_H)]
+                matrix_json = json.dumps(matrix_2d)
+            except Exception as img_e:
+                logger.warning("Failed to render image for id=%s: %s", pk, img_e)
+                matrix_json = json.dumps([[]])
+                try:
+                    del img, draw, final_img, flat, matrix_2d
+                except Exception:
+                    pass
+
+            mmsi = row.get("mmsi")
+            event_index = row.get("event_index")
+            sog_json = _ensure_json_array(row.get("sog_array"))
+            cog_json = _ensure_json_array(row.get("cog_array"))
+            rel_seconds_list = to_relative_seconds_list_using_first_non_null(row.get("timestamp_array") or row.get("timestamps") or row.get("ts_array") or row.get("time_array") or row.get("times"))
+            timestamp_json = json.dumps(rel_seconds_list)
+            behavior_label = row.get("behavior_type_label") or behavior_default
+
+            # prepare values in consistent order
+            id_val = str(int(pk)) if (isinstance(pk, int) or (isinstance(pk, str) and pk.isdigit())) else str(pk)
+            mmsi_val = str(mmsi) if mmsi is not None else ""
+            try:
+                event_idx_val = int(event_index) if (event_index is not None and str(event_index).isdigit()) else (event_index if event_index is not None else "")
+            except Exception:
+                event_idx_val = event_index if event_index is not None else ""
+
+            row_values = [
+                id_val,
+                mmsi_val,
+                event_idx_val,
+                matrix_json,
+                sog_json,
+                cog_json,
+                timestamp_json,
+                behavior_label
+            ]
+
+            # cleanup image temporaries aggressively
+            try:
+                del matrix_2d, flat, final_img, img, draw, pixels, coords
+            except Exception:
+                pass
+
+            return row_values
+
+        # helper: read a JDBC selection with retries (returns DataFrame or raises)
+        def spark_read_jdbc_with_retries(dbtable_sql: str, max_attempts: int = 3, sleep_base: float = 0.8):
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    df_local = (
+                        spark.read
+                        .format("jdbc")
+                        .option("url", jdbc_url)
+                        .option("dbtable", dbtable_sql)
+                        .option("user", pg_user)
+                        .option("password", pg_pass)
+                        .option("driver", "org.postgresql.Driver")
+                        .option("fetchsize", "200")
+                        .load()
+                    )
+                    return df_local
+                except Exception as e:
+                    last_exc = e
+                    logger.warning("spark.read JDBC attempt %d/%d failed for query [%s]: %s", attempt, max_attempts, dbtable_sql, e)
+                    time.sleep(sleep_base * attempt)
+            # final raise
+            raise last_exc
+
+        # Main processing loop
+        created_tmp_dirs = []
+        try:
+            for behavior in behavior_types_to_generate_dataset:
+                logger.info("Processing behavior '%s' (max_rows_per_behavior=%s)", behavior, max_rows_per_behavior)
+                behavior_escaped = behavior.replace("'", "''")
+                limit_clause = f" LIMIT {int(max_rows_per_behavior)}" if (max_rows_per_behavior is not None and int(max_rows_per_behavior) > 0) else ""
+
+                base_db_where = f"behavior_type_label = '{behavior_escaped}'"
+
+                # We'll stream output directly to a temp CSV file per behavior to avoid Spark-side merges.
+                now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                behavior_fname = re.sub(r"[^\w\-]+", "_", str(behavior))
+                filename = f"{behavior_fname}_dataset_{now}.csv"
+                output_path = os.path.join(output_dir, filename)
+                tmp_output_dir = f"{output_path}.part"
+                tmp_csv_path = os.path.join(tmp_output_dir, "part-00000.csv.part")
+                final_tmp_target = os.path.join(tmp_output_dir, "part-00000.csv")
+
+                # create tmp dir
+                try:
+                    os.makedirs(tmp_output_dir, exist_ok=True)
+                    created_tmp_dirs.append(tmp_output_dir)
+                except Exception as e:
+                    logger.warning("Could not create tmp_output_dir %s: %s", tmp_output_dir, e)
+
+                # open CSV file for append streaming (driver)
+                fh = open(tmp_csv_path, "w", newline="", encoding="utf-8")
+                writer = csv.writer(fh)
+                # write header
+                writer.writerow(result_columns)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
+
+                processed_for_behavior = 0
+                last_pk_processed = None
+                BATCH_WRITE_COUNT = 0
+
+                # attempt to get numeric bounds for chunking
+                min_pk = max_pk = None
+                try:
+                    bounds_tbl = (
+                        f"(select min(primary_key) as min_pk, max(primary_key) as max_pk from {schema}.{table} where {base_db_where}) as boundsq"
+                    )
+                    bounds_df = spark_read_jdbc_with_retries(bounds_tbl, max_attempts=2)
+                    rb = bounds_df.limit(1).collect()
+                    if rb:
+                        rb0 = rb[0].asDict()
+                        min_pk = rb0.get("min_pk", None)
+                        max_pk = rb0.get("max_pk", None)
+                except Exception as e:
+                    logger.debug("Unable to fetch partition bounds for behavior %s (non-fatal): %s", behavior, e)
+                    min_pk = max_pk = None
+
+                # chunk parameters (smaller to reduce pressure)
+                CHUNK_SIZE = int(os.getenv("CSV_JDBC_CHUNK_SIZE", "8"))  # smaller chunks
+                FETCHSIZE = int(os.getenv("CSV_JDBC_FETCHSIZE", "50"))
+
+                if min_pk is not None and max_pk is not None:
+                    try:
+                        min_int = int(min_pk)
+                        max_int = int(max_pk)
+                        start_pk = min_int
+                        while start_pk <= max_int:
+                            end_pk = start_pk + CHUNK_SIZE - 1
+                            where_extra = f" AND primary_key BETWEEN {start_pk} AND {end_pk}"
+                            db_chunk_subq = (
+                                f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                                f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                                f"from {schema}.{table} where {base_db_where} {where_extra} ORDER BY primary_key ASC) as subq"
+                            )
+                            # read with retries
+                            try:
+                                df_chunk = spark_read_jdbc_with_retries(db_chunk_subq, max_attempts=3, sleep_base=0.5)
+                            except Exception as e_chunk_read:
+                                logger.error("Chunk read failed for behavior %s on PK range %s..%s: %s", behavior, start_pk, end_pk, e_chunk_read)
+                                # advance to next chunk to avoid infinite loop
+                                start_pk = end_pk + 1
+                                continue
+
+                            # process rows in the chunk using toLocalIterator where possible but catch errors
+                            try:
+                                try:
+                                    rows_iter = df_chunk.toLocalIterator()
+                                except Exception:
+                                    rows_iter = iter(df_chunk.collect())
+                            except Exception as e_iter:
+                                logger.error("Failed to materialize df_chunk rows for behavior %s chunk %s..%s: %s", behavior, start_pk, end_pk, e_iter)
+                                try:
+                                    del df_chunk
+                                except Exception:
+                                    pass
+                                start_pk = end_pk + 1
+                                continue
+
+                            # iterate and process
+                            for r in rows_iter:
+                                try:
+                                    values = _process_and_format_row_for_csv(r, behavior)
+                                    if values is None:
+                                        continue
+                                    writer.writerow(values)
+                                    BATCH_WRITE_COUNT += 1
+                                    processed_for_behavior += 1
+                                    last_pk_processed = values[0]
+                                except Exception as row_e:
+                                    logger.exception("Error processing row in chunk %s..%s for behavior %s: %s", start_pk, end_pk, behavior, row_e)
+                                    continue
+
+                                # flush periodically to reduce memory pressure and ensure partial progress on disk
+                                if BATCH_WRITE_COUNT >= BATCH_ROWS:
+                                    try:
+                                        fh.flush()
+                                        try:
+                                            os.fsync(fh.fileno())
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    BATCH_WRITE_COUNT = 0
+                                    gc.collect()
+
+                                if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                                    logger.info("Reached max_rows_per_behavior=%s for behavior %s during chunk processing; stopping.", max_rows_per_behavior, behavior)
+                                    break
+
+                            # cleanup chunk df
+                            try:
+                                del df_chunk, rows_iter
+                            except Exception:
+                                pass
+
+                            if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                                break
+
+                            start_pk = end_pk + 1
+
+                    except Exception as e_chunk_main:
+                        logger.exception("Chunked processing failed for behavior %s: %s. Falling back to iterator strategy.", behavior, e_chunk_main)
+                        # fallthrough to iterator below
+
+                # if no numeric bounds or chunking failed or not enough processed, fallback: simple select (safe, but may be heavier)
+                if (min_pk is None or max_pk is None) and (max_rows_per_behavior is None or processed_for_behavior < int(max_rows_per_behavior)):
+                    select_q = (
+                        f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                        f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                        f"from {schema}.{table} where {base_db_where} {limit_clause} ORDER BY primary_key ASC) as subq"
+                    )
+                    try:
+                        df_full = spark_read_jdbc_with_retries(select_q, max_attempts=3, sleep_base=0.5)
+                    except Exception as e_read_full:
+                        logger.error("Failed initial JDBC read for behavior %s: %s", behavior, e_read_full)
+                        # close writer and continue to next behavior
+                        try:
+                            fh.flush()
+                            try:
+                                os.fsync(fh.fileno())
+                            except Exception:
+                                pass
+                            fh.close()
+                        except Exception:
+                            pass
+                        continue
+
+                    # prefer streaming iterator
+                    try:
+                        iterator = df_full.toLocalIterator()
+                    except Exception:
+                        iterator = iter(df_full.collect())
+
+                    while True:
+                        try:
+                            r = next(iterator)
+                        except StopIteration:
+                            break
+                        except EOFError:
+                            logger.warning("toLocalIterator() failed mid-iteration for behavior %s with EOFError; attempting to re-read remaining rows", behavior)
+                            # attempt to resume by re-querying > last_pk_processed
+                            if last_pk_processed is None:
+                                # nothing processed; give up on this behavior
+                                break
+                            where_extra = f" AND primary_key > {last_pk_processed}"
+                            resume_q = (
+                                f"(select primary_key as id, mmsi, event_index, ST_AsText(trajectory) as trajectory_wkt, "
+                                f"sog_array, cog_array, timestamp_array, behavior_type_label "
+                                f"from {schema}.{table} where {base_db_where} {where_extra} {limit_clause} ORDER BY primary_key ASC) as subq"
+                            )
+                            try:
+                                df_resume = spark_read_jdbc_with_retries(resume_q, max_attempts=3, sleep_base=0.5)
+                                try:
+                                    iterator = df_resume.toLocalIterator()
+                                except Exception:
+                                    iterator = iter(df_resume.collect())
+                                continue
+                            except Exception:
+                                logger.exception("Resume attempt failed for behavior %s after toLocalIterator EOF", behavior)
+                                break
+                        except Exception as iter_e:
+                            logger.exception("Iterator raised unexpected exception for behavior %s: %s", behavior, iter_e)
+                            break
+
+                        try:
+                            values = _process_and_format_row_for_csv(r, behavior)
+                            if values is None:
+                                continue
+                            writer.writerow(values)
+                            BATCH_WRITE_COUNT += 1
+                            processed_for_behavior += 1
+                            last_pk_processed = values[0]
+                        except Exception as row_e:
+                            logger.exception("Error processing row for behavior %s: %s", behavior, row_e)
+
+                        if BATCH_WRITE_COUNT >= BATCH_ROWS:
+                            try:
+                                fh.flush()
+                                try:
+                                    os.fsync(fh.fileno())
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            BATCH_WRITE_COUNT = 0
+                            gc.collect()
+
+                        if max_rows_per_behavior is not None and processed_for_behavior >= int(max_rows_per_behavior):
+                            logger.info("Reached max_rows_per_behavior=%s for behavior %s; stopping.", max_rows_per_behavior, behavior)
+                            break
+
+                    try:
+                        del df_full
+                    except Exception:
+                        pass
+
+                # finalize CSV for this behavior: close .part file and move atomically to final place
+                try:
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+                # finalize inside tmp dir
+                try:
+                    if os.path.exists(final_tmp_target):
+                        try:
+                            os.remove(final_tmp_target)
+                        except Exception:
+                            pass
+                    os.replace(tmp_csv_path, final_tmp_target)
+                except Exception as e_inner:
+                    logger.warning("Could not finalize temp inner file for behavior %s: %s", behavior, e_inner)
+
+                # move to final output_path atomically
+                try:
+                    parent = os.path.dirname(output_path)
+                    os.makedirs(parent, exist_ok=True)
+                    if os.path.exists(output_path):
+                        try:
+                            if os.path.isdir(output_path):
+                                shutil.rmtree(output_path)
+                            else:
+                                os.remove(output_path)
+                        except Exception:
+                            pass
+                    os.replace(final_tmp_target, output_path)
+                    # cleanup tmp dir
+                    try:
+                        if os.path.exists(tmp_output_dir):
+                            shutil.rmtree(tmp_output_dir)
+                    except Exception:
+                        pass
+                    try:
+                        created_tmp_dirs.remove(tmp_output_dir)
+                    except Exception:
+                        pass
+                except Exception as e_move:
+                    logger.warning("Driver-merge move tmp->final failed for behavior %s: %s. Attempting copy.", behavior, e_move)
+                    try:
+                        shutil.copyfile(final_tmp_target, output_path)
+                        try:
+                            shutil.rmtree(tmp_output_dir)
+                        except Exception:
+                            pass
+                        try:
+                            created_tmp_dirs.remove(tmp_output_dir)
+                        except Exception:
+                            pass
+                    except Exception as e_copy:
+                        logger.exception("Driver-merge fallback copy also failed for behavior %s: %s", behavior, e_copy)
+                        raise
+
+                # best-effort adjust permissions if helper exists
+                try:
+                    ProcessDataService.adjust_file_permissions(output_path)
+                except Exception:
+                    pass
+
+                logger.info("Finished behavior %s: CSV written to %s (processed rows ~%d)", behavior, output_path, processed_for_behavior)
+                # small cleanup
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
+            logger.info("generate_csv: finished for all behaviors")
+
+        except Exception as main_e:
+            logger.exception("Error generating CSV dataset per behavior: %s", main_e)
+            raise
+        finally:
+            # Final cleanup agressivo
+            try:
+                # close any open handles
+                try:
+                    if 'fh' in locals():
+                        fh_local = locals().get('fh')
+                        if fh_local and not fh_local.closed:
+                            try:
+                                fh_local.close()
+                            except Exception:
+                                pass
+                            try:
+                                del fh_local
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # remove any tmp dirs left
+                for td in list(created_tmp_dirs):
+                    try:
+                        if os.path.exists(td):
+                            shutil.rmtree(td, ignore_errors=True)
+                    except Exception:
+                        pass
+
+                # delete big locals
+                big_names = ["df", "df_chunk", "rows", "iterator", "df_full", "df_resume", "rows_iter", "matrix_2d", "flat", "final_img", "img", "draw", "pixels"]
+                for n in big_names:
+                    try:
+                        if n in locals():
+                            del locals()[n]
+                    except Exception:
+                        try:
+                            if n in globals():
+                                del globals()[n]
+                        except Exception:
+                            pass
+
+                # force GC a few times
+                gc.collect()
+                time.sleep(0.01)
+                gc.collect()
+            except Exception as final_exc:
+                try:
+                    logger.warning("Exception during final cleanup: %s", final_exc)
+                except Exception:
+                    pass
+
+
+    # def create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019(
+    #     events_df: DataFrame,
+    #     ais_path: str,
+    #     spark: SparkSession,
+    # ) -> DataFrame:
+    #     """
+    #     Pure-Spark replacement for create_aux_dataframe_with_chunks_V2 (pandas).
+
+    #     - events_df must contain: ['event_index', 'timestamp', 'id', 'Category'] where
+    #     'timestamp' on events is the event timestamp (pandas used min(timestamp) per event).
+    #     - ais_path is the path to the AIS CSV which contains ['id','timestamp','longitude','latitude','speed','heading'].
+    #     - Uses millisecond resolution for timestamps (like the pandas code did with unit='ms').
+
+    #     Returns a Spark DataFrame with columns:
+    #     ['id','event_index','trajectory','timestamp_array','sog_array','cog_array','behavior_type_label',
+    #     'average_speed','min_speed','max_speed','average_heading','std_dev_heading',
+    #     'total_area_time','low_speed_percentage','stagnation_time']
+    #     """
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: start")
+
+    #     # --- 1) Prepare events: compute event_time_ms (min timestamp per event_index,id) and keep Category ---
+    #     # Convert events timestamp to milliseconds (robust to numeric or string input)
+    #     events_pre = events_df.withColumn(
+    #         "_ev_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & (F.col("timestamp").rlike("^[0-9]+$")),
+    #             F.col("timestamp").cast("long")  # assume already in ms
+    #         ).otherwise(
+    #             # fallback: parse string to seconds then multiply
+    #             (F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000))
+    #         )
+    #     )
+
+    #     # For each (event_index, id) compute min timestamp (ms) and pick first Category
+    #     events_bounds = (
+    #         events_pre.groupBy("event_index", "id")
+    #         .agg(
+    #             F.min(F.col("_ev_ts_millis")).alias("event_time_ms"),
+    #             F.first(F.col("Category")).alias("Category")
+    #         )
+    #         .withColumnRenamed("id", "vessel_id")
+    #     )
+
+    #     # --- 2) Read AIS CSV and normalize timestamp to ms (column _ts_millis) ---
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: reading AIS from %s", ais_path)
+    #     ais = (
+    #         spark.read.option("header", True).option("inferSchema", True).csv(ais_path)
+    #         .withColumnRenamed("Id", "id")
+    #     )
+    #     ais = ais.toDF(*[c.strip() for c in ais.columns])
+    #     ais = ais.withColumn("id", F.col("id").cast(StringType()))
+
+    #     # Robustly compute milliseconds epoch for AIS timestamp:
+    #     ais = ais.withColumn(
+    #         "_ts_millis",
+    #         F.when(
+    #             (F.col("timestamp").cast("double").isNotNull()) & (F.col("timestamp").rlike("^[0-9]+$")),
+    #             F.col("timestamp").cast("long")  # already ms
+    #         ).otherwise(
+    #             (F.unix_timestamp(F.col("timestamp").cast(StringType())).cast("long") * F.lit(1000))
+    #         )
+    #     ).withColumn("longitude", F.col("longitude").cast(DoubleType())) \
+    #     .withColumn("latitude", F.col("latitude").cast(DoubleType())) \
+    #     .withColumn("speed", F.col("speed").cast(DoubleType())) \
+    #     .withColumn("heading", F.col("heading").cast(DoubleType()))
+
+    #     # --- 3) Join AIS points to events where ais._ts_millis >= event_time_ms and same vessel id ---
+    #     join_cond = (ais.id == events_bounds.vessel_id) & (ais._ts_millis >= events_bounds.event_time_ms)
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: joining ais -> events (this may shuffle)")
+    #     joined = (
+    #         ais.join(events_bounds, on=join_cond, how="inner")
+    #         .select(
+    #             events_bounds.event_index.alias("event_index"),
+    #             events_bounds.vessel_id.alias("id"),
+    #             events_bounds.Category.alias("Category"),
+    #             ais._ts_millis.alias("ts"),
+    #             ais.longitude.alias("lon"),
+    #             ais.latitude.alias("lat"),
+    #             ais.speed.alias("sog"),
+    #             ais.heading.alias("cog"),
+    #         )
+    #     )
+
+    #     #  --- 4) Build ordered 'points' per (event_index, id) ---
+    #     # collect_list struct and array_sort by ts
+    #     grouped = joined.groupBy("event_index", "id", "Category").agg(
+    #         F.expr(
+    #             "array_sort(collect_list(struct(ts as ts, lon as lon, lat as lat, sog as sog, cog as cog)), "
+    #             "(x, y) -> CASE WHEN x.ts < y.ts THEN -1 WHEN x.ts > y.ts THEN 1 ELSE 0 END)"
+    #         ).alias("points")
+    #     )
+
+    #     # --- 5) Extract arrays and compute time_diffs (milliseconds) ---
+    #     df = grouped.withColumn("ts_array", F.expr("transform(points, x -> x.ts)")) \
+    #                 .withColumn(
+    #                     "timestamp_array",
+    #                     # convert ms -> seconds for from_unixtime; show format 'YYYY-MM-DD HH:MM:SS'
+    #                     F.expr("transform(ts_array, t -> CASE WHEN t IS NULL THEN NULL ELSE from_unixtime(cast(floor(t/1000) as bigint), 'yyyy-MM-dd HH:mm:ss') END)")
+    #                 ) \
+    #                 .withColumn("sog_array", F.expr("transform(points, x -> cast(x.sog as double))")) \
+    #                 .withColumn("cog_array", F.expr("transform(points, x -> cast(x.cog as double))"))
+
+    #     # NEW: lat/lon arrays for distance computation (haversine)
+    #     df = df.withColumn("lat_array", F.expr("transform(points, x -> cast(x.lat as double))")) \
+    #            .withColumn("lon_array", F.expr("transform(points, x -> cast(x.lon as double))"))
+
+    #     # time_diffs in milliseconds: difference between consecutive ts entries
+    #     df = df.withColumn(
+    #         "time_diffs_ms",
+    #         F.expr(
+    #             "CASE WHEN size(ts_array) <= 1 THEN array() "
+    #             "ELSE transform(sequence(2, size(ts_array)), i -> element_at(ts_array, i) - element_at(ts_array, i-1)) END"
+    #         )
+    #     )
+
+    #     # total_time_ms (sum of all time diffs)
+    #     df = df.withColumn("total_time_ms", F.expr("aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x)"))
+
+    #     # --- 6) total_area_time: sum of time_diffs for which grid cell exists ---
+    #     # grid_x, grid_y derived from coordinates (floor(lon/0.1), floor(lat/0.1)) and trimmed to len(time_diffs_ms)
+    #     # min_len = least(size(time_diffs_ms), size(points)-1)
+    #     df = df.withColumn(
+    #         "min_len_for_area",
+    #         F.expr("CASE WHEN size(points) <= 1 THEN 0 ELSE least(size(time_diffs_ms), size(points) - 1) END")
+    #     )
+
+    #     # Build index sequence 1..min_len_for_area and sum corresponding time_diffs
+    #     df = df.withColumn(
+    #         "total_area_time",
+    #         F.expr(
+    #             "CASE WHEN min_len_for_area = 0 THEN 0.0 ELSE aggregate(sequence(1, min_len_for_area), cast(0.0 as double), (acc, i) -> acc + element_at(time_diffs_ms, i)) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # --- 7) SOG / COG statistics (avg/min/max/std) and counts ---
+    #     df = df.withColumn(
+    #         "sum_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "sumsq_sog",
+    #         F.expr("aggregate(sog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "count_sog",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "average_speed",
+    #         F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sum_sog / cast(count_sog as double) END").cast(DoubleType())
+    #     ).withColumn("min_speed", F.expr("array_min(sog_array)").cast(DoubleType())) \
+    #     .withColumn("max_speed", F.expr("array_max(sog_array)").cast(DoubleType())) \
+    #     .withColumn(
+    #         "std_dev_speed",
+    #         F.expr("CASE WHEN count_sog = 0 THEN 0.0 ELSE sqrt( (sumsq_sog / cast(count_sog as double)) - POWER(sum_sog / cast(count_sog as double), 2) ) END").cast(DoubleType())
+    #     )
+
+    #     # COG stats
+    #     df = df.withColumn(
+    #         "sum_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "sumsq_cog",
+    #         F.expr("aggregate(cog_array, cast(0.0 as double), (acc,x) -> acc + coalesce(x, cast(0.0 as double)) * coalesce(x, cast(0.0 as double)))")
+    #     ).withColumn(
+    #         "count_cog",
+    #         F.expr("aggregate(cog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x IS NULL THEN 0 ELSE 1 END)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "average_heading",
+    #         F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sum_cog / cast(count_cog as double) END").cast(DoubleType())
+    #     ).withColumn("std_dev_heading", F.expr("CASE WHEN count_cog = 0 THEN 0.0 ELSE sqrt((sumsq_cog / cast(count_cog as double)) - POWER(sum_cog / cast(count_cog as double), 2)) END").cast(DoubleType())) \
+    #         .withColumn("min_heading", F.expr("array_min(cog_array)").cast(DoubleType())) \
+    #         .withColumn("max_heading", F.expr("array_max(cog_array)").cast(DoubleType()))
+
+    #     # --- 8) low_speed_percentage and stagnation_time (pandas formula parity) ---
+    #     df = df.withColumn(
+    #         "count_low_speed_2",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 2.0 THEN 1 ELSE 0 END)")
+    #     ).withColumn(
+    #         "count_low_speed_0_5",
+    #         F.expr("aggregate(sog_array, cast(0 as int), (acc,x) -> acc + CASE WHEN x < 0.5 THEN 1 ELSE 0 END)")
+    #     ).withColumn(
+    #         "count_sog_total",
+    #         F.expr("size(sog_array)")
+    #     )
+
+    #     df = df.withColumn(
+    #         "low_speed_percentage",
+    #         F.expr("CASE WHEN count_sog_total = 0 THEN 0.0 ELSE (count_low_speed_2 / cast(count_sog_total as double) * 100.0) END").cast(DoubleType())
+    #     ).withColumn(
+    #         "stagnation_time",
+    #         F.expr(
+    #             "CASE WHEN count_sog_total = 0 THEN 0.0 ELSE count_low_speed_0_5 * (CASE WHEN total_time_ms IS NULL THEN 0.0 ELSE total_time_ms END) / cast(count_sog_total as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: distance_in_kilometers using haversine (Spark-only math)
+    #     df = df.withColumn(
+    #         "distance_in_kilometers",
+    #         F.expr(
+    #             "CASE WHEN size(lat_array) <= 1 THEN 0.0 ELSE aggregate(sequence(2, size(lat_array)), cast(0.0 as double), (acc, i) -> acc + ("
+    #             "2 * 6371.0 * asin( sqrt( pow( sin( (radians(element_at(lat_array, i)) - radians(element_at(lat_array, i-1))) / 2 ), 2 ) "
+    #             "+ cos(radians(element_at(lat_array, i-1))) * cos(radians(element_at(lat_array, i))) * pow( sin( (radians(element_at(lon_array, i)) - radians(element_at(lon_array, i-1))) / 2 ), 2 ) ) ) ) ) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # NEW: average_time_diff_between_consecutive_points (milliseconds) — keep time_diffs_ms units
+    #     df = df.withColumn(
+    #         "average_time_diff_between_consecutive_points",
+    #         F.expr(
+    #             "CASE WHEN size(time_diffs_ms) = 0 THEN 0.0 ELSE aggregate(time_diffs_ms, cast(0.0 as double), (acc,x) -> acc + x) / cast(size(time_diffs_ms) as double) END"
+    #         ).cast(DoubleType())
+    #     )
+
+    #     # --- 9) Build trajectory LINESTRING('lon lat', ...) ---
+    #     df = df.withColumn(
+    #         "trajectory",
+    #         F.expr("concat('LINESTRING(', array_join(transform(points, p -> concat(cast(p.lon as string), ' ', cast(p.lat as string))), ', '), ')')")
+    #     )
+
+    #     # --- 10) Stringify arrays for CSV output ---
+    #     # timestamp_array: render as [YYYY-MM-DD HH:MM:SS, None, ...] (no quotes around timestamps)
+    #     ts_array_to_str_expr = "concat('[', array_join(transform(timestamp_array, t -> CASE WHEN t IS NULL THEN 'None' ELSE t END), ', '), ']')"
+    #     df = df.withColumn("timestamp_array_str", F.expr(ts_array_to_str_expr))
+
+    #     # sog_array and cog_array stringification: numbers as strings, nulls as None
+    #     sog_array_to_str_expr = "concat('[', array_join(transform(sog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     cog_array_to_str_expr = "concat('[', array_join(transform(cog_array, x -> CASE WHEN x IS NULL THEN 'None' ELSE cast(x as string) END), ', '), ']')"
+    #     df = df.withColumn("sog_array_str", F.expr(sog_array_to_str_expr))
+    #     df = df.withColumn("cog_array_str", F.expr(cog_array_to_str_expr))
+
+    #     # --- 11) Final select and rename to match pandas output keys ---
+    #     result = df.select(
+    #         F.col("id"),
+    #         F.col("event_index"),
+    #         F.col("trajectory"),
+    #         F.col("timestamp_array_str").alias("timestamp_array"),
+    #         F.col("sog_array_str").alias("sog_array"),
+    #         F.col("cog_array_str").alias("cog_array"),
+    #         F.col("Category").alias("behavior_type_label"),
+    #         F.col("average_speed"),
+    #         F.col("min_speed"),
+    #         F.col("max_speed"),
+    #         F.col("average_heading"),
+    #         F.col("std_dev_heading"),
+    #         F.col("total_area_time"),
+    #         F.col("low_speed_percentage"),
+    #         F.col("stagnation_time"),
+    #         # NEW fields included:
+    #         F.col("distance_in_kilometers"),
+    #         F.col("average_time_diff_between_consecutive_points"),
+    #         F.col("min_heading"),
+    #         F.col("max_heading"),
+    #         F.col("std_dev_speed"),
+    #     )
+
+    #     logger.info("create_aggregated_NON_TRANSSHIPMENT_dataframe_with_spark_Pitsikalis_2019: finished")
+
+    #     return result
 
     
     

@@ -1,0 +1,90 @@
+summary: "Endpoint for SVM model training (Loitering vs Transshipment)"
+description: |
+  Trains an SVM model to classify ship trajectories as either **LOITERING** or **TRANSSHIPMENT**.
+  All training data and features are read from the `captaima.aggregated_ais_data` table.
+  The training process and results are logged in MLflow for tracking and analysis.
+
+  **Support Vector Machine (SVM)**: SVM is a supervised learning model that finds the optimal hyperplane separating classes.
+
+tags:
+  - "Train Machine Learning Models"
+produces:
+  - "application/json"
+parameters:
+  - in: body
+    name: body
+    description: |
+      You may pass hyperparameters and dataset sampling controls:
+
+      - **per_label_n**: Number of samples to draw *per class* (LOITERING and TRANSSHIPMENT). If omitted, defaults to the smallest class size between the two.
+      - **max_iteration_steps**: Maximum iterations for LinearSVC.
+      - **regParam**: Regularization parameter for LinearSVC (if omitted default is used).
+      - **test_size**: Proportion of the sampled dataset used for testing.
+      - **random_state**: Seed for reproducible sampling/splitting.
+      - **experiment_name**: Name of the MLflow experiment.
+
+    required: true
+    schema:
+      type: object
+      properties:
+        experiment_name:
+          type: string
+          example: "SVM_Loitering_vs_Transshipment"
+        hyperparameters:
+          type: object
+          properties:
+            per_label_n:
+              type: integer
+              example: 800
+            max_iteration_steps:
+              type: integer
+              example: 20
+            regParam:
+              type: number
+              format: float
+              example: 0.01
+            test_size:
+              type: number
+              format: float
+              example: 0.20
+            random_state:
+              type: integer
+              example: 42
+
+responses:
+  200:
+    description: |
+      SVM model trained and logged to MLflow. Response contains training metrics and MLflow run id.
+    schema:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Model trained and registered in MLflow"
+        details:
+          type: object
+          properties:
+            accuracy:
+              type: number
+              format: float
+            f1:
+              type: number
+              format: float
+            precision:
+              type: number
+              format: float
+            recall:
+              type: number
+              format: float
+            mlflow_run_id:
+              type: string
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal Server Error"
+        details:
+          type: string

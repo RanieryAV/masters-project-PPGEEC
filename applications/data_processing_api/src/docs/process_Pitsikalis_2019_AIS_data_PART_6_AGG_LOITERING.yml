@@ -1,12 +1,12 @@
-summary: "[OPTIONAL_MUST_BE_SKIPPED] Process Pitsikalis 2019 labels data for recognised composite events"
+summary: "[PART 6] Process Pitsikalis 2019 labels data for recognised composite events"
 description: |
-  Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with labels data ("Pitsikalis_2019_filtered_fluentname_data_v2"),
+  Load the raw AIS CSV (ais_brest_locations.csv) cross-referenced with *LOITERING* data ("ais_loitering_events_Pitsikalis_2019"),
   filter and transform the data:
 
   - Filter by certain FluentName types
   - Convert T_start and T_end from UNIX epoch to timestamps
   - Map FluentName to categories
-  - Add an EventIndex
+  - Add an event_index
   - Save the processed data in two separate files: one for transshipment events ("ais_transshipment_events") and another for non-transshipment events ("ais_loitering_non_loitering_stopping_events")
 
 tags:

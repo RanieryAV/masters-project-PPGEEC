@@ -1,0 +1,59 @@
+summary: "Endpoint for Image models training (Loitering vs Stopping)"
+description: |
+  Trains **pretrained image models** to classify ship trajectory images as either **LOITERING** or **STOPPING**.
+  Images are read from the dataset directory which must follow the structure:
+
+  - image_resolution_224x224/
+
+    - LOITERING/
+
+    - STOPPING/
+
+tags:
+- "Train Machine Learning Models"
+produces:
+- "application/json"
+parameters:
+- in: body
+  name: body
+  description: |
+    POST body may include:
+    - **dataset_dir**: Path to the image dataset root. Default is `/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224`.
+    - **per_label_n**: Number of samples to draw per class. If omitted defaults to the smallest class size.
+    - **test_size**: Fraction of sampled dataset to reserve for testing (0..1). Default is 0.2.
+  required: true
+  schema:
+    type: object
+    properties:
+      dataset_dir:
+        type: string
+        example: "/app/processed_output/image_trajectory_datasets_all_behavior_types/image_resolution_224x224"
+      per_label_n:
+        type: integer
+        example: 800
+      test_size:
+        type: number
+        format: float
+        example: 0.2
+responses:
+  200:
+    description: |
+      Image models trained and logged in MLflow. Response contains training results per pretrained model.
+    schema:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Image models trained and logged in MLflow"
+        details:
+          type: object
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal Server Error"
+        details:
+          type: string

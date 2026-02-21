@@ -10,6 +10,7 @@ services:
     volumes:
       - ./shared/utils/datasets:/app/datasets
       - ./shared/utils/processed_output:/app/processed_output
+      - ./infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     environment:
       # Flask-related env vars
       FLASK_DATA_PROCESSING_HOST: ${FLASK_DATA_PROCESSING_HOST}
@@ -34,11 +35,16 @@ services:
       OUTPUT_FOLDER_NAME_FOR_LOITERING_AIS_DATA_SPARK_PITSIKALIS_2019: ${OUTPUT_FOLDER_NAME_FOR_LOITERING_AIS_DATA_SPARK_PITSIKALIS_2019}
       OUTPUT_FOLDER_NAME_FOR_NORMAL_AIS_DATA_SPARK_PITSIKALIS_2019: ${OUTPUT_FOLDER_NAME_FOR_NORMAL_AIS_DATA_SPARK_PITSIKALIS_2019}
       OUTPUT_FOLDER_NAME_FOR_STOPPING_AIS_DATA_SPARK_PITSIKALIS_2019: ${OUTPUT_FOLDER_NAME_FOR_STOPPING_AIS_DATA_SPARK_PITSIKALIS_2019}
-      OUTPUT_FOLDER_NAME_FOR_OPTIONAL_MUST_BE_SKIPPED_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2: ${OUTPUT_FOLDER_NAME_FOR_OPTIONAL_MUST_BE_SKIPPED_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2}
+      OUTPUT_FOLDER_NAME_FOR_DEPRECATED_MUST_BE_SKIPPED_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2: ${OUTPUT_FOLDER_NAME_FOR_DEPRECATED_MUST_BE_SKIPPED_CLEANED_LOITER_STOP_TRAJECTORIES_SUBSET_V2}
       OUTPUT_FOLDER_NAME_FOR_AGG_TRANSSHIP_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES: ${OUTPUT_FOLDER_NAME_FOR_AGG_TRANSSHIP_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES}
       OUTPUT_FOLDER_NAME_FOR_AGG_LOITERING_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES: ${OUTPUT_FOLDER_NAME_FOR_AGG_LOITERING_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES}
       OUTPUT_FOLDER_NAME_FOR_AGG_NORMAL_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES: ${OUTPUT_FOLDER_NAME_FOR_AGG_NORMAL_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES}
       OUTPUT_FOLDER_NAME_FOR_AGG_STOPPING_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES: ${OUTPUT_FOLDER_NAME_FOR_AGG_STOPPING_UNIQUE_VESSEL_DATA_PITSIKALIS_2019_WITH_EXTRA_FEATURES}
+
+      # ensure driver JVM and executors see the jar
+      PYSPARK_SUBMIT_ARGS: "--jars /opt/jars/postgresql.jar --driver-class-path /opt/jars/postgresql.jar pyspark-shell"
+      # optional fallback (some spark builds read this)
+      SPARK_CLASSPATH: "/opt/jars/postgresql.jar"
     networks:
       - captaima-network
 
@@ -49,6 +55,7 @@ services:
       dockerfile: applications/model_deployment_api/dockerfile.model_deployment_api
     volumes:
       - ./applications/model_deployment_api/models:/models
+      - ./infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
     ports:
       - ${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}:${FLASK_MODEL_DEPLOYMENT_PORT_DOCKER}
       - 8502:8502 # Temporary port for the streamlit prototype
@@ -67,6 +74,11 @@ services:
       # MLFlow env vars
       MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+
+      # ensure driver JVM and executors see the jar
+      PYSPARK_SUBMIT_ARGS: "--jars /opt/jars/postgresql.jar --driver-class-path /opt/jars/postgresql.jar pyspark-shell"
+      # optional fallback (some spark builds read this)
+      SPARK_CLASSPATH: "/opt/jars/postgresql.jar"
     networks:
       - captaima-network
 
@@ -77,6 +89,11 @@ services:
       dockerfile: applications/model_training_api/dockerfile.model_training_api
     ports:
       - ${FLASK_MODEL_TRAINING_PORT_DOCKER}:${FLASK_MODEL_TRAINING_PORT_DOCKER}
+    volumes:
+      - ./shared/utils/datasets:/app/datasets
+      - ./shared/utils/processed_output:/app/processed_output
+      - ./infrastructure/jars/postgresql-42.7.3.jar:/opt/jars/postgresql.jar:ro
+    gpus: all
     environment:
       # Flask-related env vars
       FLASK_MODEL_TRAINING_HOST: ${FLASK_MODEL_TRAINING_HOST}
@@ -92,6 +109,14 @@ services:
       # MLFlow env vars
       MLFLOW_UI_PORT: ${MLFLOW_UI_PORT}
       MLFLOW_URI: http://${MLFLOW_CONTAINER_HOST}:${MLFLOW_UI_PORT}
+
+      # ensure driver JVM and executors see the jar
+      PYSPARK_SUBMIT_ARGS: "--jars /opt/jars/postgresql.jar --driver-class-path /opt/jars/postgresql.jar pyspark-shell"
+      # optional fallback (some spark builds read this)
+      SPARK_CLASSPATH: "/opt/jars/postgresql.jar"
+
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     networks:
       - captaima-network
 

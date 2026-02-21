@@ -57,3 +57,7 @@ NOTES:
 - It was discovered that in order for the local data processing API to be able to send Spark jobs to the Spark containers, the Driver host must also be a container. Insisting on using the local API would require additional configurations that are not worth the effort at this moment (such as using extra softwares, like Lily, which would increase function verbosity and add an extra failure point).
     - Consequence: Only the containerized data processing API can send Spark jobs to the Spark containers.
     - That leaves the local APIs for debugging purposes only.
+- Every now and then, run the command below to clean up unused Docker resources.
+    ```sh
+    docker system prune -af
+    ```

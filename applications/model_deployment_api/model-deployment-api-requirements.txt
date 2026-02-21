@@ -13,3 +13,4 @@ GeoAlchemy2==0.15.2
 shapely==2.0.6
 streamlit==1.40.0
 streamlit-folium==0.22.1
+pyspark==3.5.1

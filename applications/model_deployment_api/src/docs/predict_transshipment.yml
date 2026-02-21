@@ -1,0 +1,6 @@
+swagger: "2.0"
+info:
+  title: PLACEHOLDER - Model Deployment API
+  description: PLACEHOLDER - API for deploying machine learning models.
+  version: "0.1.0"
+basePath: "/"

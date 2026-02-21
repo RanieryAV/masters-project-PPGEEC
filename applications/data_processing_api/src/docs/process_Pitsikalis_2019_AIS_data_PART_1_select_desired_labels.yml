@@ -1,11 +1,11 @@
-summary: "Process Pitsikalis 2019 labels data for recognised composite events"
+summary: "[PART 1] Process Pitsikalis 2019 labels data for recognised composite events"
 description: |
   Load the Maritime Composite Events CSV (recognized_CEs.csv),
   filter and transform the data:
   - Filter by certain FluentName types
   - Convert T_start and T_end from UNIX epoch to timestamps
   - Map FluentName to categories
-  - Add an EventIndex
+  - Add an event_index
   - Save the processed data
 
 tags:
@@ -47,7 +47,7 @@ responses:
               type: "array"
               items:
                 type: "string"
-              example: ["EventIndex", "FluentName", "MMSI", "Argument", "Value", "T_start", "T_end", "Category"]
+              example: ["event_index", "FluentName", "MMSI", "Argument", "Value", "T_start", "T_end", "Category"]
             unique_counts:
               type: "object"
               additionalProperties:
