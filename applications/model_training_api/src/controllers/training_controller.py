@@ -417,3 +417,31 @@ def train_all_behavior_types_image_models_controller():
     except Exception as e:
         logging.exception("Exception occurred in controller /train_all_behavior_types_image_models")
         return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@training_bp.route('/train_all_behavior_types_image_models_from_csv', methods=['POST'])
+@swag_from(path.join(path.dirname(__file__), '../docs/train_all_behavior_types_image_models_from_csv.yml'))
+def train_all_behavior_types_image_models_from_csv_controller():
+    try:
+        logging.info("Endpoint /train_all_behavior_types_image_models_from_csv called")
+        data_request = request.get_json() or {}
+
+        # Only allow these user-settable parameters
+        dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events")
+        per_label_n = data_request.get('per_label_n', None)
+        test_size = data_request.get('test_size', 0.2)
+
+        # If you want to restrict allowed labels you can pass them here; by default TrainModelService will use the full set
+        with current_app.app_context():
+            result = TrainModelService.train_all_behavior_types_image_models_from_csv_separate_aux(
+                dataset_dir=dataset_dir,
+                models_dict=models_dict
+            )
+
+            safe_result = TrainModelService.make_json_safe(result)
+
+        logging.info("Training result: %s", safe_result)
+        return jsonify({"message": "Image models trained and logged in MLflow", "details": safe_result}), 200
+
+    except Exception as e:
+        logging.exception("Exception occurred in controller /train_all_behavior_types_image_models_from_csv")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500

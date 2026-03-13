@@ -1,0 +1,50 @@
+summary: "Endpoint for Image models training (All Behavior Types)"
+description: |
+  Trains **pretrained image models** to classify trajectory images among the behavior types (LOITERING, NORMAL, STOPPING, TRANSSHIPMENT).
+  Images are read from the CSV dataset (with extra feature arrays) which must follow the structure:
+
+  - image_resolution_224x224/
+
+    - LOITERING/
+
+    - NORMAL/
+
+    - STOPPING/
+
+    - TRANSSHIPMENT/
+
+tags:
+- "Train Machine Learning Models"
+produces:
+- "application/json"
+parameters:
+  - in: "body"
+    name: "body"
+    description: "No request body required for this endpoint. The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
+    required: false
+    schema:
+      type: "object"
+      properties: {}
+      example: {}
+responses:
+  200:
+    description: |
+      Image models trained and logged in MLflow. Response contains training results per pretrained model.
+    schema:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Image models trained and logged in MLflow"
+        details:
+          type: object
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal Server Error"
+        details:
+          type: string

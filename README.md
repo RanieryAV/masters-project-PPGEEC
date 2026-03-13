@@ -61,3 +61,8 @@ NOTES:
     ```sh
     docker system prune -af
     ```
+- After generating dataset files, run these permission commands to allow easier file use
+    ```sh
+    sudo chmod -R 777 ./shared/utils/processed_output
+    sudo chown -R <yourUsername>:<yourUsername> ./shared/utils/processed_output
+    ```

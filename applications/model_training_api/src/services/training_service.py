@@ -42,6 +42,13 @@ from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.metrics import SparseCategoricalAccuracy
 import csv
 
+# ------------------------
+# Misc imports
+import glob
+import ast
+import gc
+# ------------------------
+
 """
 Spark-based training services that read only from captaima.aggregated_ais_data,
 use the numeric feature columns defined in AggregatedAISData, perform balanced sampling,
@@ -3769,7 +3776,7 @@ Notes:
             out_dir = os.path.join("artifacts", "image_models", model_name)
             try:
                 with tf.device(device):
-                    res = _train_and_log_keras_model_with_classnames(
+                    res = TrainModelService._train_and_log_keras_model_with_classnames(
                         base_model=base_model,
                         model_name=model_name,
                         X_train_paths=X_train_paths,
@@ -3787,7 +3794,7 @@ Notes:
                     )
             except Exception as e:
                 logger.warning("Device context failed for model %s with device %s, falling back to default device. Error: %s", model_name, device, str(e))
-                res = _train_and_log_keras_model_with_classnames(
+                res = TrainModelService._train_and_log_keras_model_with_classnames(
                     base_model=base_model,
                     model_name=model_name,
                     X_train_paths=X_train_paths,
@@ -3889,7 +3896,7 @@ Notes:
             out_dir = os.path.join("artifacts", "image_models", model_name)
             try:
                 with tf.device(device):
-                    res = _train_and_log_keras_model_with_classnames(
+                    res = TrainModelService._train_and_log_keras_model_with_classnames(
                         base_model=base_model,
                         model_name=model_name,
                         X_train_paths=X_train_paths,
@@ -3907,7 +3914,7 @@ Notes:
                     )
             except Exception as e:
                 logger.warning("Device context failed for model %s with device %s, falling back to default device. Error: %s", model_name, device, str(e))
-                res = _train_and_log_keras_model_with_classnames(
+                res = TrainModelService._train_and_log_keras_model_with_classnames(
                     base_model=base_model,
                     model_name=model_name,
                     X_train_paths=X_train_paths,
@@ -3924,4 +3931,1098 @@ Notes:
                     out_dir=out_dir
                 )
             results[model_name] = res
+        return results
+    
+    # Paste inside class TrainModelService (or replace existing function definitions).
+    # Requires imports already present at top of file (tensorflow, numpy, pandas, mlflow, etc).
+
+    @staticmethod
+    def _build_tf_dataset_from_matrix_column(
+        images_list,
+        labels_list,
+        aux_data: dict,
+        preprocess_fn=None,
+        img_size=(120, 120),
+        batch_size=16,
+        shuffle=True,
+        use_aux_inputs=True,
+        aux_column_order=None,
+        aux_column_lengths=None,
+        random_state=42
+    ):
+        """
+        Build a tf.data.Dataset from in-memory lists:
+          - images_list: list/np.array of image arrays (uint8 or float)
+          - labels_list: list/np.int (int labels)
+          - aux_data: dict {colname: list/np.array} where each element is a 1D list/array for that row
+          - preprocess_fn: model-specific preprocess (can expect 0..1 or 0..255 input)
+          - use_aux_inputs: whether to include auxiliary inputs
+          - aux_column_order: explicit ordering of aux columns (list). If None, use aux_data.keys()
+          - aux_column_lengths: dict {col: length} to pad/truncate aux inputs (if None, computed from aux_data)
+        Returns: tf.data.Dataset that yields ((img_batch, aux1_batch, aux2_batch, ...), label_batch)
+        Mirrors style/structure of TrainModelService._build_tf_dataset (file-based) but for matrix-in-memory.
+        """
+        AUTOTUNE = tf.data.AUTOTUNE
+
+        images_list = list(images_list)
+        labels_list = list(labels_list or [])
+        if aux_column_order is None:
+            aux_column_order = list(aux_data.keys()) if aux_data is not None else []
+
+        # compute aux column lengths if not provided
+        if use_aux_inputs:
+            if aux_column_lengths is None:
+                aux_column_lengths = {}
+                for col in aux_column_order:
+                    col_lists = aux_data.get(col, [])
+                    maxlen = 0
+                    for arr in col_lists:
+                        if arr is None:
+                            continue
+                        try:
+                            l = len(arr)
+                        except Exception:
+                            # fallback: treat as scalar
+                            l = 1
+                        if l > maxlen:
+                            maxlen = l
+                    aux_column_lengths[col] = int(maxlen)
+            else:
+                # ensure ints
+                aux_column_lengths = {k: int(v) for k, v in aux_column_lengths.items()}
+
+        # Build a generator that yields (img, aux1, aux2, ..., label)
+        def gen():
+            n = len(images_list)
+            for i in range(n):
+                img = images_list[i]
+                label = int(labels_list[i])
+                if use_aux_inputs:
+                    row_aux = []
+                    for col in aux_column_order:
+                        colvals = aux_data.get(col, [])
+                        v = colvals[i] if i < len(colvals) else None
+                        # ensure a numpy 1D array (float32)
+                        if v is None:
+                            vec = np.zeros((aux_column_lengths.get(col, 0),), dtype=np.float32)
+                        else:
+                            arr = np.array(v, dtype=np.float32)
+                            L = aux_column_lengths.get(col, 0)
+                            if L <= 0:
+                                vec = np.array([], dtype=np.float32)
+                            else:
+                                if arr.size >= L:
+                                    vec = arr.flatten()[:L].astype(np.float32)
+                                else:
+                                    # pad with zeros
+                                    pad = np.zeros((L - arr.size,), dtype=np.float32)
+                                    vec = np.concatenate([arr.flatten(), pad]).astype(np.float32)
+                        row_aux.append(vec)
+                    # yield tuple: (img, aux1, aux2, ... , label)
+                    yield tuple([np.array(img)] + row_aux + [np.int32(label)])
+                else:
+                    yield np.array(img), np.int32(label)
+
+        # Build output_signature
+        if use_aux_inputs:
+            specs = []
+            # image: variable H,W,3 uint8/float32 - we will cast later
+            specs.append(tf.TensorSpec(shape=(None, None, 3), dtype=tf.uint8))
+            for col in aux_column_order:
+                L = aux_column_lengths.get(col, 0)
+                specs.append(tf.TensorSpec(shape=(L,), dtype=tf.float32))
+            specs.append(tf.TensorSpec(shape=(), dtype=tf.int32))
+            ds = tf.data.Dataset.from_generator(gen, output_signature=tuple(specs))
+        else:
+            ds = tf.data.Dataset.from_generator(
+                gen,
+                output_signature=(
+                    tf.TensorSpec(shape=(None, None, 3), dtype=tf.uint8),
+                    tf.TensorSpec(shape=(), dtype=tf.int32),
+                )
+            )
+
+        # Mapping: resize image, cast to float32 and normalize/apply preprocess_fn.
+        def _map_with_aux(*args):
+            # args: img, aux1, aux2, ..., label
+            img = args[0]
+            aux_inputs = args[1:-1]
+            lab = args[-1]
+            # ensure float image
+            img_rs = tf.image.resize(img, img_size)
+            img_f = tf.cast(img_rs, tf.float32)  # currently 0..255 likely
+            # apply preprocess_fn if provided
+            if preprocess_fn is not None:
+                try:
+                    img_f = preprocess_fn(img_f)
+                except Exception:
+                    # fallback: if preprocess fails, normalize 0..1
+                    img_f = img_f / 255.0
+            else:
+                # ensure normalized 0..1 (requested)
+                img_f = img_f / 255.0
+            # aux inputs already padded to fixed length and dtype float32
+            return (img_f, *aux_inputs), lab
+
+        def _map_no_aux(img, lab):
+            img_rs = tf.image.resize(img, img_size)
+            img_f = tf.cast(img_rs, tf.float32)
+            if preprocess_fn is not None:
+                try:
+                    img_f = preprocess_fn(img_f)
+                except Exception:
+                    img_f = img_f / 255.0
+            else:
+                img_f = img_f / 255.0
+            return img_f, lab
+
+        if use_aux_inputs:
+            ds = ds.map(lambda *a: _map_with_aux(*a), num_parallel_calls=AUTOTUNE)
+        else:
+            ds = ds.map(lambda img, lab: _map_no_aux(img, lab), num_parallel_calls=AUTOTUNE)
+
+        if shuffle:
+            ds = ds.shuffle(buffer_size=max(512, len(images_list)), seed=int(random_state))
+        ds = ds.batch(batch_size).prefetch(AUTOTUNE)
+        return ds
+    
+    # ----------------------
+    # Streaming tf.data builder (to be attached to TrainModelService)
+    # ----------------------
+    @staticmethod
+    def _build_tf_dataset_from_matrix_column_streaming(
+        csv_files,
+        index_set,
+        label_to_int,
+        aux_columns,
+        aux_col_lengths,
+        aux_max,
+        img_size=(120, 120),
+        preprocess_fn=None,
+        batch_size=8,
+        shuffle=False,
+        seed=42,
+        use_aux_inputs=True,
+    ):
+        """Build a streaming tf.data.Dataset with tf.data.Dataset.from_generator.
+
+        Minor fixes:
+        - Use csv.DictReader (assumes caller already set csv.field_size_limit)
+        - Lookup label int first by global index (label_to_int is typically index->int),
+        fall back to label string lookup for backward compatibility.
+        - Skip rows where label->int mapping is missing (log a warning).
+        - Delete large temporaries per-row and call gc.collect() occasionally.
+        - Cap excessively large aux_col_lengths and resample long aux arrays to the target length L.
+        """
+        import csv
+        import gc
+
+        files = list(csv_files)
+
+        # --- Safety: cap aux_col_lengths to avoid huge per-sample allocations ---
+        MAX_AUX_LEN = 1024  # adjust lower if memory is tight (256/512)
+        for k, orig in list(aux_col_lengths.items()):
+            if orig > MAX_AUX_LEN:
+                logger and logger.warning(
+                    "Aux column '%s' max length is very large (%d). Capping to %d for streaming.",
+                    k,
+                    orig,
+                    MAX_AUX_LEN,
+                )
+                aux_col_lengths[k] = MAX_AUX_LEN
+
+        def _parse_field_text_to_obj(text):
+            if text is None or (isinstance(text, str) and text.strip() == ""):
+                return None
+            s = text.strip()
+            try:
+                return ast.literal_eval(s)
+            except Exception:
+                pass
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+            return None
+
+        def generator():
+            global_idx = 0
+            rows_yielded = 0
+            try:
+                for fpath in files:
+                    try:
+                        with open(fpath, newline="") as fh:
+                            reader = csv.DictReader(fh)
+                            for row in reader:
+                                # only process requested indices
+                                if global_idx in index_set:
+                                    # parse label string (if present)
+                                    lab = None
+                                    # try common header keys (backward compatible)
+                                    lab = (
+                                        row.get("behavior_type_label")
+                                        or row.get("behavior_type")
+                                        or row.get("label")
+                                    )
+                                    if lab is not None:
+                                        lab = lab.strip()
+
+                                    # primary lookup: label_to_int is usually global_index -> int
+                                    lab_int = label_to_int.get(global_idx)
+                                    # fallback: allow label_to_int to be label->int mapping too
+                                    if lab_int is None and lab is not None:
+                                        lab_int = label_to_int.get(lab)
+
+                                    if lab_int is None:
+                                        # don't attempt np.int32(None) — skip and log
+                                        logger and logger.warning(
+                                            "Skipping row %d in %s: label int missing for lab='%s' (global_idx=%d)",
+                                            global_idx,
+                                            fpath,
+                                            str(lab),
+                                            global_idx,
+                                        )
+                                        global_idx += 1
+                                        continue
+
+                                    # parse image matrix
+                                    mat_text = (
+                                        row.get("trajectory_image_matrix")
+                                        or row.get("trajectory_image")
+                                        or row.get("matrix")
+                                    )
+                                    parsed_mat = _parse_field_text_to_obj(mat_text)
+                                    if parsed_mat is None:
+                                        logger and logger.warning(
+                                            "Skipping row %d in %s: no matrix parsed", global_idx, fpath
+                                        )
+                                        global_idx += 1
+                                        continue
+
+                                    # convert to numpy and force 3-channel rgb
+                                    try:
+                                        arr = np.array(parsed_mat)
+                                        if arr.ndim == 2:
+                                            arr_rgb = np.stack([arr, arr, arr], axis=-1)
+                                        elif arr.ndim == 3:
+                                            if arr.shape[2] == 3:
+                                                arr_rgb = arr
+                                            elif arr.shape[2] == 1:
+                                                arr_rgb = np.concatenate([arr, arr, arr], axis=-1)
+                                            else:
+                                                arr_rgb = arr[:, :, :3]
+                                        else:
+                                            flat = arr.flatten()
+                                            total_pix = flat.size // 3
+                                            if total_pix <= 0:
+                                                global_idx += 1
+                                                # cleanup
+                                                try:
+                                                    del arr
+                                                except Exception:
+                                                    pass
+                                                gc.collect()
+                                                continue
+                                            side = int(np.sqrt(total_pix))
+                                            flat = flat[: (side * side * 3)]
+                                            arr_rgb = flat.reshape((side, side, 3))
+                                    except Exception:
+                                        logger and logger.exception(
+                                            "Failed to convert parsed_mat -> arr for row %d in %s", global_idx, fpath
+                                        )
+                                        # attempt to free and continue
+                                        try:
+                                            del parsed_mat
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # normalize to float32 [0,1]
+                                    try:
+                                        if np.issubdtype(arr_rgb.dtype, np.floating):
+                                            maxv = float(np.nanmax(arr_rgb)) if arr_rgb.size else 0.0
+                                            if maxv <= 1.0:
+                                                img = np.clip(arr_rgb, 0.0, 1.0).astype(np.float32)
+                                            else:
+                                                img = (np.clip(arr_rgb, 0.0, 255.0) / 255.0).astype(np.float32)
+                                        else:
+                                            img = (arr_rgb.astype(np.float32) / 255.0)
+                                    except Exception:
+                                        logger and logger.exception(
+                                            "Failed to normalize arr_rgb for row %d in %s", global_idx, fpath
+                                        )
+                                        # cleanup temporaries
+                                        try:
+                                            del arr, arr_rgb
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # resize if needed
+                                    try:
+                                        if img.shape[0] != img_size[0] or img.shape[1] != img_size[1]:
+                                            img = tf.image.resize(img, (img_size[0], img_size[1])).numpy().astype(np.float32)
+                                    except Exception:
+                                        logger and logger.exception(
+                                            "Failed to resize image for row %d in %s", global_idx, fpath
+                                        )
+                                        try:
+                                            del arr, arr_rgb, img
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # apply preprocess_fn if provided
+                                    if callable(preprocess_fn):
+                                        try:
+                                            img_proc = preprocess_fn(np.expand_dims(img, axis=0))
+                                            img = np.squeeze(img_proc, axis=0).astype(np.float32)
+                                        except Exception:
+                                            # fallback to unprocessed img
+                                            pass
+
+                                    # build aux vectors (with safe resampling/pad/truncate)
+                                    aux_inputs = []
+                                    if use_aux_inputs:
+                                        for col in aux_columns:
+                                            L = aux_col_lengths.get(col, 0)
+                                            raw_aux = row.get(col, None)
+                                            parsed_aux = _parse_field_text_to_obj(raw_aux)
+
+                                            # default
+                                            if L <= 0:
+                                                vec = np.zeros((0,), dtype=np.float32)
+                                            else:
+                                                if parsed_aux is None:
+                                                    vec = np.zeros((L,), dtype=np.float32)
+                                                else:
+                                                    try:
+                                                        arr_aux = np.array([float(x) for x in parsed_aux], dtype=np.float32)
+                                                    except Exception:
+                                                        arr_aux = np.zeros((0,), dtype=np.float32)
+
+                                                    n = arr_aux.size
+
+                                                    if n == 0:
+                                                        vec = np.zeros((L,), dtype=np.float32)
+                                                    elif n == L:
+                                                        vec = arr_aux.astype(np.float32)
+                                                    elif n < L:
+                                                        pad = np.zeros((L - n,), dtype=np.float32)
+                                                        vec = np.concatenate([arr_aux, pad], axis=0)
+                                                    else:
+                                                        # n > L: resample via linear interpolation to L points (uniform positions)
+                                                        idx_target = np.linspace(0.0, float(n - 1), num=L)
+                                                        vec = np.interp(idx_target, np.arange(n, dtype=np.float32), arr_aux).astype(np.float32)
+
+                                            # normalize after resampling/pad/truncate
+                                            maxv = float(aux_max.get(col, 1.0) or 1.0)
+                                            if maxv != 0.0 and vec.size > 0:
+                                                vec = vec / maxv
+
+                                            aux_inputs.append(vec.astype(np.float32))
+
+                                    # final inputs tuple
+                                    if use_aux_inputs and len(aux_inputs) > 0:
+                                        inputs = (img.astype(np.float32),) + tuple(aux_inputs)
+                                    else:
+                                        inputs = (img.astype(np.float32),)
+
+                                    # safe conversion of label int
+                                    try:
+                                        label_value = int(lab_int)
+                                    except Exception:
+                                        logger and logger.warning(
+                                            "Invalid label int for row %d in %s: %s", global_idx, fpath, str(lab_int)
+                                        )
+                                        # cleanup and continue
+                                        try:
+                                            del arr, arr_rgb, img, inputs
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # yield (inputs, label)
+                                    yield inputs, np.int32(label_value)
+                                    rows_yielded += 1
+
+                                    # free per-row temporaries to keep peak memory down
+                                    try:
+                                        del arr, arr_rgb, img
+                                    except Exception:
+                                        pass
+                                    gc.collect()
+
+                                global_idx += 1
+                    except StopIteration:
+                        break
+                    except Exception:
+                        logger and logger.exception("Error streaming CSV %s", fpath)
+                        # continue with next file
+                        continue
+            finally:
+                # final cleanup if generator ends (either normally or because of exception)
+                gc.collect()
+
+        # build output signature
+        image_spec = tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32)
+        aux_specs = []
+        if use_aux_inputs:
+            for col in aux_columns:
+                L = aux_col_lengths.get(col, 0)
+                if L > 0:
+                    aux_specs.append(tf.TensorSpec(shape=(L,), dtype=tf.float32))
+        input_signature = ((image_spec,) + tuple(aux_specs), tf.TensorSpec(shape=(), dtype=tf.int32))
+
+        ds = tf.data.Dataset.from_generator(generator, output_signature=input_signature)
+        if shuffle:
+            ds = ds.shuffle(buffer_size=16, seed=seed)
+        ds = ds.batch(batch_size)
+        ds = ds.prefetch(4)
+        return ds
+
+
+    import numpy as np
+    import pandas as pd
+    import tensorflow as tf
+    import mlflow
+
+    from datetime import datetime
+    from sklearn.model_selection import StratifiedShuffleSplit
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+
+    # ----------------------
+    # Example compatible base model helper
+    # ----------------------
+    def example_compatible_base_model(img_size=(120, 120), aux_column_lengths: dict = None):
+        """Example compatible base model (backbone) demonstrating expected input signatures.
+
+        - image input: (H, W, 3)
+        - for each aux column a 1D vector of length L
+        The model returns a vector representation (not final predictions). Use this
+        as a baseline for building custom backbones that integrate image + aux inputs.
+        """
+        if aux_column_lengths is None:
+            aux_column_lengths = {}
+
+        image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
+        aux_inputs = [tf.keras.Input(shape=(L,), name=f"aux_{c}") for c, L in aux_column_lengths.items()]
+
+        # simple conv backbone for image -> vector
+        y = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(image_input)
+        y = tf.keras.layers.MaxPool2D()(y)
+        y = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(y)
+        y = tf.keras.layers.GlobalAveragePooling2D()(y)  # -> vector
+
+        aux_heads = []
+        for inp in aux_inputs:
+            h = tf.keras.layers.Dense(32, activation="relu")(inp)
+            aux_heads.append(h)
+
+        if aux_heads:
+            merged = tf.keras.layers.concatenate([y] + aux_heads)
+        else:
+            merged = y
+
+        merged = tf.keras.layers.Dense(128, activation="relu")(merged)
+        model = tf.keras.Model(inputs=[image_input] + aux_inputs, outputs=merged, name="example_backbone")
+        return model
+
+
+    def train_all_behavior_types_image_models_from_csv_separate_aux(
+        dataset_dir: str,
+        matrix_column: str = "trajectory_image_matrix",
+        label_column: str = "behavior_type_label",
+        aux_columns: list = None,  # e.g. ["sog_array","cog_array","timestamp_array"]
+        models_dict: dict = None,
+        base_tensorflow_model=None,  # optional user-supplied Keras model to integrate
+        allowed_labels: list = None,
+        per_label_n: int = 50,  # default per-class samples (0 -> use all)
+        test_size: float = 0.2,
+        random_state: int = 42,
+        img_size: tuple = (120, 120),  # target image size (height, width)
+        epochs: int = 5,
+        batch_size: int = 8,
+        learning_rate: float = 0.001,
+        callbacks_list: list = None,
+        experiment_name: str = None,
+        register_model_name: str = None,
+        use_aux_inputs: bool = True,
+    ):
+        """
+        Main training pipeline that streams CSV rows into tf.data, validates user base model,
+        builds a true 4-input model (image + aux vectors) and logs with MLflow.
+
+        Changed behaviour:
+        - Build TF datasets ONCE with a neutral/no-op image preprocessing.
+        - For each model, wrap the image input with a Keras preprocessing layer that
+        calls the per-model preprocess_fn. This lets us reuse the heavy CSV streaming
+        builder while applying model-specific preprocessing inside the Keras model graph.
+        """
+        import csv as _csv
+        import sys as _sys
+        import gc
+
+        logger and logger.info and logger.debug  # quiet reference if not present
+
+        # increase CSV parser field size limit (handle very large serialized fields)
+        _max_int = _sys.maxsize
+        while True:
+            try:
+                _csv.field_size_limit(_max_int)
+                break
+            except OverflowError:
+                _max_int = int(_max_int / 10)
+
+        if aux_columns is None:
+            aux_columns = ["sog_array", "cog_array", "timestamp_array"]
+        if allowed_labels is None:
+            allowed_labels = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+
+        if not os.path.isdir(dataset_dir):
+            return {"error": f"dataset_dir not found or not a directory: {dataset_dir}"}
+        logger and logger.info("Scanning dataset_dir for CSV files: %s", dataset_dir)
+
+        csv_files = sorted(glob.glob(os.path.join(dataset_dir, "*.csv")))
+        if len(csv_files) == 0:
+            return {"error": f"No CSV files found in dataset_dir: {dataset_dir}"}
+
+        logger and logger.info("Found %d CSV files", len(csv_files))
+
+        # --- First pass: gather labels, compute aux_col_lengths and aux_max without storing images ---
+        labels_list = []
+        shapes_set = set()
+        aux_col_lengths = {c: 0 for c in aux_columns}
+        aux_max = {c: 0.0 for c in aux_columns}
+        total_rows = 0
+        skipped_rows = 0
+
+        def _parse_field_text_local(text):
+            if text is None or (isinstance(text, str) and text.strip() == ""):
+                return None
+            s = text.strip()
+            try:
+                return ast.literal_eval(s)
+            except Exception:
+                pass
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+            return None
+
+        for fpath in csv_files:
+            logger and logger.info("Reading CSV for metadata: %s", fpath)
+            try:
+                with open(fpath, newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        total_rows += 1
+                        lab = row.get(label_column) or row.get("behavior_type_label")
+                        if lab is None or lab.strip() == "" or lab.strip() not in allowed_labels:
+                            skipped_rows += 1
+                            continue
+                        labels_list.append(lab.strip())
+
+                        # compute aux stats
+                        for col in aux_columns:
+                            raw = row.get(col, None)
+                            parsed = _parse_field_text_local(raw)
+                            if parsed is None:
+                                continue
+                            # length
+                            try:
+                                plen = len(parsed)
+                            except Exception:
+                                plen = 0
+                            if plen > aux_col_lengths[col]:
+                                aux_col_lengths[col] = plen
+                            # max absolute value
+                            try:
+                                cand = float(np.max(np.abs(np.array(parsed, dtype=float))))
+                                if cand > aux_max[col]:
+                                    aux_max[col] = cand
+                            except Exception:
+                                # skip non-numeric values
+                                pass
+
+                        # detect image shape in a lightweight way (do not store image)
+                        mat_text = row.get(matrix_column, None)
+                        parsed_mat = _parse_field_text_local(mat_text)
+                        if parsed_mat is not None:
+                            try:
+                                if isinstance(parsed_mat, list) and len(parsed_mat) > 0:
+                                    h = len(parsed_mat)
+                                    first_row = parsed_mat[0]
+                                    if isinstance(first_row, list):
+                                        w = len(first_row)
+                                    else:
+                                        w = 1
+                                    shapes_set.add((h, w))
+                            except Exception:
+                                pass
+            except Exception:
+                logger and logger.exception("Failed first-pass read of %s", fpath)
+                return {"error": f"Failed reading CSV {fpath} during first pass"}
+
+        if len(labels_list) == 0:
+            return {"error": "No usable rows found in CSV files after first pass."}
+
+        logger and logger.info(
+            "First pass done: total_rows=%d, usable=%d, skipped=%d",
+            total_rows,
+            len(labels_list),
+            skipped_rows,
+        )
+        logger and logger.info("Detected image shapes (sample): %s", shapes_set)
+        logger and logger.info("aux_col_lengths: %s", aux_col_lengths)
+        logger and logger.info("aux_max: %s", aux_max)
+
+        # fallback aux_max to 1.0 when zero to avoid division by zero
+        for k, v in aux_max.items():
+            if v == 0.0:
+                aux_max[k] = 1.0
+
+        # cap excessively-large aux vectors to safe streaming size
+        MAX_AUX_LEN = 1024
+        for k, orig in list(aux_col_lengths.items()):
+            if orig > MAX_AUX_LEN:
+                logger and logger.warning(
+                    "Aux column '%s' max length is very large (%d). Capping to %d for streaming.",
+                    k, orig, MAX_AUX_LEN,
+                )
+                aux_col_lengths[k] = MAX_AUX_LEN
+
+        # --- sampling per_label_n: index map scaffolding ---
+        label_to_indices = {lab: [] for lab in set(labels_list)}
+        total_idx = 0
+        for fpath in csv_files:
+            with open(fpath, newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    lab = row.get(label_column) or row.get("behavior_type_label")
+                    if lab is None or lab.strip() == "" or lab.strip() not in allowed_labels:
+                        total_idx += 1
+                        continue
+                    lab = lab.strip()
+                    label_to_indices.setdefault(lab, []).append(total_idx)
+                    total_idx += 1
+
+        # apply per-label sampling if requested
+        chosen_global_indices = []
+        import random
+        rng = random.Random(int(random_state))
+        logger and logger.info("Applying per-label sampling per_label_n=%s", per_label_n)
+        if per_label_n and per_label_n > 0:
+            for lab, idxs in label_to_indices.items():
+                if len(idxs) <= per_label_n:
+                    chosen = idxs
+                else:
+                    chosen = rng.sample(idxs, per_label_n)
+                chosen_global_indices.extend(chosen)
+        else:
+            for idxs in label_to_indices.values():
+                chosen_global_indices.extend(idxs)
+
+        chosen_global_indices = sorted(chosen_global_indices)
+        # second quick pass to fetch labels for chosen indices only
+        chosen_labels = []
+        chosen_set = set(chosen_global_indices)
+        gidx = 0
+        for fpath in csv_files:
+            with open(fpath, newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    if gidx in chosen_set:
+                        lab = row.get(label_column) or row.get("behavior_type_label")
+                        chosen_labels.append(lab.strip())
+                    gidx += 1
+
+        # label encode chosen_labels for stratified split
+        le = LabelEncoder()
+        y_int_all = le.fit_transform(chosen_labels)
+        logger and logger.info("Final classes: %s", list(le.classes_))
+        logger and logger.info("Total chosen samples: %d", len(y_int_all))
+
+        # stratified split on the chosen set
+        sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=int(random_state))
+        indices = np.arange(len(chosen_global_indices))
+        train_sub_idx, test_sub_idx = next(sss.split(indices, y_int_all))
+        train_global_idx = set(int(chosen_global_indices[i]) for i in train_sub_idx)
+        test_global_idx = set(int(chosen_global_indices[i]) for i in test_sub_idx)
+
+        logger and logger.info("Train samples: %d, Test samples: %d", len(train_sub_idx), len(test_sub_idx))
+
+        # build global->labelint mapping
+        global_to_pos = {int(v): i for i, v in enumerate(chosen_global_indices)}
+        index_to_labelint = {}
+        gidx = 0
+        with_indices_populated = 0
+        for fpath in csv_files:
+            with open(fpath, newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    if gidx in global_to_pos:
+                        pos = global_to_pos[gidx]
+                        index_to_labelint[gidx] = int(y_int_all[pos])
+                        with_indices_populated += 1
+                    gidx += 1
+        logger and logger.info("Built index->labelint mapping entries=%d", with_indices_populated)
+
+        # Prepare aux_meta artifact for MLflow
+        aux_meta = {"aux_max": aux_max, "aux_col_lengths": aux_col_lengths, "aux_columns": aux_columns}
+        aux_meta_path = os.path.join("artifacts", "aux_meta.json")
+        os.makedirs(os.path.dirname(aux_meta_path), exist_ok=True)
+        with open(aux_meta_path, "w") as fh:
+            json.dump(aux_meta, fh)
+        logger and logger.info("Wrote aux_meta to %s", aux_meta_path)
+
+        # Strict compatibility check for a user-supplied base_tensorflow_model (unchanged)
+        base_integration_success = False
+        integration_mode = None
+        base_model_name = None
+        if base_tensorflow_model is not None:
+            base_model_name = getattr(base_tensorflow_model, "name", str(base_tensorflow_model))
+            logger and logger.info("Performing strict base model compatibility check for %s", base_model_name)
+            img_dummy = tf.zeros((1, img_size[0], img_size[1], 3), dtype=tf.float32)
+            aux_dummies = []
+            for col in aux_columns:
+                L = aux_col_lengths.get(col, 0)
+                if L > 0:
+                    aux_dummies.append(tf.zeros((1, L), dtype=tf.float32))
+                else:
+                    aux_dummies.append(tf.zeros((1, 0), dtype=tf.float32))
+            errors = []
+            try:
+                try:
+                    out = base_tensorflow_model([img_dummy] + aux_dummies)
+                    base_integration_success = True
+                    integration_mode = "all_inputs"
+                except Exception as e_a:
+                    errors.append(("pattern_all_inputs", str(e_a)))
+                    try:
+                        out = base_tensorflow_model(img_dummy)
+                        base_integration_success = True
+                        integration_mode = "image_only"
+                    except Exception as e_b:
+                        errors.append(("pattern_image_only", str(e_b)))
+                        base_integration_success = False
+                        integration_mode = None
+            except Exception as e_general:
+                errors.append(("general", str(e_general)))
+                base_integration_success = False
+                integration_mode = None
+
+            if not base_integration_success:
+                msg = (
+                    "Provided base_tensorflow_model is incompatible with expected input signatures.\n"
+                    "Tried calling it with either ([image] + aux_vectors) or (image) and both failed.\n"
+                    f"aux_col_lengths: {aux_col_lengths}\n"
+                    f"errors: {errors}\n"
+                    "Please adapt your model input signature to accept either (image) OR (image, aux1, aux2, ...).\n"
+                    "See example_compatible_base_model(...) for an example."
+                )
+                logger and logger.error(msg)
+                raise ValueError(msg)
+            else:
+                logger and logger.info(
+                    "base_tensorflow_model '%s' integrated successfully using mode=%s",
+                    str(base_model_name),
+                    integration_mode,
+                )
+
+        # ---------- BUILD DATASETS ONCE (neutral preprocess) ----------
+        # Build datasets with preprocess_fn=None (neutral) so they yield normalized images [0,1] and aux vectors.
+        train_ds = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
+            csv_files=csv_files,
+            index_set=train_global_idx,
+            label_to_int=index_to_labelint,
+            aux_columns=aux_columns,
+            aux_col_lengths=aux_col_lengths,
+            aux_max=aux_max,
+            img_size=img_size,
+            preprocess_fn=None,  # neutral: do minimal normalization inside dataset (already happening)
+            batch_size=batch_size,
+            shuffle=True,
+            use_aux_inputs=use_aux_inputs,
+        )
+
+        test_ds = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
+            csv_files=csv_files,
+            index_set=test_global_idx,
+            label_to_int=index_to_labelint,
+            aux_columns=aux_columns,
+            aux_col_lengths=aux_col_lengths,
+            aux_max=aux_max,
+            img_size=img_size,
+            preprocess_fn=None,
+            batch_size=batch_size,
+            shuffle=False,
+            use_aux_inputs=use_aux_inputs,
+        )
+
+        # helper: build a Keras preprocessing layer that will call the model-specific preprocess_fn
+        def _make_preprocess_layer(pre_fn):
+            """
+            Wrap a numpy/tf preprocess_fn into a Keras Layer.
+            We call the preprocess_fn via tf.numpy_function (safe for numpy-based preprocessors).
+            Keep this wrapper minimal and robust.
+            pre_fn: callable that accepts a numpy array batch (N,H,W,3) and returns the same-shaped np array (float32).
+            """
+            if pre_fn is None:
+                return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
+
+            def _tf_preprocess(x):
+                # x has shape (batch, H, W, C)
+                def _np_call(x_np):
+                    try:
+                        out = pre_fn(x_np)
+                    except Exception as e:
+                        # fallback: return input unchanged on failure
+                        out = x_np
+                    # ensure dtype float32
+                    out = np.asarray(out, dtype=np.float32)
+                    return out
+
+                y = tf.numpy_function(_np_call, [x], Tout=tf.float32)
+                # set static shape information if possible: (None, H, W, 3)
+                try:
+                    y.set_shape([None, img_size[0], img_size[1], 3])
+                except Exception:
+                    pass
+                return y
+
+            return tf.keras.layers.Lambda(_tf_preprocess, name="model_preprocess")
+
+        # iterate models (models_dict values are expected to be base TF/Keras models or None)
+        results = {}
+        iter_items = (models_dict.items() if models_dict else [("custom", None)])
+
+        try:
+            for model_key, iter_base in iter_items:
+                logger and logger.info("Training loop starting for model_key=%s", model_key)
+                out_dir = os.path.join("artifacts", "image_models", model_key)
+                os.makedirs(out_dir, exist_ok=True)
+
+                # chosen_base: prefer function param base_tensorflow_model if provided, else models_dict value
+                chosen_base = base_tensorflow_model if base_tensorflow_model is not None else iter_base
+
+                # decide experiment name
+                exp_name = experiment_name or f"image_training_{model_key}"
+                if chosen_base is not None:
+                    prefix = getattr(chosen_base, "name", None) or str(chosen_base)
+                    exp_name = f"{prefix}_{exp_name}"
+
+                # Obtain per-model preprocess_fn (may be numpy or tf-based). We'll wrap it into Keras layer.
+                per_model_pre_fn = TrainModelService._get_preprocess_fn_for_model(model_key)
+                preprocess_layer = _make_preprocess_layer(per_model_pre_fn)
+
+                # Build Keras model (image + aux inputs)
+                image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
+                # apply per-model preprocessing inside the model
+                image_preprocessed = preprocess_layer(image_input)
+
+                aux_inputs = []
+                aux_processed = []
+                if use_aux_inputs:
+                    for col in aux_columns:
+                        L = aux_col_lengths.get(col, 0)
+                        if L <= 0:
+                            logger and logger.info("Skipping aux column %s because max length == 0", col)
+                            continue
+                        inp = tf.keras.Input(shape=(L,), name=f"aux_{col}")
+                        aux_inputs.append(inp)
+                        hidden_units = max(16, min(128, L * 2))
+                        h = tf.keras.layers.Dense(hidden_units, activation="relu")(inp)
+                        h = tf.keras.layers.Dropout(0.2)(h)
+                        aux_processed.append(h)
+
+                # integrate chosen_base if possible: call chosen_base with the **preprocessed image**
+                x = None
+                try:
+                    if chosen_base is not None:
+                        if base_integration_success and integration_mode == "all_inputs":
+                            # chosen_base must accept the list [image, aux1, aux2...]; pass preprocessed image
+                            x = chosen_base([image_preprocessed] + aux_inputs)
+                        elif base_integration_success and integration_mode == "image_only":
+                            x = chosen_base(image_preprocessed)
+                        else:
+                            # if chosen_base couldn't be integrated, we fall back to internal backbone below
+                            pass
+                except Exception as e:
+                    logger and logger.exception("Error while calling chosen_base during model construction: %s", e)
+                    raise
+
+                # fallback internal conv backbone if chosen_base not used
+                if x is None:
+                    y = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same")(image_preprocessed)
+                    y = tf.keras.layers.MaxPool2D()(y)
+                    y = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(y)
+                    y = tf.keras.layers.MaxPool2D()(y)
+                    y = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(y)
+                    y = tf.keras.layers.GlobalAveragePooling2D()(y)
+                    x = tf.keras.layers.Dense(128, activation="relu")(y)
+
+                # ensure x is a vector
+                if len(x.shape) == 4:
+                    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+
+                x = tf.keras.layers.Dense(256, activation="relu")(x)
+                x = tf.keras.layers.Dropout(0.5)(x)
+
+                if aux_processed:
+                    merged = tf.keras.layers.concatenate([x] + aux_processed)
+                    merged = tf.keras.layers.Dense(128, activation="relu")(merged)
+                    merged = tf.keras.layers.Dropout(0.3)(merged)
+                    outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
+                    model_inputs = [image_input] + aux_inputs
+                    model = tf.keras.Model(inputs=model_inputs, outputs=outputs, name=f"{model_key}_full")
+                else:
+                    outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(x)
+                    model = tf.keras.Model(inputs=image_input, outputs=outputs, name=f"{model_key}_full")
+
+                # callbacks
+                cb = callbacks_list[:] if callbacks_list else []
+                if not callbacks_list:
+                    cb = [
+                        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+                        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=3),
+                    ]
+                csv_log_path = os.path.join(out_dir, f"{model_key}_epoch_history.csv")
+                cb.append(tf.keras.callbacks.CSVLogger(csv_log_path))
+
+                # MLflow run
+                mlflow.set_experiment(exp_name)
+                with mlflow.start_run(run_name=f"{model_key}_train_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"):
+                    mlflow.log_param("model_base", model_key)
+                    mlflow.log_param("num_classes", len(le.classes_))
+                    mlflow.log_param("epochs", epochs)
+                    mlflow.log_param("batch_size", batch_size)
+                    mlflow.log_param("learning_rate", learning_rate)
+                    mlflow.log_param("use_aux_inputs", bool(use_aux_inputs))
+                    mlflow.log_param("aux_col_lengths", aux_col_lengths)
+                    mlflow.log_param("per_label_n", int(per_label_n or 0))
+
+                    model.compile(
+                        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                    )
+
+                    phase1_epochs = max(3, epochs // 4)
+                    history_phase1 = model.fit(train_ds, epochs=phase1_epochs, validation_data=test_ds, callbacks=cb, verbose=1)
+
+                    # fine-tune if possible
+                    try:
+                        if chosen_base is not None and hasattr(chosen_base, "trainable"):
+                            chosen_base.trainable = True
+                            for layer in getattr(chosen_base, "layers", [])[:-20]:
+                                layer.trainable = False
+                    except Exception:
+                        pass
+
+                    model.compile(
+                        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
+                        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                    )
+
+                    history_phase2 = model.fit(train_ds, epochs=epochs, validation_data=test_ds, callbacks=cb, verbose=1)
+
+                    # merge histories
+                    history = {}
+                    for k in set(list(history_phase1.history.keys()) + list(history_phase2.history.keys())):
+                        a = history_phase1.history.get(k, [])
+                        b = history_phase2.history.get(k, [])
+                        history[k] = a + b
+
+                    # evaluate
+                    eval_res = model.evaluate(test_ds, verbose=1)
+                    mlflow.log_metric("test_loss", float(eval_res[0]) if len(eval_res) >= 1 else None)
+                    if len(eval_res) >= 2:
+                        mlflow.log_metric("test_sparse_categorical_accuracy", float(eval_res[1]))
+
+                    # predictions -> produce confusion matrix
+                    y_true = []
+                    y_pred = []
+                    for batch in test_ds:
+                        inputs_batch, labels_batch = batch
+                        if isinstance(inputs_batch, (list, tuple)):
+                            preds = model.predict(list(inputs_batch), verbose=0)
+                        else:
+                            preds = model.predict(inputs_batch, verbose=0)
+                        pred_ints = np.argmax(preds, axis=1)
+                        y_pred.extend(pred_ints.tolist())
+                        y_true.extend([int(x) for x in labels_batch.numpy().tolist()])
+
+                    y_true = np.array(y_true, dtype=int)
+                    y_pred = np.array(y_pred, dtype=int)
+
+                    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(le.classes_))))
+                    cm_csv = os.path.join(out_dir, f"{model_key}_confusion_matrix.csv")
+                    with open(cm_csv, "w", newline="") as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow([""] + list(le.classes_))
+                        for i, row in enumerate(cm):
+                            writer.writerow([le.classes_[i]] + row.tolist())
+
+                    precision, recall, f1, support = precision_recall_fscore_support(
+                        y_true, y_pred, labels=list(range(len(le.classes_))), zero_division=0
+                    )
+                    per_class_csv = os.path.join(out_dir, f"{model_key}_per_class_metrics.csv")
+                    with open(per_class_csv, "w", newline="") as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow(["class_name", "precision", "recall", "f1", "support"])
+                        for i, name in enumerate(le.classes_):
+                            writer.writerow([name, float(precision[i]), float(recall[i]), int(support[i])])
+
+                    # log artifacts
+                    try:
+                        mlflow.log_artifact(cm_csv, artifact_path="confusion_matrix")
+                        mlflow.log_artifact(per_class_csv, artifact_path="per_class_metrics")
+                        mlflow.log_artifact(aux_meta_path, artifact_path="metadata")
+                        mlflow.keras.log_model(model, artifact_path="model")
+                    except Exception:
+                        logger and logger.exception("Failed to log artifacts or model for %s", model_key)
+
+                    results[model_key] = {
+                        "history": history,
+                        "confusion_matrix": cm,
+                        "per_class_metrics": {
+                            "class_names": list(le.classes_),
+                            "precision": precision.tolist(),
+                            "recall": recall.tolist(),
+                            "f1": f1.tolist(),
+                            "support": support.tolist(),
+                        },
+                        "eval": eval_res,
+                    }
+
+                # cleanup dataset and model before next iteration to free RAM
+                try:
+                    del model
+                except Exception:
+                    pass
+                gc.collect()
+
+        except Exception as e:
+            logger and logger.exception("Error during training: %s", e)
+            results = {"error": f"Error during training: {e}"}
+
+        finally:
+            try:
+                tf.keras.backend.clear_session()
+                gc.collect()
+            except Exception:
+                pass
+
         return results
