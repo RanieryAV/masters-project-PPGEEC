@@ -47,6 +47,7 @@ import csv
 import glob
 import ast
 import gc
+from typing import Callable, Iterable, Tuple, List, Dict, Any
 # ------------------------
 
 """
@@ -4086,310 +4087,6 @@ Notes:
         ds = ds.batch(batch_size).prefetch(AUTOTUNE)
         return ds
     
-    # ----------------------
-    # Streaming tf.data builder (to be attached to TrainModelService)
-    # ----------------------
-    @staticmethod
-    def _build_tf_dataset_from_matrix_column_streaming(
-        csv_files,
-        index_set,
-        label_to_int,
-        aux_columns,
-        aux_col_lengths,
-        aux_max,
-        img_size=(120, 120),
-        preprocess_fn=None,
-        batch_size=8,
-        shuffle=False,
-        seed=42,
-        use_aux_inputs=True,
-    ):
-        """Build a streaming tf.data.Dataset with tf.data.Dataset.from_generator.
-
-        Minor fixes:
-        - Use csv.DictReader (assumes caller already set csv.field_size_limit)
-        - Lookup label int first by global index (label_to_int is typically index->int),
-        fall back to label string lookup for backward compatibility.
-        - Skip rows where label->int mapping is missing (log a warning).
-        - Delete large temporaries per-row and call gc.collect() occasionally.
-        - Cap excessively large aux_col_lengths and resample long aux arrays to the target length L.
-        """
-        import csv
-        import gc
-
-        files = list(csv_files)
-
-        # --- Safety: cap aux_col_lengths to avoid huge per-sample allocations ---
-        MAX_AUX_LEN = 1024  # adjust lower if memory is tight (256/512)
-        for k, orig in list(aux_col_lengths.items()):
-            if orig > MAX_AUX_LEN:
-                logger and logger.warning(
-                    "Aux column '%s' max length is very large (%d). Capping to %d for streaming.",
-                    k,
-                    orig,
-                    MAX_AUX_LEN,
-                )
-                aux_col_lengths[k] = MAX_AUX_LEN
-
-        def _parse_field_text_to_obj(text):
-            if text is None or (isinstance(text, str) and text.strip() == ""):
-                return None
-            s = text.strip()
-            try:
-                return ast.literal_eval(s)
-            except Exception:
-                pass
-            try:
-                return json.loads(s)
-            except Exception:
-                pass
-            return None
-
-        def generator():
-            global_idx = 0
-            rows_yielded = 0
-            try:
-                for fpath in files:
-                    try:
-                        with open(fpath, newline="") as fh:
-                            reader = csv.DictReader(fh)
-                            for row in reader:
-                                # only process requested indices
-                                if global_idx in index_set:
-                                    # parse label string (if present)
-                                    lab = None
-                                    # try common header keys (backward compatible)
-                                    lab = (
-                                        row.get("behavior_type_label")
-                                        or row.get("behavior_type")
-                                        or row.get("label")
-                                    )
-                                    if lab is not None:
-                                        lab = lab.strip()
-
-                                    # primary lookup: label_to_int is usually global_index -> int
-                                    lab_int = label_to_int.get(global_idx)
-                                    # fallback: allow label_to_int to be label->int mapping too
-                                    if lab_int is None and lab is not None:
-                                        lab_int = label_to_int.get(lab)
-
-                                    if lab_int is None:
-                                        # don't attempt np.int32(None) — skip and log
-                                        logger and logger.warning(
-                                            "Skipping row %d in %s: label int missing for lab='%s' (global_idx=%d)",
-                                            global_idx,
-                                            fpath,
-                                            str(lab),
-                                            global_idx,
-                                        )
-                                        global_idx += 1
-                                        continue
-
-                                    # parse image matrix
-                                    mat_text = (
-                                        row.get("trajectory_image_matrix")
-                                        or row.get("trajectory_image")
-                                        or row.get("matrix")
-                                    )
-                                    parsed_mat = _parse_field_text_to_obj(mat_text)
-                                    if parsed_mat is None:
-                                        logger and logger.warning(
-                                            "Skipping row %d in %s: no matrix parsed", global_idx, fpath
-                                        )
-                                        global_idx += 1
-                                        continue
-
-                                    # convert to numpy and force 3-channel rgb
-                                    try:
-                                        arr = np.array(parsed_mat)
-                                        if arr.ndim == 2:
-                                            arr_rgb = np.stack([arr, arr, arr], axis=-1)
-                                        elif arr.ndim == 3:
-                                            if arr.shape[2] == 3:
-                                                arr_rgb = arr
-                                            elif arr.shape[2] == 1:
-                                                arr_rgb = np.concatenate([arr, arr, arr], axis=-1)
-                                            else:
-                                                arr_rgb = arr[:, :, :3]
-                                        else:
-                                            flat = arr.flatten()
-                                            total_pix = flat.size // 3
-                                            if total_pix <= 0:
-                                                global_idx += 1
-                                                # cleanup
-                                                try:
-                                                    del arr
-                                                except Exception:
-                                                    pass
-                                                gc.collect()
-                                                continue
-                                            side = int(np.sqrt(total_pix))
-                                            flat = flat[: (side * side * 3)]
-                                            arr_rgb = flat.reshape((side, side, 3))
-                                    except Exception:
-                                        logger and logger.exception(
-                                            "Failed to convert parsed_mat -> arr for row %d in %s", global_idx, fpath
-                                        )
-                                        # attempt to free and continue
-                                        try:
-                                            del parsed_mat
-                                        except Exception:
-                                            pass
-                                        gc.collect()
-                                        global_idx += 1
-                                        continue
-
-                                    # normalize to float32 [0,1]
-                                    try:
-                                        if np.issubdtype(arr_rgb.dtype, np.floating):
-                                            maxv = float(np.nanmax(arr_rgb)) if arr_rgb.size else 0.0
-                                            if maxv <= 1.0:
-                                                img = np.clip(arr_rgb, 0.0, 1.0).astype(np.float32)
-                                            else:
-                                                img = (np.clip(arr_rgb, 0.0, 255.0) / 255.0).astype(np.float32)
-                                        else:
-                                            img = (arr_rgb.astype(np.float32) / 255.0)
-                                    except Exception:
-                                        logger and logger.exception(
-                                            "Failed to normalize arr_rgb for row %d in %s", global_idx, fpath
-                                        )
-                                        # cleanup temporaries
-                                        try:
-                                            del arr, arr_rgb
-                                        except Exception:
-                                            pass
-                                        gc.collect()
-                                        global_idx += 1
-                                        continue
-
-                                    # resize if needed
-                                    try:
-                                        if img.shape[0] != img_size[0] or img.shape[1] != img_size[1]:
-                                            img = tf.image.resize(img, (img_size[0], img_size[1])).numpy().astype(np.float32)
-                                    except Exception:
-                                        logger and logger.exception(
-                                            "Failed to resize image for row %d in %s", global_idx, fpath
-                                        )
-                                        try:
-                                            del arr, arr_rgb, img
-                                        except Exception:
-                                            pass
-                                        gc.collect()
-                                        global_idx += 1
-                                        continue
-
-                                    # apply preprocess_fn if provided
-                                    if callable(preprocess_fn):
-                                        try:
-                                            img_proc = preprocess_fn(np.expand_dims(img, axis=0))
-                                            img = np.squeeze(img_proc, axis=0).astype(np.float32)
-                                        except Exception:
-                                            # fallback to unprocessed img
-                                            pass
-
-                                    # build aux vectors (with safe resampling/pad/truncate)
-                                    aux_inputs = []
-                                    if use_aux_inputs:
-                                        for col in aux_columns:
-                                            L = aux_col_lengths.get(col, 0)
-                                            raw_aux = row.get(col, None)
-                                            parsed_aux = _parse_field_text_to_obj(raw_aux)
-
-                                            # default
-                                            if L <= 0:
-                                                vec = np.zeros((0,), dtype=np.float32)
-                                            else:
-                                                if parsed_aux is None:
-                                                    vec = np.zeros((L,), dtype=np.float32)
-                                                else:
-                                                    try:
-                                                        arr_aux = np.array([float(x) for x in parsed_aux], dtype=np.float32)
-                                                    except Exception:
-                                                        arr_aux = np.zeros((0,), dtype=np.float32)
-
-                                                    n = arr_aux.size
-
-                                                    if n == 0:
-                                                        vec = np.zeros((L,), dtype=np.float32)
-                                                    elif n == L:
-                                                        vec = arr_aux.astype(np.float32)
-                                                    elif n < L:
-                                                        pad = np.zeros((L - n,), dtype=np.float32)
-                                                        vec = np.concatenate([arr_aux, pad], axis=0)
-                                                    else:
-                                                        # n > L: resample via linear interpolation to L points (uniform positions)
-                                                        idx_target = np.linspace(0.0, float(n - 1), num=L)
-                                                        vec = np.interp(idx_target, np.arange(n, dtype=np.float32), arr_aux).astype(np.float32)
-
-                                            # normalize after resampling/pad/truncate
-                                            maxv = float(aux_max.get(col, 1.0) or 1.0)
-                                            if maxv != 0.0 and vec.size > 0:
-                                                vec = vec / maxv
-
-                                            aux_inputs.append(vec.astype(np.float32))
-
-                                    # final inputs tuple
-                                    if use_aux_inputs and len(aux_inputs) > 0:
-                                        inputs = (img.astype(np.float32),) + tuple(aux_inputs)
-                                    else:
-                                        inputs = (img.astype(np.float32),)
-
-                                    # safe conversion of label int
-                                    try:
-                                        label_value = int(lab_int)
-                                    except Exception:
-                                        logger and logger.warning(
-                                            "Invalid label int for row %d in %s: %s", global_idx, fpath, str(lab_int)
-                                        )
-                                        # cleanup and continue
-                                        try:
-                                            del arr, arr_rgb, img, inputs
-                                        except Exception:
-                                            pass
-                                        gc.collect()
-                                        global_idx += 1
-                                        continue
-
-                                    # yield (inputs, label)
-                                    yield inputs, np.int32(label_value)
-                                    rows_yielded += 1
-
-                                    # free per-row temporaries to keep peak memory down
-                                    try:
-                                        del arr, arr_rgb, img
-                                    except Exception:
-                                        pass
-                                    gc.collect()
-
-                                global_idx += 1
-                    except StopIteration:
-                        break
-                    except Exception:
-                        logger and logger.exception("Error streaming CSV %s", fpath)
-                        # continue with next file
-                        continue
-            finally:
-                # final cleanup if generator ends (either normally or because of exception)
-                gc.collect()
-
-        # build output signature
-        image_spec = tf.TensorSpec(shape=(img_size[0], img_size[1], 3), dtype=tf.float32)
-        aux_specs = []
-        if use_aux_inputs:
-            for col in aux_columns:
-                L = aux_col_lengths.get(col, 0)
-                if L > 0:
-                    aux_specs.append(tf.TensorSpec(shape=(L,), dtype=tf.float32))
-        input_signature = ((image_spec,) + tuple(aux_specs), tf.TensorSpec(shape=(), dtype=tf.int32))
-
-        ds = tf.data.Dataset.from_generator(generator, output_signature=input_signature)
-        if shuffle:
-            ds = ds.shuffle(buffer_size=16, seed=seed)
-        ds = ds.batch(batch_size)
-        ds = ds.prefetch(4)
-        return ds
-
-
     import numpy as np
     import pandas as pd
     import tensorflow as tf
@@ -4437,44 +4134,370 @@ Notes:
         model = tf.keras.Model(inputs=[image_input] + aux_inputs, outputs=merged, name="example_backbone")
         return model
 
-
-    def train_all_behavior_types_image_models_from_csv_separate_aux(
-        dataset_dir: str,
-        matrix_column: str = "trajectory_image_matrix",
-        label_column: str = "behavior_type_label",
-        aux_columns: list = None,  # e.g. ["sog_array","cog_array","timestamp_array"]
-        models_dict: dict = None,
-        base_tensorflow_model=None,  # optional user-supplied Keras model to integrate
-        allowed_labels: list = None,
-        per_label_n: int = 50,  # default per-class samples (0 -> use all)
-        test_size: float = 0.2,
-        random_state: int = 42,
-        img_size: tuple = (120, 120),  # target image size (height, width)
-        epochs: int = 5,
-        batch_size: int = 8,
-        learning_rate: float = 0.001,
-        callbacks_list: list = None,
-        experiment_name: str = None,
-        register_model_name: str = None,
-        use_aux_inputs: bool = True,
-    ):
+    @staticmethod
+    def _build_tf_dataset_from_matrix_column_streaming(
+            csv_files: Iterable[str],
+            index_set: set,
+            label_to_int: dict,
+            aux_columns: list,
+            aux_col_lengths: dict,
+            aux_max: dict,
+            img_size=(120, 120),
+            preprocess_fn: Callable = None,         # numpy-based fallback
+            tf_preprocess_fn: Callable = None,      # preferred: tf.Tensor -> tf.Tensor
+            batch_size: int = 24,
+            shuffle: bool = True,
+            seed: int = 42,
+            use_aux_inputs: bool = True,
+        ):
         """
-        Main training pipeline that streams CSV rows into tf.data, validates user base model,
-        builds a true 4-input model (image + aux vectors) and logs with MLflow.
+        Streaming tf.data.Dataset builder that prioritizes TF ops and attempts to place batches on GPU.
 
-        Changed behaviour:
-        - Build TF datasets ONCE with a neutral/no-op image preprocessing.
-        - For each model, wrap the image input with a Keras preprocessing layer that
-        calls the per-model preprocess_fn. This lets us reuse the heavy CSV streaming
-        builder while applying model-specific preprocessing inside the Keras model graph.
+        Returns:
+            (dataset, tried_device_prefetch: bool)
+        """
+        import csv as _csv
+        import tensorflow as tf
+        from tensorflow.data import AUTOTUNE
+
+        files = list(csv_files)
+
+        # cap aux lengths (safety)
+        MAX_AUX_LEN = 1024
+        for k, orig in list(aux_col_lengths.items()):
+            if orig > MAX_AUX_LEN:
+                try:
+                    logger and logger.warning("Aux column '%s' max length %d capped to %d for streaming.", k, orig, MAX_AUX_LEN)
+                except Exception:
+                    pass
+                aux_col_lengths[k] = MAX_AUX_LEN
+
+        def _parse_field_text_to_obj(text):
+            if text is None or (isinstance(text, str) and text.strip() == ""):
+                return None
+            s = text.strip()
+            try:
+                return ast.literal_eval(s)
+            except Exception:
+                pass
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+            return None
+
+        # ---------- generator: pure python/ numpy / io ----------
+        def generator():
+            global_idx = 0
+            try:
+                for fpath in files:
+                    try:
+                        # log which file we're currently reading (helpful)
+                        try:
+                            logger and logger.info("Generator: reading file %s", fpath)
+                        except Exception:
+                            pass
+
+                        with open(fpath, newline="") as fh:
+                            reader = _csv.DictReader(fh)
+                            for row in reader:
+                                if global_idx in index_set:
+                                    # label lookup
+                                    lab = (row.get("behavior_type_label") or row.get("behavior_type") or row.get("label"))
+                                    if lab is not None:
+                                        lab = lab.strip()
+                                    lab_int = label_to_int.get(global_idx)
+                                    if lab_int is None and lab is not None:
+                                        lab_int = label_to_int.get(lab)
+                                    if lab_int is None:
+                                        global_idx += 1
+                                        continue
+
+                                    # parse matrix -> numpy
+                                    mat_text = (row.get("trajectory_image_matrix") or row.get("trajectory_image") or row.get("matrix"))
+                                    parsed_mat = _parse_field_text_to_obj(mat_text)
+                                    if parsed_mat is None:
+                                        global_idx += 1
+                                        continue
+                                    try:
+                                        arr = np.array(parsed_mat)
+                                        # coerce to HxWx3
+                                        if arr.ndim == 2:
+                                            arr_rgb = np.stack([arr, arr, arr], axis=-1)
+                                        elif arr.ndim == 3:
+                                            if arr.shape[2] == 3:
+                                                arr_rgb = arr
+                                            elif arr.shape[2] == 1:
+                                                arr_rgb = np.concatenate([arr, arr, arr], axis=-1)
+                                            else:
+                                                arr_rgb = arr[:, :, :3]
+                                        else:
+                                            flat = arr.flatten()
+                                            total_pix = flat.size // 3
+                                            if total_pix <= 0:
+                                                global_idx += 1
+                                                try:
+                                                    del arr
+                                                except Exception:
+                                                    pass
+                                                gc.collect()
+                                                continue
+                                            side = int(np.sqrt(total_pix))
+                                            flat = flat[: (side * side * 3)]
+                                            arr_rgb = flat.reshape((side, side, 3))
+                                    except Exception:
+                                        try:
+                                            del parsed_mat
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # Normalize to uint8 to reduce host->device transfer size
+                                    try:
+                                        if np.issubdtype(arr_rgb.dtype, np.floating):
+                                            maxv = float(np.nanmax(arr_rgb)) if arr_rgb.size else 0.0
+                                            if maxv <= 1.0:
+                                                img_out = (np.clip(arr_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+                                            else:
+                                                img_out = (np.clip(arr_rgb, 0.0, 255.0)).astype(np.uint8)
+                                        else:
+                                            img_out = np.clip(arr_rgb, 0, 255).astype(np.uint8)
+                                    except Exception:
+                                        try:
+                                            del arr, arr_rgb
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    # Build aux arrays
+                                    aux_inputs = []
+                                    if use_aux_inputs:
+                                        for col in aux_columns:
+                                            L = aux_col_lengths.get(col, 0)
+                                            raw_aux = row.get(col, None)
+                                            parsed_aux = _parse_field_text_to_obj(raw_aux)
+                                            if L <= 0:
+                                                vec = np.zeros((0,), dtype=np.float32)
+                                            else:
+                                                if parsed_aux is None:
+                                                    vec = np.zeros((L,), dtype=np.float32)
+                                                else:
+                                                    try:
+                                                        arr_aux = np.array([float(x) for x in parsed_aux], dtype=np.float32)
+                                                    except Exception:
+                                                        arr_aux = np.zeros((0,), dtype=np.float32)
+                                                    n = arr_aux.size
+                                                    if n == 0:
+                                                        vec = np.zeros((L,), dtype=np.float32)
+                                                    elif n == L:
+                                                        vec = arr_aux.astype(np.float32)
+                                                    elif n < L:
+                                                        pad = np.zeros((L - n,), dtype=np.float32)
+                                                        vec = np.concatenate([arr_aux, pad], axis=0)
+                                                    else:
+                                                        idx_target = np.linspace(0.0, float(n - 1), num=L)
+                                                        vec = np.interp(idx_target, np.arange(n, dtype=np.float32), arr_aux).astype(np.float32)
+                                            maxv = float(aux_max.get(col, 1.0) or 1.0)
+                                            if maxv != 0.0 and vec.size > 0:
+                                                vec = vec / maxv
+                                            aux_inputs.append(vec.astype(np.float32))
+
+                                    if use_aux_inputs and len(aux_inputs) > 0:
+                                        inputs = (img_out,) + tuple(aux_inputs)
+                                    else:
+                                        inputs = (img_out,)
+
+                                    try:
+                                        label_value = int(lab_int)
+                                    except Exception:
+                                        try:
+                                            del arr, arr_rgb, img_out, inputs
+                                        except Exception:
+                                            pass
+                                        gc.collect()
+                                        global_idx += 1
+                                        continue
+
+                                    yield inputs, np.int32(label_value)
+
+                                    # cleanup per-row temporaries
+                                    try:
+                                        del arr, arr_rgb, img_out
+                                    except Exception:
+                                        pass
+                                    gc.collect()
+
+                                global_idx += 1
+                    except StopIteration:
+                        break
+                    except Exception:
+                        # file-level exceptions are swallowed and pipeline continues to next file
+                        continue
+            finally:
+                gc.collect()
+
+        # ---------- output_signature ----------
+        import tensorflow as tf  # local import for clarity
+        image_spec = tf.TensorSpec(shape=(None, None, 3), dtype=tf.uint8)
+        aux_specs = []
+        if use_aux_inputs:
+            for col in aux_columns:
+                L = aux_col_lengths.get(col, 0)
+                if L > 0:
+                    aux_specs.append(tf.TensorSpec(shape=(L,), dtype=tf.float32))
+        input_signature = ((image_spec,) + tuple(aux_specs), tf.TensorSpec(shape=(), dtype=tf.int32))
+
+        ds = tf.data.Dataset.from_generator(generator, output_signature=input_signature)
+
+        # shuffle small buffer
+        if shuffle:
+            ds = ds.shuffle(buffer_size=1024, seed=seed)
+
+        # map: uint8 -> float32, resize, apply tf_preprocess_fn if available (these ops can be placed on GPU)
+        def _map_to_model_tensors(inputs, label):
+            image = inputs[0]
+            aux = inputs[1:] if len(inputs) > 1 else ()
+
+            # TF ops (graph ops can be placed on GPU if dataset is device-prefetched)
+            img = tf.image.convert_image_dtype(image, dtype=tf.float32)   # uint8 -> float32 [0,1]
+            img = tf.image.resize(img, (img_size[0], img_size[1]), method='bilinear')
+
+            # prefer pure-TF preprocess function so preprocessing runs on device
+            if callable(tf_preprocess_fn):
+                try:
+                    img = tf_preprocess_fn(img)
+                except Exception:
+                    pass
+            else:
+                # numpy fallback: will run on CPU via tf.numpy_function (slower)
+                if callable(preprocess_fn):
+                    try:
+                        def _call_pre(x_np):
+                            try:
+                                out = preprocess_fn(x_np)
+                            except Exception:
+                                out = x_np
+                            return np.asarray(out, dtype=np.float32)
+                        img = tf.numpy_function(func=_call_pre, inp=[tf.expand_dims(img, axis=0)], Tout=tf.float32)
+                        img.set_shape([1, img_size[0], img_size[1], 3])
+                        img = tf.squeeze(img, axis=0)
+                    except Exception:
+                        pass
+
+            if aux:
+                aux_tensors = tuple(tf.cast(a, tf.float32) for a in aux)
+                return ((img,) + aux_tensors, label)
+            else:
+                return (img, label)
+
+        ds = ds.map(_map_to_model_tensors, num_parallel_calls=AUTOTUNE)
+
+        # batch
+        ds = ds.batch(batch_size, drop_remainder=False)
+
+        # dataset options (autotune)
+        try:
+            options = tf.data.Options()
+            try:
+                options.experimental_optimization.autotune = True
+            except Exception:
+                pass
+            ds = ds.with_options(options)
+        except Exception:
+            pass
+
+        # prefetch host-side baseline
+        ds = ds.prefetch(AUTOTUNE)
+
+        # Attempt GPU memory growth + prefetch_to_device to push batches to GPU
+        tried_device_prefetch = False
+        try:
+            gpus = tf.config.experimental.list_physical_devices("GPU")
+            if gpus:
+                for g in gpus:
+                    try:
+                        tf.config.experimental.set_memory_growth(g, True)
+                    except Exception:
+                        pass
+
+                try:
+                    ds = ds.apply(tf.data.experimental.prefetch_to_device("/GPU:0", buffer_size=1))
+                    tried_device_prefetch = True
+                    logger and logger.info("Dataset: applied prefetch_to_device('/GPU:0', buffer_size=1)")
+                except Exception:
+                    logger and logger.debug("Dataset: prefetch_to_device('/GPU:0') not available or failed; continuing with host prefetch.")
+                    tried_device_prefetch = False
+        except Exception:
+            tried_device_prefetch = False
+
+        return ds, tried_device_prefetch
+
+    @staticmethod
+    def train_all_behavior_types_image_models_from_csv_separate_aux(
+            dataset_dir: str,
+            matrix_column: str = "trajectory_image_matrix",
+            label_column: str = "behavior_type_label",
+            aux_columns: list = None,
+            models_dict: dict = None,
+            base_tensorflow_model=None,
+            allowed_labels: list = None,
+            per_label_n: int = 100,
+            test_size: float = 0.2,
+            random_state: float = 42,
+            img_size: tuple = (120, 120),
+            epochs: int = 12,
+            batch_size: int = 24,
+            learning_rate: float = 0.001,
+            callbacks_list: list = None,
+            experiment_name: str = None,
+            register_model_name: str = None,
+            use_aux_inputs: bool = True,
+            warmup_epochs: int = 3,
+            enable_mixed_precision: bool = True,
+            tf_preprocess_fn: Callable = None,   # pass-through to dataset builder
+        ):
+        """
+        Training pipeline that prefers GPU usage. Adds per-epoch elapsed + ETA logging for each model.
+        Minimally modifies original logic; supports fallback to manual eager loop if generator-backed
+        Dataset cannot be serialized.
         """
         import csv as _csv
         import sys as _sys
-        import gc
+        import tensorflow as tf
+        import time as _time
+        import os as _os
+        import random as _random
 
-        logger and logger.info and logger.debug  # quiet reference if not present
+        # --- early GPU setup: memory growth + mixed precision ---
+        gpu_available = False
+        try:
+            gpus = tf.config.experimental.list_physical_devices("GPU")
+            if gpus:
+                gpu_available = True
+                logger and logger.info("GPUs detected: %s", gpus)
+                for g in gpus:
+                    try:
+                        tf.config.experimental.set_memory_growth(g, True)
+                    except Exception:
+                        pass
+                if enable_mixed_precision:
+                    try:
+                        from tensorflow.keras import mixed_precision
+                        mixed_precision.set_global_policy("mixed_float16")
+                        logger and logger.info("Enabled mixed precision policy: mixed_float16")
+                    except Exception:
+                        logger and logger.debug("Could not enable mixed precision policy.")
+            else:
+                logger and logger.info("No physical GPUs detected; training will run on CPU.")
+        except Exception as e:
+            logger and logger.debug("GPU setup failed: %s", e)
+            gpu_available = False
 
-        # increase CSV parser field size limit (handle very large serialized fields)
+        # increase CSV parser field size limit
         _max_int = _sys.maxsize
         while True:
             try:
@@ -4496,9 +4519,16 @@ Notes:
         if len(csv_files) == 0:
             return {"error": f"No CSV files found in dataset_dir: {dataset_dir}"}
 
-        logger and logger.info("Found %d CSV files", len(csv_files))
+        # Prepare progress logging (bytes)
+        try:
+            total_bytes_all = sum((_os.path.getsize(p) for p in csv_files))
+        except Exception:
+            total_bytes_all = 0
 
-        # --- First pass: gather labels, compute aux_col_lengths and aux_max without storing images ---
+        start_all = _time.time()
+        bytes_processed_cumulative_before = 0
+
+        # first pass - labels and aux metadata with progress logging
         labels_list = []
         shapes_set = set()
         aux_col_lengths = {c: 0 for c in aux_columns}
@@ -4520,56 +4550,139 @@ Notes:
                 pass
             return None
 
-        for fpath in csv_files:
-            logger and logger.info("Reading CSV for metadata: %s", fpath)
+        def _format_seconds(s):
             try:
+                s = int(max(0, float(s)))
+            except Exception:
+                return "n/a"
+            hh = s // 3600
+            mm = (s % 3600) // 60
+            ss = s % 60
+            if hh > 0:
+                return f"{hh}h{mm:02d}m{ss:02d}s"
+            if mm > 0:
+                return f"{mm}m{ss:02d}s"
+            return f"{ss}s"
+
+        for idx, fpath in enumerate(csv_files):
+            try:
+                try:
+                    file_size = _os.path.getsize(fpath)
+                except Exception:
+                    file_size = 0
+
+                logger and logger.info(
+                    "Reading CSV %d/%d: %s (size=%s bytes). Total dataset size ~ %s bytes.",
+                    idx + 1,
+                    len(csv_files),
+                    fpath,
+                    file_size,
+                    total_bytes_all,
+                )
+
+                file_start = _time.time()
+                last_log_time = file_start
+                rows_in_file = 0
+
                 with open(fpath, newline="") as fh:
-                    reader = csv.DictReader(fh)
+                    reader = _csv.DictReader(fh)
                     for row in reader:
                         total_rows += 1
+                        rows_in_file += 1
+
                         lab = row.get(label_column) or row.get("behavior_type_label")
                         if lab is None or lab.strip() == "" or lab.strip() not in allowed_labels:
                             skipped_rows += 1
-                            continue
-                        labels_list.append(lab.strip())
+                        else:
+                            labels_list.append(lab.strip())
 
-                        # compute aux stats
-                        for col in aux_columns:
-                            raw = row.get(col, None)
-                            parsed = _parse_field_text_local(raw)
-                            if parsed is None:
-                                continue
-                            # length
-                            try:
-                                plen = len(parsed)
-                            except Exception:
-                                plen = 0
-                            if plen > aux_col_lengths[col]:
-                                aux_col_lengths[col] = plen
-                            # max absolute value
-                            try:
-                                cand = float(np.max(np.abs(np.array(parsed, dtype=float))))
-                                if cand > aux_max[col]:
-                                    aux_max[col] = cand
-                            except Exception:
-                                # skip non-numeric values
-                                pass
+                            # aux stats
+                            for col in aux_columns:
+                                raw = row.get(col, None)
+                                parsed = _parse_field_text_local(raw)
+                                if parsed is None:
+                                    continue
+                                try:
+                                    plen = len(parsed)
+                                except Exception:
+                                    plen = 0
+                                if plen > aux_col_lengths[col]:
+                                    aux_col_lengths[col] = plen
+                                try:
+                                    cand = float(np.max(np.abs(np.array(parsed, dtype=float))))
+                                    if cand > aux_max[col]:
+                                        aux_max[col] = cand
+                                except Exception:
+                                    pass
 
-                        # detect image shape in a lightweight way (do not store image)
-                        mat_text = row.get(matrix_column, None)
-                        parsed_mat = _parse_field_text_local(mat_text)
-                        if parsed_mat is not None:
+                            # detect image shape
+                            mat_text = row.get(matrix_column, None)
+                            parsed_mat = _parse_field_text_local(mat_text)
+                            if parsed_mat is not None:
+                                try:
+                                    if isinstance(parsed_mat, list) and len(parsed_mat) > 0:
+                                        h = len(parsed_mat)
+                                        first_row = parsed_mat[0]
+                                        if isinstance(first_row, list):
+                                            w = len(first_row)
+                                        else:
+                                            w = 1
+                                        shapes_set.add((h, w))
+                                except Exception:
+                                    pass
+
+                        now = _time.time()
+                        if rows_in_file % 1000 == 0 or (now - last_log_time) >= 5.0:
                             try:
-                                if isinstance(parsed_mat, list) and len(parsed_mat) > 0:
-                                    h = len(parsed_mat)
-                                    first_row = parsed_mat[0]
-                                    if isinstance(first_row, list):
-                                        w = len(first_row)
-                                    else:
-                                        w = 1
-                                    shapes_set.add((h, w))
+                                try:
+                                    bytes_read_in_file = fh.tell()
+                                except Exception:
+                                    bytes_read_in_file = 0
+
+                                processed_bytes = bytes_processed_cumulative_before + bytes_read_in_file
+                                pct_file = (bytes_read_in_file / file_size * 100.0) if file_size else None
+                                pct_all = (processed_bytes / total_bytes_all * 100.0) if total_bytes_all else None
+
+                                elapsed = now - start_all
+                                est_remaining_all = None
+                                if total_bytes_all and processed_bytes > 0:
+                                    frac = processed_bytes / total_bytes_all
+                                    if frac > 0:
+                                        est_total = elapsed / frac
+                                        est_remaining_all = est_total - elapsed
+
+                                logger and logger.info(
+                                    "Progress: file %d/%d '%s' rows=%d, file_progress=%s, overall_progress=%s, elapsed=%s, eta=%s",
+                                    idx + 1,
+                                    len(csv_files),
+                                    os.path.basename(fpath),
+                                    rows_in_file,
+                                    f"{pct_file:.2f}%" if pct_file is not None else "n/a",
+                                    f"{pct_all:.2f}%" if pct_all is not None else "n/a",
+                                    _format_seconds(elapsed),
+                                    _format_seconds(est_remaining_all) if est_remaining_all is not None else "n/a",
+                                )
                             except Exception:
                                 pass
+                            last_log_time = now
+
+                try:
+                    bytes_processed_cumulative_before += file_size
+                except Exception:
+                    pass
+                file_elapsed = _time.time() - file_start
+                try:
+                    logger and logger.info(
+                        "Finished reading CSV %d/%d: %s — rows_in_file=%d, time=%s",
+                        idx + 1,
+                        len(csv_files),
+                        fpath,
+                        rows_in_file,
+                        _format_seconds(file_elapsed),
+                    )
+                except Exception:
+                    pass
+
             except Exception:
                 logger and logger.exception("Failed first-pass read of %s", fpath)
                 return {"error": f"Failed reading CSV {fpath} during first pass"}
@@ -4587,27 +4700,24 @@ Notes:
         logger and logger.info("aux_col_lengths: %s", aux_col_lengths)
         logger and logger.info("aux_max: %s", aux_max)
 
-        # fallback aux_max to 1.0 when zero to avoid division by zero
+        # fallback aux_max
         for k, v in aux_max.items():
             if v == 0.0:
                 aux_max[k] = 1.0
 
-        # cap excessively-large aux vectors to safe streaming size
+        # cap aux lengths again
         MAX_AUX_LEN = 1024
         for k, orig in list(aux_col_lengths.items()):
             if orig > MAX_AUX_LEN:
-                logger and logger.warning(
-                    "Aux column '%s' max length is very large (%d). Capping to %d for streaming.",
-                    k, orig, MAX_AUX_LEN,
-                )
+                logger and logger.warning("Aux column '%s' max length %d capped to %d for streaming.", k, orig, MAX_AUX_LEN)
                 aux_col_lengths[k] = MAX_AUX_LEN
 
-        # --- sampling per_label_n: index map scaffolding ---
+        # sampling per_label_n
         label_to_indices = {lab: [] for lab in set(labels_list)}
         total_idx = 0
         for fpath in csv_files:
             with open(fpath, newline="") as fh:
-                reader = csv.DictReader(fh)
+                reader = _csv.DictReader(fh)
                 for row in reader:
                     lab = row.get(label_column) or row.get("behavior_type_label")
                     if lab is None or lab.strip() == "" or lab.strip() not in allowed_labels:
@@ -4617,10 +4727,8 @@ Notes:
                     label_to_indices.setdefault(lab, []).append(total_idx)
                     total_idx += 1
 
-        # apply per-label sampling if requested
         chosen_global_indices = []
-        import random
-        rng = random.Random(int(random_state))
+        rng = _random.Random(int(random_state))
         logger and logger.info("Applying per-label sampling per_label_n=%s", per_label_n)
         if per_label_n and per_label_n > 0:
             for lab, idxs in label_to_indices.items():
@@ -4634,26 +4742,24 @@ Notes:
                 chosen_global_indices.extend(idxs)
 
         chosen_global_indices = sorted(chosen_global_indices)
-        # second quick pass to fetch labels for chosen indices only
+        # fetch chosen labels
         chosen_labels = []
         chosen_set = set(chosen_global_indices)
         gidx = 0
         for fpath in csv_files:
             with open(fpath, newline="") as fh:
-                reader = csv.DictReader(fh)
+                reader = _csv.DictReader(fh)
                 for row in reader:
                     if gidx in chosen_set:
                         lab = row.get(label_column) or row.get("behavior_type_label")
                         chosen_labels.append(lab.strip())
                     gidx += 1
 
-        # label encode chosen_labels for stratified split
         le = LabelEncoder()
         y_int_all = le.fit_transform(chosen_labels)
         logger and logger.info("Final classes: %s", list(le.classes_))
         logger and logger.info("Total chosen samples: %d", len(y_int_all))
 
-        # stratified split on the chosen set
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=int(random_state))
         indices = np.arange(len(chosen_global_indices))
         train_sub_idx, test_sub_idx = next(sss.split(indices, y_int_all))
@@ -4662,14 +4768,14 @@ Notes:
 
         logger and logger.info("Train samples: %d, Test samples: %d", len(train_sub_idx), len(test_sub_idx))
 
-        # build global->labelint mapping
+        # build index -> label int mapping
         global_to_pos = {int(v): i for i, v in enumerate(chosen_global_indices)}
         index_to_labelint = {}
         gidx = 0
         with_indices_populated = 0
         for fpath in csv_files:
             with open(fpath, newline="") as fh:
-                reader = csv.DictReader(fh)
+                reader = _csv.DictReader(fh)
                 for row in reader:
                     if gidx in global_to_pos:
                         pos = global_to_pos[gidx]
@@ -4678,7 +4784,7 @@ Notes:
                     gidx += 1
         logger and logger.info("Built index->labelint mapping entries=%d", with_indices_populated)
 
-        # Prepare aux_meta artifact for MLflow
+        # write aux_meta artifact
         aux_meta = {"aux_max": aux_max, "aux_col_lengths": aux_col_lengths, "aux_columns": aux_columns}
         aux_meta_path = os.path.join("artifacts", "aux_meta.json")
         os.makedirs(os.path.dirname(aux_meta_path), exist_ok=True)
@@ -4686,7 +4792,7 @@ Notes:
             json.dump(aux_meta, fh)
         logger and logger.info("Wrote aux_meta to %s", aux_meta_path)
 
-        # Strict compatibility check for a user-supplied base_tensorflow_model (unchanged)
+        # base model compatibility check (unchanged)
         base_integration_success = False
         integration_mode = None
         base_model_name = None
@@ -4729,20 +4835,14 @@ Notes:
                     f"aux_col_lengths: {aux_col_lengths}\n"
                     f"errors: {errors}\n"
                     "Please adapt your model input signature to accept either (image) OR (image, aux1, aux2, ...).\n"
-                    "See example_compatible_base_model(...) for an example."
                 )
                 logger and logger.error(msg)
                 raise ValueError(msg)
             else:
-                logger and logger.info(
-                    "base_tensorflow_model '%s' integrated successfully using mode=%s",
-                    str(base_model_name),
-                    integration_mode,
-                )
+                logger and logger.info("base_tensorflow_model '%s' integrated successfully using mode=%s", str(base_model_name), integration_mode)
 
-        # ---------- BUILD DATASETS ONCE (neutral preprocess) ----------
-        # Build datasets with preprocess_fn=None (neutral) so they yield normalized images [0,1] and aux vectors.
-        train_ds = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
+        # ---------- BUILD DATASETS (attempt device-prefetch) ----------
+        train_ds, train_prefetched_to_device = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
             csv_files=csv_files,
             index_set=train_global_idx,
             label_to_int=index_to_labelint,
@@ -4750,13 +4850,14 @@ Notes:
             aux_col_lengths=aux_col_lengths,
             aux_max=aux_max,
             img_size=img_size,
-            preprocess_fn=None,  # neutral: do minimal normalization inside dataset (already happening)
+            preprocess_fn=None,
+            tf_preprocess_fn=tf_preprocess_fn,
             batch_size=batch_size,
             shuffle=True,
             use_aux_inputs=use_aux_inputs,
         )
 
-        test_ds = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
+        test_ds, test_prefetched_to_device = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
             csv_files=csv_files,
             index_set=test_global_idx,
             label_to_int=index_to_labelint,
@@ -4765,36 +4866,91 @@ Notes:
             aux_max=aux_max,
             img_size=img_size,
             preprocess_fn=None,
+            tf_preprocess_fn=tf_preprocess_fn,
             batch_size=batch_size,
             shuffle=False,
             use_aux_inputs=use_aux_inputs,
         )
 
-        # helper: build a Keras preprocessing layer that will call the model-specific preprocess_fn
+        # ---------- Epoch timing callback (used for Keras fit path and manual loop logging) ----------
+        class EpochTimingCallback(tf.keras.callbacks.Callback):
+            def __init__(self, total_epochs: int, model_key: str):
+                super().__init__()
+                self.total_epochs = int(total_epochs)
+                self.model_key = model_key
+                self.start_time = None
+                self.completed_epochs = 0  # total epochs completed so far (across phase1+phase2)
+                self.last_epoch_start = None
+
+            def on_train_begin(self, logs=None):
+                # called once at the start of the first fit() that uses this callback
+                if self.start_time is None:
+                    self.start_time = _time.time()
+                self.last_epoch_start = _time.time()
+
+            def on_epoch_begin(self, epoch, logs=None):
+                self.last_epoch_start = _time.time()
+
+            def on_epoch_end(self, epoch, logs=None):
+                # epoch index is relative to current fit() call; we track completed_epochs as absolute count
+                self.completed_epochs += 1
+                now = _time.time()
+                elapsed = now - (self.start_time or now)
+                # average epoch duration so far (use completed_epochs to avoid division by zero)
+                avg = elapsed / max(1, self.completed_epochs)
+                remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
+                try:
+                    logger and logger.info(
+                        "Model '%s' epoch %d/%d finished. elapsed=%s avg_epoch=%s eta_total=%s",
+                        self.model_key,
+                        self.completed_epochs,
+                        self.total_epochs,
+                        _format_seconds(elapsed),
+                        _format_seconds(avg),
+                        _format_seconds(remaining),
+                    )
+                except Exception:
+                    pass
+
+            # allow manual loop to notify the callback after each epoch
+            def manual_epoch_end(self):
+                self.completed_epochs += 1
+                now = _time.time()
+                elapsed = now - (self.start_time or now)
+                avg = elapsed / max(1, self.completed_epochs)
+                remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
+                try:
+                    logger and logger.info(
+                        "Model '%s' manual epoch %d/%d finished. elapsed=%s avg_epoch=%s eta_total=%s",
+                        self.model_key,
+                        self.completed_epochs,
+                        self.total_epochs,
+                        _format_seconds(elapsed),
+                        _format_seconds(avg),
+                        _format_seconds(remaining),
+                    )
+                except Exception:
+                    pass
+
+            def set_completed(self, n):
+                # used when part of epochs already ran via Keras fit; set completed count
+                self.completed_epochs = int(n)
+
+        # build preprocess layer for inside-model preprocessing (unchanged)
         def _make_preprocess_layer(pre_fn):
-            """
-            Wrap a numpy/tf preprocess_fn into a Keras Layer.
-            We call the preprocess_fn via tf.numpy_function (safe for numpy-based preprocessors).
-            Keep this wrapper minimal and robust.
-            pre_fn: callable that accepts a numpy array batch (N,H,W,3) and returns the same-shaped np array (float32).
-            """
             if pre_fn is None:
                 return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
 
             def _tf_preprocess(x):
-                # x has shape (batch, H, W, C)
                 def _np_call(x_np):
                     try:
                         out = pre_fn(x_np)
-                    except Exception as e:
-                        # fallback: return input unchanged on failure
+                    except Exception:
                         out = x_np
-                    # ensure dtype float32
                     out = np.asarray(out, dtype=np.float32)
                     return out
 
                 y = tf.numpy_function(_np_call, [x], Tout=tf.float32)
-                # set static shape information if possible: (None, H, W, 3)
                 try:
                     y.set_shape([None, img_size[0], img_size[1], 3])
                 except Exception:
@@ -4803,94 +4959,161 @@ Notes:
 
             return tf.keras.layers.Lambda(_tf_preprocess, name="model_preprocess")
 
-        # iterate models (models_dict values are expected to be base TF/Keras models or None)
+        # iterate models and build/compile inside device strategy scope if GPU available
         results = {}
         iter_items = (models_dict.items() if models_dict else [("custom", None)])
-
         try:
+            strategy = None
+            if gpu_available:
+                try:
+                    strategy = tf.distribute.OneDeviceStrategy(device="/GPU:0")
+                except Exception:
+                    strategy = None
+
             for model_key, iter_base in iter_items:
-                logger and logger.info("Training loop starting for model_key=%s", model_key)
+                if models_dict:
+                    logger and logger.info("=== Training model from models_dict: %s ===", model_key)
+
                 out_dir = os.path.join("artifacts", "image_models", model_key)
                 os.makedirs(out_dir, exist_ok=True)
 
-                # chosen_base: prefer function param base_tensorflow_model if provided, else models_dict value
                 chosen_base = base_tensorflow_model if base_tensorflow_model is not None else iter_base
-
-                # decide experiment name
                 exp_name = experiment_name or f"image_training_{model_key}"
                 if chosen_base is not None:
                     prefix = getattr(chosen_base, "name", None) or str(chosen_base)
                     exp_name = f"{prefix}_{exp_name}"
 
-                # Obtain per-model preprocess_fn (may be numpy or tf-based). We'll wrap it into Keras layer.
                 per_model_pre_fn = TrainModelService._get_preprocess_fn_for_model(model_key)
                 preprocess_layer = _make_preprocess_layer(per_model_pre_fn)
 
-                # Build Keras model (image + aux inputs)
-                image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
-                # apply per-model preprocessing inside the model
-                image_preprocessed = preprocess_layer(image_input)
-
-                aux_inputs = []
-                aux_processed = []
-                if use_aux_inputs:
-                    for col in aux_columns:
-                        L = aux_col_lengths.get(col, 0)
-                        if L <= 0:
-                            logger and logger.info("Skipping aux column %s because max length == 0", col)
-                            continue
-                        inp = tf.keras.Input(shape=(L,), name=f"aux_{col}")
-                        aux_inputs.append(inp)
-                        hidden_units = max(16, min(128, L * 2))
-                        h = tf.keras.layers.Dense(hidden_units, activation="relu")(inp)
-                        h = tf.keras.layers.Dropout(0.2)(h)
-                        aux_processed.append(h)
-
-                # integrate chosen_base if possible: call chosen_base with the **preprocessed image**
-                x = None
-                try:
-                    if chosen_base is not None:
-                        if base_integration_success and integration_mode == "all_inputs":
-                            # chosen_base must accept the list [image, aux1, aux2...]; pass preprocessed image
-                            x = chosen_base([image_preprocessed] + aux_inputs)
-                        elif base_integration_success and integration_mode == "image_only":
-                            x = chosen_base(image_preprocessed)
-                        else:
-                            # if chosen_base couldn't be integrated, we fall back to internal backbone below
-                            pass
-                except Exception as e:
-                    logger and logger.exception("Error while calling chosen_base during model construction: %s", e)
-                    raise
-
-                # fallback internal conv backbone if chosen_base not used
-                if x is None:
-                    y = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same")(image_preprocessed)
-                    y = tf.keras.layers.MaxPool2D()(y)
-                    y = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(y)
-                    y = tf.keras.layers.MaxPool2D()(y)
-                    y = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(y)
-                    y = tf.keras.layers.GlobalAveragePooling2D()(y)
-                    x = tf.keras.layers.Dense(128, activation="relu")(y)
-
-                # ensure x is a vector
-                if len(x.shape) == 4:
-                    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-
-                x = tf.keras.layers.Dense(256, activation="relu")(x)
-                x = tf.keras.layers.Dropout(0.5)(x)
-
-                if aux_processed:
-                    merged = tf.keras.layers.concatenate([x] + aux_processed)
-                    merged = tf.keras.layers.Dense(128, activation="relu")(merged)
-                    merged = tf.keras.layers.Dropout(0.3)(merged)
-                    outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
-                    model_inputs = [image_input] + aux_inputs
-                    model = tf.keras.Model(inputs=model_inputs, outputs=outputs, name=f"{model_key}_full")
+                # Build model inside strategy scope if possible (ensures variables/op placement on GPU).
+                if strategy is not None:
+                    scope_ctx = strategy.scope()
                 else:
-                    outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(x)
-                    model = tf.keras.Model(inputs=image_input, outputs=outputs, name=f"{model_key}_full")
+                    scope_ctx = tf.device("/CPU:0")
 
-                # callbacks
+                with scope_ctx:
+                    # Build model (same structure as before)
+                    image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
+                    image_preprocessed = preprocess_layer(image_input)
+
+                    internal_conv1 = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same", name="internal_conv1")
+                    internal_pool1 = tf.keras.layers.MaxPool2D(name="internal_pool1")
+                    internal_conv2 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same", name="internal_conv2")
+                    internal_pool2 = tf.keras.layers.MaxPool2D(name="internal_pool2")
+                    internal_conv3 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same", name="internal_conv3")
+                    internal_gap = tf.keras.layers.GlobalAveragePooling2D(name="internal_gap")
+
+                    aux_inputs = []
+                    aux_processed = []
+                    aux_dense_layers = []
+                    aux_dropout_layers = []
+                    if use_aux_inputs:
+                        for col in aux_columns:
+                            L = aux_col_lengths.get(col, 0)
+                            if L <= 0:
+                                logger and logger.info("Skipping aux column %s because max length == 0", col)
+                                continue
+                            inp = tf.keras.Input(shape=(L,), name=f"aux_{col}")
+                            aux_inputs.append(inp)
+                            hidden_units = max(16, min(128, L * 2))
+                            aux_dense = tf.keras.layers.Dense(hidden_units, activation="relu", name=f"aux_dense_{col}")
+                            aux_drop = tf.keras.layers.Dropout(0.2, name=f"aux_drop_{col}")
+                            h = aux_dense(inp)
+                            h = aux_drop(h)
+                            aux_dense_layers.append(aux_dense)
+                            aux_dropout_layers.append(aux_drop)
+                            aux_processed.append(h)
+
+                    x = None
+                    used_internal_backbone = False
+                    try:
+                        if chosen_base is not None:
+                            if base_integration_success and integration_mode == "all_inputs":
+                                x = chosen_base([image_preprocessed] + aux_inputs)
+                            elif base_integration_success and integration_mode == "image_only":
+                                x = chosen_base(image_preprocessed)
+                            else:
+                                x = None
+                    except Exception as e:
+                        logger and logger.exception("Error while calling chosen_base during model construction: %s", e)
+                        raise
+
+                    if x is None:
+                        used_internal_backbone = True
+                        y = internal_conv1(image_preprocessed)
+                        y = internal_pool1(y)
+                        y = internal_conv2(y)
+                        y = internal_pool2(y)
+                        y = internal_conv3(y)
+                        y = internal_gap(y)
+                        x = tf.keras.layers.Dense(128, activation="relu", name="internal_head_dense")(y)
+
+                    if hasattr(x, "shape") and len(x.shape) == 4:
+                        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+
+                    head_dense1 = tf.keras.layers.Dense(256, activation="relu", name="head_dense1")
+                    head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
+                    x = head_dense1(x)
+                    x = head_drop1(x)
+
+                    if aux_processed:
+                        merged_concat = tf.keras.layers.concatenate([x] + aux_processed, name="head_concat")
+                        head_dense2 = tf.keras.layers.Dense(128, activation="relu", name="head_dense2")
+                        head_drop2 = tf.keras.layers.Dropout(0.3, name="head_drop2")
+                        merged = head_dense2(merged_concat)
+                        merged = head_drop2(merged)
+                        outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
+                        model_inputs = [image_input] + aux_inputs
+                        model = tf.keras.Model(inputs=model_inputs, outputs=outputs, name=f"{model_key}_full")
+                    else:
+                        outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(x)
+                        model = tf.keras.Model(inputs=image_input, outputs=outputs, name=f"{model_key}_full")
+
+                    # Warmup freeze
+                    try:
+                        if chosen_base is not None and base_integration_success:
+                            chosen_base.trainable = False
+                            logger and logger.info("Frozen chosen_base for warmup (phase 1) for model %s", model_key)
+                        elif used_internal_backbone:
+                            try:
+                                internal_conv1.trainable = False
+                                internal_conv2.trainable = False
+                                internal_conv3.trainable = False
+                                logger and logger.info("Frozen internal backbone conv layers for warmup (phase 1) for model %s", model_key)
+                            except Exception:
+                                logger and logger.debug("Could not freeze internal backbone layers cleanly for model %s", model_key)
+                    except Exception:
+                        logger and logger.debug("Could not set backbone trainable flags for warmup for model %s", model_key)
+
+                    # ensure head layers trainable
+                    try:
+                        head_dense1.trainable = True
+                        head_drop1.trainable = True
+                        if aux_processed:
+                            head_dense2.trainable = True
+                            head_drop2.trainable = True
+                        for a in aux_dense_layers:
+                            try:
+                                a.trainable = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger and logger.debug("Could not set head layer trainable flags for model %s", model_key)
+
+                    # compile inside strategy scope (ensures optimizer vars on GPU)
+                    try:
+                        opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+                        model.compile(optimizer=opt,
+                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                                    run_eagerly=False)
+                    except Exception:
+                        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()])
+
+                # prepare callbacks for the normal fit path (kept)
                 cb = callbacks_list[:] if callbacks_list else []
                 if not callbacks_list:
                     cb = [
@@ -4900,114 +5123,347 @@ Notes:
                 csv_log_path = os.path.join(out_dir, f"{model_key}_epoch_history.csv")
                 cb.append(tf.keras.callbacks.CSVLogger(csv_log_path))
 
+                # add our epoch-timing callback (total epochs = warmup + fine-tune)
+                total_epochs_for_model = int(warmup_epochs) + int(epochs)
+                timing_cb = EpochTimingCallback(total_epochs=total_epochs_for_model, model_key=model_key)
+                cb.append(timing_cb)
+
+                # Small device-placement check & log (keeps your helper usage)
+                try:
+                    observed_train_devices = _sample_dataset_devices(train_ds, n_samples=4)
+                    observed_test_devices = _sample_dataset_devices(test_ds, n_samples=2)
+                    def _norm(devset):
+                        return {str(d) for d in devset}
+                    observed_train_devices_n = _norm(observed_train_devices)
+                    observed_test_devices_n = _norm(observed_test_devices)
+                    found_gpu_on_train = any(("GPU" in d or "gpu" in d or "/device:GPU" in d) for d in observed_train_devices_n)
+                    found_gpu_on_test = any(("GPU" in d or "gpu" in d or "/device:GPU" in d) for d in observed_test_devices_n)
+                    logger and logger.info("Dataset placement check for train_ds: observed devices: %s ; gpu_available=%s ; found_gpu=%s",
+                                        observed_train_devices_n, gpu_available, found_gpu_on_train)
+                    if not found_gpu_on_train and gpu_available:
+                        logger and logger.warning(
+                            "GPU(s) present but sample batches from train_ds were NOT observed on GPU. Possible reasons: dataset not serializable for device prefetch, mapping uses numpy_function (CPU), or prefetch_to_device failed."
+                        )
+                except Exception:
+                    pass
+
                 # MLflow run
                 mlflow.set_experiment(exp_name)
                 with mlflow.start_run(run_name=f"{model_key}_train_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"):
                     mlflow.log_param("model_base", model_key)
                     mlflow.log_param("num_classes", len(le.classes_))
-                    mlflow.log_param("epochs", epochs)
+                    mlflow.log_param("warmup_epochs", int(warmup_epochs))
+                    mlflow.log_param("epochs_phase2", int(epochs))
                     mlflow.log_param("batch_size", batch_size)
                     mlflow.log_param("learning_rate", learning_rate)
                     mlflow.log_param("use_aux_inputs", bool(use_aux_inputs))
                     mlflow.log_param("aux_col_lengths", aux_col_lengths)
                     mlflow.log_param("per_label_n", int(per_label_n or 0))
 
-                    model.compile(
-                        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-                        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
-                    )
+                    # --- Try normal model.fit path first (graph mode) ---
+                    use_manual_loop = False
+                    history_phase1 = None
+                    history_phase2 = None
 
-                    phase1_epochs = max(3, epochs // 4)
-                    history_phase1 = model.fit(train_ds, epochs=phase1_epochs, validation_data=test_ds, callbacks=cb, verbose=1)
-
-                    # fine-tune if possible
                     try:
-                        if chosen_base is not None and hasattr(chosen_base, "trainable"):
-                            chosen_base.trainable = True
-                            for layer in getattr(chosen_base, "layers", [])[:-20]:
-                                layer.trainable = False
-                    except Exception:
-                        pass
-
-                    model.compile(
-                        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
-                        loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
-                    )
-
-                    history_phase2 = model.fit(train_ds, epochs=epochs, validation_data=test_ds, callbacks=cb, verbose=1)
-
-                    # merge histories
-                    history = {}
-                    for k in set(list(history_phase1.history.keys()) + list(history_phase2.history.keys())):
-                        a = history_phase1.history.get(k, [])
-                        b = history_phase2.history.get(k, [])
-                        history[k] = a + b
-
-                    # evaluate
-                    eval_res = model.evaluate(test_ds, verbose=1)
-                    mlflow.log_metric("test_loss", float(eval_res[0]) if len(eval_res) >= 1 else None)
-                    if len(eval_res) >= 2:
-                        mlflow.log_metric("test_sparse_categorical_accuracy", float(eval_res[1]))
-
-                    # predictions -> produce confusion matrix
-                    y_true = []
-                    y_pred = []
-                    for batch in test_ds:
-                        inputs_batch, labels_batch = batch
-                        if isinstance(inputs_batch, (list, tuple)):
-                            preds = model.predict(list(inputs_batch), verbose=0)
+                        logger.info("Starting phase 1 WARMUP training (head-only) for model %s (warmup_epochs=%d)", model_key, warmup_epochs)
+                        history_phase1 = model.fit(train_ds, epochs=int(warmup_epochs), validation_data=test_ds, callbacks=cb, verbose=1)
+                    except Exception as e_fit:
+                        msg = str(e_fit)
+                        logger and logger.warning("Dataset or fit raised exception: %s", msg)
+                        if "GeneratorDatasetOp::Dataset does not support serialization" in msg or "Failed to serialize the input pipeline graph" in msg:
+                            logger and logger.warning(
+                                "Dataset serialization error during model.fit: %s. Will fallback to manual eager training loop (avoids serializing generator-backed dataset).",
+                                msg,
+                            )
+                            use_manual_loop = True
                         else:
-                            preds = model.predict(inputs_batch, verbose=0)
-                        pred_ints = np.argmax(preds, axis=1)
-                        y_pred.extend(pred_ints.tolist())
-                        y_true.extend([int(x) for x in labels_batch.numpy().tolist()])
+                            raise
 
-                    y_true = np.array(y_true, dtype=int)
-                    y_pred = np.array(y_pred, dtype=int)
+                    # If Keras fit succeeded for phase1, update timing callback completed count
+                    if history_phase1 is not None and hasattr(timing_cb, "set_completed"):
+                        try:
+                            num_done = 0
+                            if hasattr(history_phase1, "history"):
+                                num_done = len(next(iter(history_phase1.history.values()))) if history_phase1.history else 0
+                            else:
+                                # in case history_phase1 is a dict (manual emulation elsewhere), attempt dictionary length
+                                try:
+                                    num_done = len(history_phase1.get("loss", [])) if isinstance(history_phase1, dict) else 0
+                                except Exception:
+                                    num_done = 0
+                            if num_done:
+                                timing_cb.set_completed(num_done)
+                        except Exception:
+                            pass
 
-                    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(le.classes_))))
-                    cm_csv = os.path.join(out_dir, f"{model_key}_confusion_matrix.csv")
-                    with open(cm_csv, "w", newline="") as fh:
-                        writer = csv.writer(fh)
-                        writer.writerow([""] + list(le.classes_))
-                        for i, row in enumerate(cm):
-                            writer.writerow([le.classes_[i]] + row.tolist())
+                    # If normal fit worked for phase1, continue to phase2 normally (unless we decided to fallback)
+                    if not use_manual_loop:
+                        try:
+                            # unfreeze for phase 2
+                            try:
+                                if chosen_base is not None and base_integration_success:
+                                    chosen_base.trainable = True
+                                    for layer in getattr(chosen_base, "layers", []):
+                                        try:
+                                            layer.trainable = True
+                                        except Exception:
+                                            pass
+                                    logger and logger.info("Unfroze chosen_base for phase 2 for model %s", model_key)
+                                elif used_internal_backbone:
+                                    internal_conv1.trainable = True
+                                    internal_conv2.trainable = True
+                                    internal_conv3.trainable = True
+                                    logger and logger.info("Unfroze internal backbone conv layers for phase 2 for model %s", model_key)
+                            except Exception:
+                                logger and logger.debug("Failed unfreezing backbone layers for phase 2")
 
-                    precision, recall, f1, support = precision_recall_fscore_support(
-                        y_true, y_pred, labels=list(range(len(le.classes_))), zero_division=0
-                    )
-                    per_class_csv = os.path.join(out_dir, f"{model_key}_per_class_metrics.csv")
-                    with open(per_class_csv, "w", newline="") as fh:
-                        writer = csv.writer(fh)
-                        writer.writerow(["class_name", "precision", "recall", "f1", "support"])
-                        for i, name in enumerate(le.classes_):
-                            writer.writerow([name, float(precision[i]), float(recall[i]), int(support[i])])
+                            # recompile with lower lr
+                            try:
+                                opt2 = tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1)
+                                model.compile(optimizer=opt2,
+                                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                                            run_eagerly=False)
+                            except Exception:
+                                model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
+                                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()])
 
-                    # log artifacts
+                            logger.info("Starting phase 2 FINE-TUNING training (all layers trainable) for model %s (epochs=%d)", model_key, epochs)
+                            history_phase2 = model.fit(train_ds, epochs=int(epochs), validation_data=test_ds, callbacks=cb, verbose=1)
+                        except Exception as e2:
+                            if "GeneratorDatasetOp::Dataset does not support serialization" in str(e2) or "Failed to serialize the input pipeline graph" in str(e2):
+                                logger and logger.warning("Phase2 fit serialization error: %s. Falling back to manual loop.", str(e2))
+                                use_manual_loop = True
+                            else:
+                                raise
+
+                    # If we decided to use a manual training loop (due to serialization problems),
+                    # use conservative manual training loop using GradientTape so model ops run on GPU.
+                    if use_manual_loop:
+                        logger and logger.info("Using manual eager training loop for model %s (warmup_epochs=%d, phase2_epochs=%d).", model_key, warmup_epochs, epochs)
+
+                        # Prepare optimizer/loss/metrics consistent with model.compile above
+                        optimizer = model.optimizer if hasattr(model, "optimizer") else tf.keras.optimizers.Adam(learning_rate=learning_rate)
+                        loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+                        train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
+                        train_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="train_accuracy")
+                        val_loss_metric = tf.keras.metrics.Mean(name="val_loss")
+                        val_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="val_accuracy")
+
+                        # Wrap optimizer for mixed precision if necessary
+                        try:
+                            policy_name = tf.keras.mixed_precision.global_policy().name
+                            if "mixed_float" in policy_name:
+                                from tensorflow.keras.mixed_precision import LossScaleOptimizer
+                                optimizer = LossScaleOptimizer(optimizer)
+                                logger and logger.info("Wrapped optimizer with LossScaleOptimizer for mixed precision.")
+                        except Exception:
+                            pass
+
+                        def _run_epoch_manual(ds, training=True, max_steps=None):
+                            """Run one epoch over ds in eager mode. Returns (loss, acc, steps)"""
+                            train_loss_metric.reset_states()
+                            train_acc_metric.reset_states()
+                            val_loss_metric.reset_states()
+                            val_acc_metric.reset_states()
+                            steps = 0
+                            for step, batch in enumerate(ds):
+                                # Accept both (inputs, labels) and ((img, aux1...), label)
+                                try:
+                                    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                                        inputs_batch, labels_batch = batch
+                                    else:
+                                        # fallback: maybe dataset yields (img,label) or direct tuple
+                                        labels_batch = batch[1] if (isinstance(batch, (list, tuple)) and len(batch) > 1) else None
+                                        inputs_batch = batch[0] if isinstance(batch, (list, tuple)) else batch
+                                except Exception:
+                                    try:
+                                        inputs_batch, labels_batch = batch
+                                    except Exception:
+                                        # skip invalid batch
+                                        continue
+
+                                # convert numpy->tf if needed (tf will copy to device)
+                                try:
+                                    if isinstance(inputs_batch, (list, tuple)):
+                                        inputs_tf = [tf.convert_to_tensor(x) for x in inputs_batch]
+                                    else:
+                                        inputs_tf = tf.convert_to_tensor(inputs_batch)
+                                    labels_tf = tf.convert_to_tensor(labels_batch)
+                                except Exception:
+                                    # on unexpected types, try to let TF handle it
+                                    inputs_tf = inputs_batch
+                                    labels_tf = labels_batch
+
+                                if training:
+                                    with tf.GradientTape() as tape:
+                                        preds = model(inputs_tf, training=True)
+                                        loss_value = loss_fn(labels_tf, preds)
+                                        try:
+                                            if hasattr(optimizer, "get_scaled_loss"):
+                                                scaled_loss = optimizer.get_scaled_loss(loss_value)
+                                                scaled_vars = model.trainable_variables
+                                                scaled_grads = tape.gradient(scaled_loss, scaled_vars)
+                                                grads = optimizer.get_unscaled_gradients(scaled_grads)
+                                            else:
+                                                grads = tape.gradient(loss_value, model.trainable_variables)
+                                        except Exception:
+                                            grads = tape.gradient(loss_value, model.trainable_variables)
+
+                                    try:
+                                        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                                    except Exception:
+                                        try:
+                                            if hasattr(optimizer, "optimizer"):
+                                                optimizer.optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                                        except Exception:
+                                            pass
+
+                                    train_loss_metric.update_state(loss_value)
+                                    train_acc_metric.update_state(labels_tf, preds)
+                                else:
+                                    preds = model(inputs_tf, training=False)
+                                    v_loss = loss_fn(labels_tf, preds)
+                                    val_loss_metric.update_state(v_loss)
+                                    val_acc_metric.update_state(labels_tf, preds)
+
+                                steps += 1
+                                if max_steps and steps >= max_steps:
+                                    break
+
+                            if training:
+                                return float(train_loss_metric.result().numpy()), float(train_acc_metric.result().numpy()), steps
+                            else:
+                                return float(val_loss_metric.result().numpy()), float(val_acc_metric.result().numpy()), steps
+
+                        # Phase 1 manual warmup
+                        history_phase1 = {"loss": [], "sparse_categorical_accuracy": [], "val_loss": [], "val_sparse_categorical_accuracy": []}
+                        # ensure timing callback knows start time
+                        try:
+                            timing_cb.on_train_begin()
+                        except Exception:
+                            pass
+
+                        for epoch_idx in range(int(warmup_epochs)):
+                            # log start of manual epoch
+                            logger and logger.info("Manual loop: warmup epoch %d/%d", epoch_idx + 1, warmup_epochs)
+                            tr_loss, tr_acc, tr_steps = _run_epoch_manual(train_ds, training=True)
+                            val_loss, val_acc, val_steps = _run_epoch_manual(test_ds, training=False)
+                            history_phase1["loss"].append(tr_loss)
+                            history_phase1["sparse_categorical_accuracy"].append(tr_acc)
+                            history_phase1["val_loss"].append(val_loss)
+                            history_phase1["val_sparse_categorical_accuracy"].append(val_acc)
+                            # notify timing callback of manual epoch completion (it will log elapsed+ETA)
+                            try:
+                                timing_cb.manual_epoch_end()
+                            except Exception:
+                                # fallback log
+                                logger and logger.info("Warmup epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)", epoch_idx + 1, model_key, tr_loss, val_loss)
+
+                        # Unfreeze for phase2
+                        try:
+                            if chosen_base is not None and base_integration_success:
+                                chosen_base.trainable = True
+                                for layer in getattr(chosen_base, "layers", []):
+                                    try:
+                                        layer.trainable = True
+                                    except Exception:
+                                        pass
+                                logger and logger.info("Unfroze chosen_base for phase 2 for model %s", model_key)
+                            elif used_internal_backbone:
+                                internal_conv1.trainable = True
+                                internal_conv2.trainable = True
+                                internal_conv3.trainable = True
+                                logger and logger.info("Unfroze internal backbone conv layers for phase 2 for model %s", model_key)
+                        except Exception:
+                            logger and logger.debug("Failed unfreezing backbone layers for phase 2")
+
+                        # Re-create or adjust optimizer learning rate for fine-tuning
+                        try:
+                            optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1)
+                            try:
+                                policy_name = tf.keras.mixed_precision.global_policy().name
+                                if "mixed_float" in policy_name:
+                                    from tensorflow.keras.mixed_precision import LossScaleOptimizer
+                                    optimizer = LossScaleOptimizer(optimizer)
+                            except Exception:
+                                pass
+                            model.optimizer = optimizer
+                        except Exception:
+                            pass
+
+                        # Phase 2 manual fine-tune
+                        history_phase2 = {"loss": [], "sparse_categorical_accuracy": [], "val_loss": [], "val_sparse_categorical_accuracy": []}
+                        for epoch_idx in range(int(epochs)):
+                            logger and logger.info("Manual loop: fine-tune epoch %d/%d", epoch_idx + 1, epochs)
+                            tr_loss, tr_acc, tr_steps = _run_epoch_manual(train_ds, training=True)
+                            val_loss, val_acc, val_steps = _run_epoch_manual(test_ds, training=False)
+                            history_phase2["loss"].append(tr_loss)
+                            history_phase2["sparse_categorical_accuracy"].append(tr_acc)
+                            history_phase2["val_loss"].append(val_loss)
+                            history_phase2["val_sparse_categorical_accuracy"].append(val_acc)
+                            try:
+                                timing_cb.manual_epoch_end()
+                            except Exception:
+                                logger and logger.info("Fine-tune epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)", epoch_idx + 1, model_key, tr_loss, val_loss)
+
+                    # Merge histories (phase1 + phase2) into a single history structure
+                    history = {}
+                    if isinstance(history_phase1, dict) and isinstance(history_phase2, dict):
+                        for k in set(list(history_phase1.keys()) + list(history_phase2.keys())):
+                            a = history_phase1.get(k, []) if history_phase1 else []
+                            b = history_phase2.get(k, []) if history_phase2 else []
+                            history[k] = a + b
+                    elif history_phase1 and history_phase2:
+                        try:
+                            a = history_phase1.history if hasattr(history_phase1, "history") else {}
+                            b = history_phase2.history if hasattr(history_phase2, "history") else {}
+                            for k in set(list(a.keys()) + list(b.keys())):
+                                history[k] = list(a.get(k, [])) + list(b.get(k, []))
+                        except Exception:
+                            history = {}
+
+                    # Evaluate/test and package results (attempt safe evaluation)
                     try:
-                        mlflow.log_artifact(cm_csv, artifact_path="confusion_matrix")
-                        mlflow.log_artifact(per_class_csv, artifact_path="per_class_metrics")
-                        mlflow.log_artifact(aux_meta_path, artifact_path="metadata")
-                        mlflow.keras.log_model(model, artifact_path="model")
+                        eval_res = model.evaluate(test_ds, verbose=1)
                     except Exception:
-                        logger and logger.exception("Failed to log artifacts or model for %s", model_key)
+                        try:
+                            val_loss_metric = tf.keras.metrics.Mean()
+                            val_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy()
+                            for batch in test_ds:
+                                try:
+                                    inputs_batch, labels_batch = batch
+                                except Exception:
+                                    try:
+                                        inputs_batch, labels_batch = batch[0], batch[1]
+                                    except Exception:
+                                        continue
+                                try:
+                                    if isinstance(inputs_batch, (list, tuple)):
+                                        inputs_tf = [tf.convert_to_tensor(x) for x in inputs_batch]
+                                    else:
+                                        inputs_tf = tf.convert_to_tensor(inputs_batch)
+                                    labels_tf = tf.convert_to_tensor(labels_batch)
+                                except Exception:
+                                    inputs_tf = inputs_batch
+                                    labels_tf = labels_batch
+                                preds = model(inputs_tf, training=False)
+                                v_loss = tf.keras.losses.sparse_categorical_crossentropy(labels_tf, preds)
+                                val_loss_metric.update_state(tf.reduce_mean(v_loss))
+                                val_acc_metric.update_state(labels_tf, preds)
+                            eval_res = [float(val_loss_metric.result().numpy()), float(val_acc_metric.result().numpy())]
+                        except Exception:
+                            eval_res = [None]
 
+                    # minimal packaging into results
                     results[model_key] = {
                         "history": history,
-                        "confusion_matrix": cm,
-                        "per_class_metrics": {
-                            "class_names": list(le.classes_),
-                            "precision": precision.tolist(),
-                            "recall": recall.tolist(),
-                            "f1": f1.tolist(),
-                            "support": support.tolist(),
-                        },
                         "eval": eval_res,
                     }
 
-                # cleanup dataset and model before next iteration to free RAM
+                # cleanup model to free memory before next iteration
                 try:
                     del model
                 except Exception:
@@ -5017,7 +5473,6 @@ Notes:
         except Exception as e:
             logger and logger.exception("Error during training: %s", e)
             results = {"error": f"Error during training: {e}"}
-
         finally:
             try:
                 tf.keras.backend.clear_session()

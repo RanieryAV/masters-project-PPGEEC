@@ -922,7 +922,7 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
             spark=spark,
             output_dir=output_dir,
             behavior_types_to_generate_dataset=behavior_types_to_generate_dataset,
-            max_rows_per_behavior=320
+            max_rows_per_behavior=100
         )
 
         logger.info("Task finished. Stopping Spark session...")
