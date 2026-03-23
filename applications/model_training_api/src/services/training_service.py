@@ -2108,7 +2108,7 @@ Notes:
         fig.subplots_adjust(bottom=0.20, left=0.09)
 
         png_path = _os.path.join(artifact_dir, "confusion_matrix.png")
-        fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        fig.savefig(png_path, dpi=400, bbox_inches="tight")
         _plt.close(fig)
 
         # Save JSON with matrix + per-class metrics (precision/recall as decimals)
@@ -4151,7 +4151,8 @@ Notes:
             use_aux_inputs: bool = True,
         ):
         """
-        Streaming tf.data.Dataset builder that prioritizes TF ops and attempts to place batches on GPU.
+        Streaming tf.data.Dataset builder that prioritizes TF ops where possible,
+        but keeps the generator-based input pipeline intact.
 
         Returns:
             (dataset, tried_device_prefetch: bool)
@@ -4167,7 +4168,10 @@ Notes:
         for k, orig in list(aux_col_lengths.items()):
             if orig > MAX_AUX_LEN:
                 try:
-                    logger and logger.warning("Aux column '%s' max length %d capped to %d for streaming.", k, orig, MAX_AUX_LEN)
+                    logger and logger.warning(
+                        "Aux column '%s' max length %d capped to %d for streaming.",
+                        k, orig, MAX_AUX_LEN
+                    )
                 except Exception:
                     pass
                 aux_col_lengths[k] = MAX_AUX_LEN
@@ -4186,7 +4190,7 @@ Notes:
                 pass
             return None
 
-        # ---------- generator: pure python/ numpy / io ----------
+        # ---------- generator: pure python / numpy / io ----------
         def generator():
             global_idx = 0
             try:
@@ -4206,6 +4210,7 @@ Notes:
                                     lab = (row.get("behavior_type_label") or row.get("behavior_type") or row.get("label"))
                                     if lab is not None:
                                         lab = lab.strip()
+
                                     lab_int = label_to_int.get(global_idx)
                                     if lab_int is None and lab is not None:
                                         lab_int = label_to_int.get(lab)
@@ -4219,6 +4224,7 @@ Notes:
                                     if parsed_mat is None:
                                         global_idx += 1
                                         continue
+
                                     try:
                                         arr = np.array(parsed_mat)
                                         # coerce to HxWx3
@@ -4341,7 +4347,6 @@ Notes:
                 gc.collect()
 
         # ---------- output_signature ----------
-        import tensorflow as tf  # local import for clarity
         image_spec = tf.TensorSpec(shape=(None, None, 3), dtype=tf.uint8)
         aux_specs = []
         if use_aux_inputs:
@@ -4355,25 +4360,22 @@ Notes:
 
         # shuffle small buffer
         if shuffle:
-            ds = ds.shuffle(buffer_size=1024, seed=seed)
+            ds = ds.shuffle(buffer_size=min(1024, max(32, batch_size * 16)), seed=seed)
 
-        # map: uint8 -> float32, resize, apply tf_preprocess_fn if available (these ops can be placed on GPU)
+        # map: uint8 -> float32, resize, apply tf_preprocess_fn if available
         def _map_to_model_tensors(inputs, label):
             image = inputs[0]
             aux = inputs[1:] if len(inputs) > 1 else ()
 
-            # TF ops (graph ops can be placed on GPU if dataset is device-prefetched)
-            img = tf.image.convert_image_dtype(image, dtype=tf.float32)   # uint8 -> float32 [0,1]
-            img = tf.image.resize(img, (img_size[0], img_size[1]), method='bilinear')
+            img = tf.image.convert_image_dtype(image, dtype=tf.float32)
+            img = tf.image.resize(img, (img_size[0], img_size[1]), method="bilinear")
 
-            # prefer pure-TF preprocess function so preprocessing runs on device
             if callable(tf_preprocess_fn):
                 try:
                     img = tf_preprocess_fn(img)
                 except Exception:
                     pass
             else:
-                # numpy fallback: will run on CPU via tf.numpy_function (slower)
                 if callable(preprocess_fn):
                     try:
                         def _call_pre(x_np):
@@ -4382,6 +4384,7 @@ Notes:
                             except Exception:
                                 out = x_np
                             return np.asarray(out, dtype=np.float32)
+
                         img = tf.numpy_function(func=_call_pre, inp=[tf.expand_dims(img, axis=0)], Tout=tf.float32)
                         img.set_shape([1, img_size[0], img_size[1], 3])
                         img = tf.squeeze(img, axis=0)
@@ -4395,7 +4398,6 @@ Notes:
                 return (img, label)
 
         ds = ds.map(_map_to_model_tensors, num_parallel_calls=AUTOTUNE)
-
         # batch
         ds = ds.batch(batch_size, drop_remainder=False)
 
@@ -4406,14 +4408,16 @@ Notes:
                 options.experimental_optimization.autotune = True
             except Exception:
                 pass
+            try:
+                options.experimental_deterministic = False
+            except Exception:
+                pass
             ds = ds.with_options(options)
         except Exception:
             pass
 
-        # prefetch host-side baseline
         ds = ds.prefetch(AUTOTUNE)
 
-        # Attempt GPU memory growth + prefetch_to_device to push batches to GPU
         tried_device_prefetch = False
         try:
             gpus = tf.config.experimental.list_physical_devices("GPU")
@@ -4429,41 +4433,43 @@ Notes:
                     tried_device_prefetch = True
                     logger and logger.info("Dataset: applied prefetch_to_device('/GPU:0', buffer_size=1)")
                 except Exception:
-                    logger and logger.debug("Dataset: prefetch_to_device('/GPU:0') not available or failed; continuing with host prefetch.")
+                    logger and logger.debug(
+                        "Dataset: prefetch_to_device('/GPU:0') not available or failed; continuing with host prefetch."
+                    )
                     tried_device_prefetch = False
         except Exception:
             tried_device_prefetch = False
 
         return ds, tried_device_prefetch
 
-    @staticmethod
+
     def train_all_behavior_types_image_models_from_csv_separate_aux(
-            dataset_dir: str,
-            matrix_column: str = "trajectory_image_matrix",
-            label_column: str = "behavior_type_label",
-            aux_columns: list = None,
-            models_dict: dict = None,
-            base_tensorflow_model=None,
-            allowed_labels: list = None,
-            per_label_n: int = 100,
-            test_size: float = 0.2,
-            random_state: float = 42,
-            img_size: tuple = (120, 120),
-            epochs: int = 12,
-            batch_size: int = 24,
-            learning_rate: float = 0.001,
-            callbacks_list: list = None,
-            experiment_name: str = None,
-            register_model_name: str = None,
-            use_aux_inputs: bool = True,
-            warmup_epochs: int = 3,
-            enable_mixed_precision: bool = True,
-            tf_preprocess_fn: Callable = None,   # pass-through to dataset builder
-        ):
+        dataset_dir: str,
+        matrix_column: str = "trajectory_image_matrix",
+        label_column: str = "behavior_type_label",
+        aux_columns: list = None,
+        models_dict: dict = None,
+        base_tensorflow_model=None,
+        allowed_labels: list = None,
+        per_label_n: int = 100,
+        test_size: float = 0.2,
+        random_state: float = 42,
+        img_size: tuple = (120, 120),
+        epochs: int = 12,
+        batch_size: int = 24,
+        learning_rate: float = 0.001,
+        callbacks_list: list = None,
+        experiment_name: str = None,
+        register_model_name: str = None,
+        use_aux_inputs: bool = True,
+        warmup_epochs: int = 3,
+        enable_mixed_precision: bool = True,
+        tf_preprocess_fn: Callable = None,
+    ):
         """
-        Training pipeline that prefers GPU usage. Adds per-epoch elapsed + ETA logging for each model.
-        Minimally modifies original logic; supports fallback to manual eager loop if generator-backed
-        Dataset cannot be serialized.
+        Training pipeline that prefers GPU usage, while keeping the generator-backed input pipeline.
+        Adds per-epoch elapsed/ETA logging per model, and falls back to an eager manual loop only
+        if graph-mode fit fails due to generator serialization.
         """
         import csv as _csv
         import sys as _sys
@@ -4472,7 +4478,349 @@ Notes:
         import os as _os
         import random as _random
 
-        # --- early GPU setup: memory growth + mixed precision ---
+        def _format_seconds(s):
+            try:
+                s = int(max(0, float(s)))
+            except Exception:
+                return "n/a"
+            hh = s // 3600
+            mm = (s % 3600) // 60
+            ss = s % 60
+            if hh > 0:
+                return f"{hh}h{mm:02d}m{ss:02d}s"
+            if mm > 0:
+                return f"{mm}m{ss:02d}s"
+            return f"{ss}s"
+
+        def _log_history_metrics_to_mlflow(history_obj, model_key_local):
+            try:
+                history_dict = {}
+                if isinstance(history_obj, dict):
+                    history_dict = history_obj
+                elif hasattr(history_obj, "history"):
+                    history_dict = history_obj.history or {}
+
+                if not history_dict:
+                    return 0
+
+                n_epochs_total_local = 0
+                for values in history_dict.values():
+                    try:
+                        n_epochs_total_local = max(n_epochs_total_local, len(values))
+                    except Exception:
+                        pass
+
+                for epoch_idx_local in range(n_epochs_total_local):
+                    for metric_name_local, values_local in history_dict.items():
+                        try:
+                            if epoch_idx_local < len(values_local):
+                                metric_value = values_local[epoch_idx_local]
+                                if metric_value is not None:
+                                    mlflow.log_metric(
+                                        metric_name_local,
+                                        float(metric_value),
+                                        step=int(epoch_idx_local + 1),
+                                    )
+                        except Exception:
+                            pass
+
+                metrics_csv_local = os.path.join(out_dir, f"{model_key_local}_metrics_per_epoch.csv")
+                try:
+                    with open(metrics_csv_local, "w", newline="") as fh:
+                        writer = _csv.writer(fh)
+                        header = ["epoch"] + list(history_dict.keys())
+                        writer.writerow(header)
+                        for e_local in range(n_epochs_total_local):
+                            row = [e_local + 1]
+                            for k_local in history_dict.keys():
+                                vals_local = history_dict.get(k_local, [])
+                                row.append(vals_local[e_local] if e_local < len(vals_local) else "")
+                            writer.writerow(row)
+                    try:
+                        mlflow.log_artifact(metrics_csv_local, artifact_path="metrics")
+                        logger and logger.info("Logged per-epoch metrics CSV to MLflow: %s", metrics_csv_local)
+                    except Exception:
+                        logger and logger.debug("Couldn't log per-epoch metrics CSV to MLflow.")
+                except Exception:
+                    logger and logger.exception("Failed writing per-epoch metrics CSV.")
+                return n_epochs_total_local
+            except Exception:
+                logger and logger.exception("Failed logging history metrics to MLflow.")
+                return 0
+
+        def _build_mlflow_input_example(model_obj):
+            try:
+                model_inputs_local = list(getattr(model_obj, "inputs", []) or [])
+                if len(model_inputs_local) <= 1:
+                    return np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
+
+                example_local = {}
+                for inp_local in model_inputs_local:
+                    try:
+                        input_name_local = str(getattr(inp_local, "name", "input")).split(":")[0]
+                    except Exception:
+                        input_name_local = "input"
+
+                    if "image" in input_name_local.lower():
+                        example_local[input_name_local] = np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
+                    else:
+                        matched_col_local = None
+                        for col_local in aux_columns:
+                            if col_local in input_name_local:
+                                matched_col_local = col_local
+                                break
+                        L_local = int(aux_col_lengths.get(matched_col_local, 0) or 0) if matched_col_local else 0
+                        example_local[input_name_local] = np.zeros((1, L_local), dtype=np.float32)
+                return example_local
+            except Exception:
+                return np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
+
+
+        def _save_model_architecture_artifacts(model_obj, model_key_local, out_dir_local):
+            """
+            Save a model diagram PNG and a plain-text model.summary() artifact.
+            Falls back to a text-rendered PNG when tensorflow's plot_model backend
+            is unavailable (e.g., missing pydot/graphviz).
+            """
+            import os
+            import io
+            import re as _re
+            import textwrap as _textwrap
+
+            artifact_dir_local = os.path.join(out_dir_local, "model_architecture")
+            os.makedirs(artifact_dir_local, exist_ok=True)
+
+            summary_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_summary.txt")
+            diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_diagram.png")
+
+            # Save the textual summary first.
+            try:
+                with open(summary_path_local, "w", encoding="utf-8") as fh:
+                    model_obj.summary(print_fn=lambda s: fh.write(s + "\n"))
+            except Exception as e_sum:
+                with open(summary_path_local, "w", encoding="utf-8") as fh:
+                    fh.write(f"Could not generate model.summary(): {e_sum}\n")
+
+            # Try the native TensorFlow diagram path.
+            diagram_saved = False
+            try:
+                from tensorflow.keras.utils import plot_model as _plot_model
+
+                _plot_model(
+                    model_obj,
+                    to_file=diagram_path_local,
+                    show_shapes=True,
+                    show_layer_names=True,
+                    expand_nested=True,
+                    dpi=400,
+                )
+                diagram_saved = True
+            except Exception as e_plot:
+                logger and logger.warning(
+                    "Could not save model diagram artifact for %s with plot_model: %s",
+                    model_key_local,
+                    str(e_plot),
+                )
+
+            # Fallback: render the summary text into a PNG so a diagram artifact always exists.
+            if not diagram_saved:
+                try:
+                    import matplotlib.pyplot as _plt
+
+                    fig = _plt.figure(figsize=(12, 0.35 * max(12, len(open(summary_path_local, encoding="utf-8").read().splitlines()))))
+                    _plt.axis("off")
+                    with open(summary_path_local, "r", encoding="utf-8") as fh:
+                        summary_text_local = fh.read()
+
+                    # keep the PNG reasonably compact
+                    summary_text_local = "\n".join(summary_text_local.splitlines()[:250])
+                    summary_text_local = _textwrap.shorten(summary_text_local, width=12000, placeholder="\n...[truncated]...")
+                    _plt.text(
+                        0.01,
+                        0.99,
+                        summary_text_local,
+                        va="top",
+                        ha="left",
+                        family="monospace",
+                        fontsize=8,
+                    )
+                    _plt.savefig(diagram_path_local, bbox_inches="tight")
+                    _plt.close(fig)
+                    diagram_saved = True
+                except Exception as e_fallback:
+                    # As a last resort, create a small text file with the same name so logging does not break.
+                    with open(diagram_path_local.replace(".png", ".txt"), "w", encoding="utf-8") as fh:
+                        fh.write(f"Could not render diagram PNG for {model_key_local}: {e_fallback}\n")
+
+            # Log both artifacts to MLflow.
+            try:
+                mlflow.log_artifact(summary_path_local, artifact_path="model_architecture")
+            except Exception:
+                logger and logger.exception("Failed logging model summary artifact for %s.", model_key_local)
+            try:
+                mlflow.log_artifact(diagram_path_local, artifact_path="model_architecture")
+            except Exception:
+                logger and logger.exception("Failed logging model diagram artifact for %s.", model_key_local)
+
+            return {
+                "summary": summary_path_local,
+                "diagram": diagram_path_local,
+                "artifact_dir": artifact_dir_local,
+            }
+
+        def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str):
+            import json
+            import os
+            import shutil
+            import tempfile
+            import sys as _sys
+            import yaml as _yaml
+
+            # 1) Try the normal MLflow Keras path first.
+            try:
+                mlflow.keras.log_model(model, artifact_path="model")
+                logger.info("Logged Keras model to MLflow using the standard Keras path for %s.", model_key)
+                return {"mode": "mlflow.keras.log_model", "artifact_path": "model"}
+            except Exception as e1:
+                logger.warning(
+                    "Primary MLflow Keras logging failed for %s; trying MLflow TensorFlow/SavedModel fallback. Error: %s",
+                    model_key,
+                    e1,
+                )
+
+            # 2) Build a full MLflow model directory manually around a raw SavedModel export.
+            #    This avoids Keras serialization/deepcopy issues while still creating MLflow
+            #    metadata files (MLmodel, conda.yaml, python_env.yaml, requirements.txt).
+            tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
+            data_model_dir = os.path.join(tmp_model_dir, "data", "model")
+            os.makedirs(data_model_dir, exist_ok=True)
+
+            try:
+                # Raw TensorFlow export (works even when Keras save/log_model fails).
+                tf.saved_model.save(model, data_model_dir)
+
+                # MLflow metadata
+                try:
+                    from mlflow.models import Model as _MlflowModel
+                except Exception:
+                    from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
+
+                mlflow_model = _MlflowModel()
+                mlflow_model.add_flavor(
+                    "tensorflow",
+                    saved_model_dir=os.path.join("data", "model"),
+                    model_type="tf2-module",
+                )
+
+                try:
+                    mlflow.pyfunc.add_to_model(
+                        mlflow_model,
+                        loader_module="mlflow.tensorflow",
+                        conda_env="conda.yaml",
+                        python_env="python_env.yaml",
+                    )
+                except Exception:
+                    # Keep the MLflow model valid even if pyfunc metadata helper changes.
+                    pass
+
+                mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
+
+                # Environment files
+                try:
+                    conda_env = mlflow.tensorflow.get_default_conda_env()
+                except Exception:
+                    conda_env = {
+                        "name": "mlflow-env",
+                        "channels": ["conda-forge"],
+                        "dependencies": [
+                            f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                            {"pip": [f"tensorflow=={tf.__version__}"]},
+                        ],
+                    }
+
+                try:
+                    pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
+                except Exception:
+                    pip_reqs = [f"tensorflow=={tf.__version__}"]
+
+                with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
+                    _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
+
+                with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(pip_reqs) + "\n")
+
+                # Best-effort python_env.yaml that matches the MLflow layout.
+                try:
+                    import importlib.metadata as _importlib_metadata
+                    pip_ver = _importlib_metadata.version("pip")
+                    setuptools_ver = _importlib_metadata.version("setuptools")
+                    wheel_ver = _importlib_metadata.version("wheel")
+                except Exception:
+                    pip_ver = "unknown"
+                    setuptools_ver = "unknown"
+                    wheel_ver = "unknown"
+
+                python_env_payload = {
+                    "python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                    "build_dependencies": [
+                        f"pip=={pip_ver}",
+                        f"setuptools=={setuptools_ver}",
+                        f"wheel=={wheel_ver}",
+                    ],
+                    "dependencies": ["-r requirements.txt"],
+                }
+                with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
+                    _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
+
+                manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "model_key": model_key,
+                            "export_mode": "tf.saved_model.save",
+                            "artifact_path": "model",
+                            "mlflow_dir": True,
+                        },
+                        fh,
+                        indent=2,
+                    )
+
+                mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
+                logger.info(
+                    "Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.",
+                    model_key,
+                )
+                return {
+                    "mode": "tf.saved_model.save + mlflow_model_dir",
+                    "artifact_path": "model",
+                    "registered_model_ready": True,
+                }
+
+            except Exception as e2:
+                logger.exception("TensorFlow/MLflow export failed for %s", model_key)
+
+                # 3) Last-resort fallback: keep the core artifacts so nothing is lost.
+                try:
+                    weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
+                    model.save_weights(weights_path)
+
+                    summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
+                    with open(summary_path, "w", encoding="utf-8") as fh:
+                        model.summary(print_fn=lambda s: fh.write(s + "\n"))
+
+                    mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
+                    logger.warning("Saved weights + summary fallback artifact for %s.", model_key)
+                    return {
+                        "mode": "weights_and_summary",
+                        "artifact_path": f"fallback_{model_key}",
+                        "error": str(e2),
+                    }
+                except Exception as e3:
+                    logger.exception("Final fallback also failed for %s", model_key)
+                    return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
+            finally:
+                shutil.rmtree(tmp_model_dir, ignore_errors=True)
+        # --- early GPU setup ---
         gpu_available = False
         try:
             gpus = tf.config.experimental.list_physical_devices("GPU")
@@ -4549,20 +4897,6 @@ Notes:
             except Exception:
                 pass
             return None
-
-        def _format_seconds(s):
-            try:
-                s = int(max(0, float(s)))
-            except Exception:
-                return "n/a"
-            hh = s // 3600
-            mm = (s % 3600) // 60
-            ss = s % 60
-            if hh > 0:
-                return f"{hh}h{mm:02d}m{ss:02d}s"
-            if mm > 0:
-                return f"{mm}m{ss:02d}s"
-            return f"{ss}s"
 
         for idx, fpath in enumerate(csv_files):
             try:
@@ -4690,12 +5024,7 @@ Notes:
         if len(labels_list) == 0:
             return {"error": "No usable rows found in CSV files after first pass."}
 
-        logger and logger.info(
-            "First pass done: total_rows=%d, usable=%d, skipped=%d",
-            total_rows,
-            len(labels_list),
-            skipped_rows,
-        )
+        logger and logger.info("First pass done: total_rows=%d, usable=%d, skipped=%d", total_rows, len(labels_list), skipped_rows)
         logger and logger.info("Detected image shapes (sample): %s", shapes_set)
         logger and logger.info("aux_col_lengths: %s", aux_col_lengths)
         logger and logger.info("aux_max: %s", aux_max)
@@ -4810,13 +5139,13 @@ Notes:
             errors = []
             try:
                 try:
-                    out = base_tensorflow_model([img_dummy] + aux_dummies)
+                    _ = base_tensorflow_model([img_dummy] + aux_dummies)
                     base_integration_success = True
                     integration_mode = "all_inputs"
                 except Exception as e_a:
                     errors.append(("pattern_all_inputs", str(e_a)))
                     try:
-                        out = base_tensorflow_model(img_dummy)
+                        _ = base_tensorflow_model(img_dummy)
                         base_integration_success = True
                         integration_mode = "image_only"
                     except Exception as e_b:
@@ -4839,9 +5168,12 @@ Notes:
                 logger and logger.error(msg)
                 raise ValueError(msg)
             else:
-                logger and logger.info("base_tensorflow_model '%s' integrated successfully using mode=%s", str(base_model_name), integration_mode)
+                logger and logger.info(
+                    "base_tensorflow_model '%s' integrated successfully using mode=%s",
+                    str(base_model_name),
+                    integration_mode,
+                )
 
-        # ---------- BUILD DATASETS (attempt device-prefetch) ----------
         train_ds, train_prefetched_to_device = TrainModelService._build_tf_dataset_from_matrix_column_streaming(
             csv_files=csv_files,
             index_set=train_global_idx,
@@ -4872,71 +5204,42 @@ Notes:
             use_aux_inputs=use_aux_inputs,
         )
 
-        # ---------- Epoch timing callback (used for Keras fit path and manual loop logging) ----------
-        class EpochTimingCallback(tf.keras.callbacks.Callback):
-            def __init__(self, total_epochs: int, model_key: str):
-                super().__init__()
-                self.total_epochs = int(total_epochs)
-                self.model_key = model_key
-                self.start_time = None
-                self.completed_epochs = 0  # total epochs completed so far (across phase1+phase2)
-                self.last_epoch_start = None
+        # Optional check: log whether sample batches appear to land on GPU
+        def _sample_dataset_devices(ds, n_samples=3):
+            observed = set()
+            try:
+                it = iter(ds)
+                for _ in range(n_samples):
+                    try:
+                        batch = next(it)
+                    except Exception:
+                        break
 
-            def on_train_begin(self, logs=None):
-                # called once at the start of the first fit() that uses this callback
-                if self.start_time is None:
-                    self.start_time = _time.time()
-                self.last_epoch_start = _time.time()
+                    elems = batch if isinstance(batch, (list, tuple)) else (batch,)
 
-            def on_epoch_begin(self, epoch, logs=None):
-                self.last_epoch_start = _time.time()
+                    def _collect_devices(x):
+                        devs = set()
+                        if isinstance(x, (list, tuple)):
+                            for y in x:
+                                devs |= _collect_devices(y)
+                        else:
+                            try:
+                                d = getattr(x, "device", None)
+                                if d:
+                                    devs.add(d)
+                                else:
+                                    devs.add("host:CPU")
+                            except Exception:
+                                devs.add("host:CPU")
+                        return devs
 
-            def on_epoch_end(self, epoch, logs=None):
-                # epoch index is relative to current fit() call; we track completed_epochs as absolute count
-                self.completed_epochs += 1
-                now = _time.time()
-                elapsed = now - (self.start_time or now)
-                # average epoch duration so far (use completed_epochs to avoid division by zero)
-                avg = elapsed / max(1, self.completed_epochs)
-                remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
-                try:
-                    logger and logger.info(
-                        "Model '%s' epoch %d/%d finished. elapsed=%s avg_epoch=%s eta_total=%s",
-                        self.model_key,
-                        self.completed_epochs,
-                        self.total_epochs,
-                        _format_seconds(elapsed),
-                        _format_seconds(avg),
-                        _format_seconds(remaining),
-                    )
-                except Exception:
-                    pass
+                    for el in elems:
+                        observed |= _collect_devices(el)
+            except Exception:
+                pass
+            return observed
 
-            # allow manual loop to notify the callback after each epoch
-            def manual_epoch_end(self):
-                self.completed_epochs += 1
-                now = _time.time()
-                elapsed = now - (self.start_time or now)
-                avg = elapsed / max(1, self.completed_epochs)
-                remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
-                try:
-                    logger and logger.info(
-                        "Model '%s' manual epoch %d/%d finished. elapsed=%s avg_epoch=%s eta_total=%s",
-                        self.model_key,
-                        self.completed_epochs,
-                        self.total_epochs,
-                        _format_seconds(elapsed),
-                        _format_seconds(avg),
-                        _format_seconds(remaining),
-                    )
-                except Exception:
-                    pass
-
-            def set_completed(self, n):
-                # used when part of epochs already ran via Keras fit; set completed count
-                self.completed_epochs = int(n)
-
-        # build preprocess layer for inside-model preprocessing (unchanged)
+        # build preprocess layer for inside-model preprocessing
         def _make_preprocess_layer(pre_fn):
             if pre_fn is None:
                 return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
@@ -4962,6 +5265,7 @@ Notes:
         # iterate models and build/compile inside device strategy scope if GPU available
         results = {}
         iter_items = (models_dict.items() if models_dict else [("custom", None)])
+
         try:
             strategy = None
             if gpu_available:
@@ -4986,14 +5290,7 @@ Notes:
                 per_model_pre_fn = TrainModelService._get_preprocess_fn_for_model(model_key)
                 preprocess_layer = _make_preprocess_layer(per_model_pre_fn)
 
-                # Build model inside strategy scope if possible (ensures variables/op placement on GPU).
-                if strategy is not None:
-                    scope_ctx = strategy.scope()
-                else:
-                    scope_ctx = tf.device("/CPU:0")
-
-                with scope_ctx:
-                    # Build model (same structure as before)
+                with strategy.scope() if strategy is not None else tf.device("/CPU:0"):
                     image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
                     image_preprocessed = preprocess_layer(image_input)
 
@@ -5070,19 +5367,16 @@ Notes:
                         outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(x)
                         model = tf.keras.Model(inputs=image_input, outputs=outputs, name=f"{model_key}_full")
 
-                    # Warmup freeze
+                    # Keep head trainable, freeze backbone only for warmup
                     try:
                         if chosen_base is not None and base_integration_success:
                             chosen_base.trainable = False
                             logger and logger.info("Frozen chosen_base for warmup (phase 1) for model %s", model_key)
                         elif used_internal_backbone:
-                            try:
-                                internal_conv1.trainable = False
-                                internal_conv2.trainable = False
-                                internal_conv3.trainable = False
-                                logger and logger.info("Frozen internal backbone conv layers for warmup (phase 1) for model %s", model_key)
-                            except Exception:
-                                logger and logger.debug("Could not freeze internal backbone layers cleanly for model %s", model_key)
+                            internal_conv1.trainable = False
+                            internal_conv2.trainable = False
+                            internal_conv3.trainable = False
+                            logger and logger.info("Frozen internal backbone conv layers for warmup (phase 1) for model %s", model_key)
                     except Exception:
                         logger and logger.debug("Could not set backbone trainable flags for warmup for model %s", model_key)
 
@@ -5104,14 +5398,20 @@ Notes:
                     # compile inside strategy scope (ensures optimizer vars on GPU)
                     try:
                         opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-                        model.compile(optimizer=opt,
-                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
-                                    run_eagerly=False)
+                        model.compile(
+                            optimizer=opt,
+                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                            run_eagerly=False,
+                            jit_compile=bool(gpu_available),
+                            steps_per_execution=16 if gpu_available else 1,
+                        )
                     except Exception:
-                        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()])
+                        model.compile(
+                            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                        )
 
                 # prepare callbacks for the normal fit path (kept)
                 cb = callbacks_list[:] if callbacks_list else []
@@ -5125,6 +5425,85 @@ Notes:
 
                 # add our epoch-timing callback (total epochs = warmup + fine-tune)
                 total_epochs_for_model = int(warmup_epochs) + int(epochs)
+
+                class EpochTimingCallback(tf.keras.callbacks.Callback):
+                    def __init__(self, total_epochs: int, model_key: str):
+                        super().__init__()
+                        self.total_epochs = int(total_epochs)
+                        self.model_key = model_key
+                        self.start_time = None
+                        self.completed_epochs = 0
+
+                    def on_train_begin(self, logs=None):
+                        if self.start_time is None:
+                            self.start_time = _time.time()
+                        logger and logger.info("------------------------------------------------------------")
+                        logger and logger.info("********** Training started for model '%s' **********", self.model_key)
+                        logger and logger.info("------------------------------------------------------------")
+
+                    def on_epoch_end(self, epoch, logs=None):
+                        self.completed_epochs += 1
+                        now = _time.time()
+                        elapsed = now - (self.start_time or now)
+                        avg = elapsed / max(1, self.completed_epochs)
+                        remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
+
+                        loss_value = None
+                        acc_value = None
+                        val_loss_value = None
+                        val_acc_value = None
+                        if isinstance(logs, dict):
+                            loss_value = logs.get("loss", None)
+                            acc_value = logs.get("sparse_categorical_accuracy", logs.get("accuracy", None))
+                            val_loss_value = logs.get("val_loss", None)
+                            val_acc_value = logs.get("val_sparse_categorical_accuracy", logs.get("val_accuracy", None))
+
+                        logger and logger.info("------------------------------------------------------------")
+                        logger and logger.info("********** Model '%s' epoch %d/%d finished **********", self.model_key, self.completed_epochs, self.total_epochs)
+                        logger and logger.info("loss: %s | sparse_categorical_accuracy: %s | val_loss: %s | val_sparse_categorical_accuracy: %s",
+                                            ("n/a" if loss_value is None else f"{float(loss_value):.6f}"),
+                                            ("n/a" if acc_value is None else f"{float(acc_value):.6f}"),
+                                            ("n/a" if val_loss_value is None else f"{float(val_loss_value):.6f}"),
+                                            ("n/a" if val_acc_value is None else f"{float(val_acc_value):.6f}"))
+                        logger and logger.info("elapsed=%s | avg_epoch=%s | eta_total=%s",
+                                            _format_seconds(elapsed),
+                                            _format_seconds(avg),
+                                            _format_seconds(remaining))
+                        logger and logger.info("------------------------------------------------------------")
+
+                    def manual_epoch_end(self, logs=None):
+                        self.completed_epochs += 1
+                        now = _time.time()
+                        elapsed = now - (self.start_time or now)
+                        avg = elapsed / max(1, self.completed_epochs)
+                        remaining = max(0.0, (self.total_epochs - self.completed_epochs) * avg)
+
+                        loss_value = None
+                        acc_value = None
+                        val_loss_value = None
+                        val_acc_value = None
+                        if isinstance(logs, dict):
+                            loss_value = logs.get("loss", None)
+                            acc_value = logs.get("sparse_categorical_accuracy", logs.get("accuracy", None))
+                            val_loss_value = logs.get("val_loss", None)
+                            val_acc_value = logs.get("val_sparse_categorical_accuracy", logs.get("val_accuracy", None))
+
+                        logger and logger.info("------------------------------------------------------------")
+                        logger and logger.info("********** Model '%s' manual epoch %d/%d finished **********", self.model_key, self.completed_epochs, self.total_epochs)
+                        logger and logger.info("loss: %s | sparse_categorical_accuracy: %s | val_loss: %s | val_sparse_categorical_accuracy: %s",
+                                            ("n/a" if loss_value is None else f"{float(loss_value):.6f}"),
+                                            ("n/a" if acc_value is None else f"{float(acc_value):.6f}"),
+                                            ("n/a" if val_loss_value is None else f"{float(val_loss_value):.6f}"),
+                                            ("n/a" if val_acc_value is None else f"{float(val_acc_value):.6f}"))
+                        logger and logger.info("elapsed=%s | avg_epoch=%s | eta_total=%s",
+                                            _format_seconds(elapsed),
+                                            _format_seconds(avg),
+                                            _format_seconds(remaining))
+                        logger and logger.info("------------------------------------------------------------")
+
+                    def set_completed(self, n):
+                        self.completed_epochs = int(n)
+
                 timing_cb = EpochTimingCallback(total_epochs=total_epochs_for_model, model_key=model_key)
                 cb.append(timing_cb)
 
@@ -5132,17 +5511,22 @@ Notes:
                 try:
                     observed_train_devices = _sample_dataset_devices(train_ds, n_samples=4)
                     observed_test_devices = _sample_dataset_devices(test_ds, n_samples=2)
-                    def _norm(devset):
-                        return {str(d) for d in devset}
-                    observed_train_devices_n = _norm(observed_train_devices)
-                    observed_test_devices_n = _norm(observed_test_devices)
+                    observed_train_devices_n = {str(d) for d in observed_train_devices}
+                    observed_test_devices_n = {str(d) for d in observed_test_devices}
                     found_gpu_on_train = any(("GPU" in d or "gpu" in d or "/device:GPU" in d) for d in observed_train_devices_n)
                     found_gpu_on_test = any(("GPU" in d or "gpu" in d or "/device:GPU" in d) for d in observed_test_devices_n)
-                    logger and logger.info("Dataset placement check for train_ds: observed devices: %s ; gpu_available=%s ; found_gpu=%s",
-                                        observed_train_devices_n, gpu_available, found_gpu_on_train)
-                    if not found_gpu_on_train and gpu_available:
+                    logger and logger.info(
+                        "Dataset placement check for train_ds: observed devices: %s ; gpu_available=%s ; found_gpu=%s",
+                        observed_train_devices_n, gpu_available, found_gpu_on_train
+                    )
+                    logger and logger.info(
+                        "Dataset placement check for test_ds: observed devices: %s ; gpu_available=%s ; found_gpu=%s",
+                        observed_test_devices_n, gpu_available, found_gpu_on_test
+                    )
+                    if gpu_available and not found_gpu_on_train:
                         logger and logger.warning(
-                            "GPU(s) present but sample batches from train_ds were NOT observed on GPU. Possible reasons: dataset not serializable for device prefetch, mapping uses numpy_function (CPU), or prefetch_to_device failed."
+                            "GPU(s) present but sample batches from train_ds were NOT observed on GPU. "
+                            "Possible reasons: generator-backed dataset, numpy_function in preprocessing, or device prefetch not supported."
                         )
                 except Exception:
                     pass
@@ -5166,14 +5550,23 @@ Notes:
                     history_phase2 = None
 
                     try:
-                        logger.info("Starting phase 1 WARMUP training (head-only) for model %s (warmup_epochs=%d)", model_key, warmup_epochs)
-                        history_phase1 = model.fit(train_ds, epochs=int(warmup_epochs), validation_data=test_ds, callbacks=cb, verbose=1)
+                        logger.info(
+                            "Starting phase 1 WARMUP training (head-only) for model %s (warmup_epochs=%d)",
+                            model_key, warmup_epochs
+                        )
+                        history_phase1 = model.fit(
+                            train_ds,
+                            epochs=int(warmup_epochs),
+                            validation_data=test_ds,
+                            callbacks=cb,
+                            verbose=1,
+                        )
                     except Exception as e_fit:
                         msg = str(e_fit)
                         logger and logger.warning("Dataset or fit raised exception: %s", msg)
                         if "GeneratorDatasetOp::Dataset does not support serialization" in msg or "Failed to serialize the input pipeline graph" in msg:
                             logger and logger.warning(
-                                "Dataset serialization error during model.fit: %s. Will fallback to manual eager training loop (avoids serializing generator-backed dataset).",
+                                "Dataset serialization error during model.fit: %s. Will fallback to manual eager training loop.",
                                 msg,
                             )
                             use_manual_loop = True
@@ -5186,12 +5579,8 @@ Notes:
                             num_done = 0
                             if hasattr(history_phase1, "history"):
                                 num_done = len(next(iter(history_phase1.history.values()))) if history_phase1.history else 0
-                            else:
-                                # in case history_phase1 is a dict (manual emulation elsewhere), attempt dictionary length
-                                try:
-                                    num_done = len(history_phase1.get("loss", [])) if isinstance(history_phase1, dict) else 0
-                                except Exception:
-                                    num_done = 0
+                            elif isinstance(history_phase1, dict):
+                                num_done = len(history_phase1.get("loss", []))
                             if num_done:
                                 timing_cb.set_completed(num_done)
                         except Exception:
@@ -5221,17 +5610,32 @@ Notes:
                             # recompile with lower lr
                             try:
                                 opt2 = tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1)
-                                model.compile(optimizer=opt2,
-                                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
-                                            run_eagerly=False)
+                                model.compile(
+                                    optimizer=opt2,
+                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                                    run_eagerly=False,
+                                    jit_compile=bool(gpu_available),
+                                    steps_per_execution=16 if gpu_available else 1,
+                                )
                             except Exception:
-                                model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
-                                            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                                            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()])
+                                model.compile(
+                                    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
+                                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                                    metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
+                                )
 
-                            logger.info("Starting phase 2 FINE-TUNING training (all layers trainable) for model %s (epochs=%d)", model_key, epochs)
-                            history_phase2 = model.fit(train_ds, epochs=int(epochs), validation_data=test_ds, callbacks=cb, verbose=1)
+                            logger.info(
+                                "Starting phase 2 FINE-TUNING training (all layers trainable) for model %s (epochs=%d)",
+                                model_key, epochs
+                            )
+                            history_phase2 = model.fit(
+                                train_ds,
+                                epochs=int(epochs),
+                                validation_data=test_ds,
+                                callbacks=cb,
+                                verbose=1,
+                            )
                         except Exception as e2:
                             if "GeneratorDatasetOp::Dataset does not support serialization" in str(e2) or "Failed to serialize the input pipeline graph" in str(e2):
                                 logger and logger.warning("Phase2 fit serialization error: %s. Falling back to manual loop.", str(e2))
@@ -5242,7 +5646,10 @@ Notes:
                     # If we decided to use a manual training loop (due to serialization problems),
                     # use conservative manual training loop using GradientTape so model ops run on GPU.
                     if use_manual_loop:
-                        logger and logger.info("Using manual eager training loop for model %s (warmup_epochs=%d, phase2_epochs=%d).", model_key, warmup_epochs, epochs)
+                        logger and logger.info(
+                            "Using manual eager training loop for model %s (warmup_epochs=%d, phase2_epochs=%d).",
+                            model_key, warmup_epochs, epochs
+                        )
 
                         # Prepare optimizer/loss/metrics consistent with model.compile above
                         optimizer = model.optimizer if hasattr(model, "optimizer") else tf.keras.optimizers.Adam(learning_rate=learning_rate)
@@ -5263,12 +5670,12 @@ Notes:
                             pass
 
                         def _run_epoch_manual(ds, training=True, max_steps=None):
-                            """Run one epoch over ds in eager mode. Returns (loss, acc, steps)"""
-                            train_loss_metric.reset_states()
-                            train_acc_metric.reset_states()
-                            val_loss_metric.reset_states()
-                            val_acc_metric.reset_states()
+                            train_loss_metric.reset_state()
+                            train_acc_metric.reset_state()
+                            val_loss_metric.reset_state()
+                            val_acc_metric.reset_state()
                             steps = 0
+
                             for step, batch in enumerate(ds):
                                 # Accept both (inputs, labels) and ((img, aux1...), label)
                                 try:
@@ -5304,8 +5711,7 @@ Notes:
                                         try:
                                             if hasattr(optimizer, "get_scaled_loss"):
                                                 scaled_loss = optimizer.get_scaled_loss(loss_value)
-                                                scaled_vars = model.trainable_variables
-                                                scaled_grads = tape.gradient(scaled_loss, scaled_vars)
+                                                scaled_grads = tape.gradient(scaled_loss, model.trainable_variables)
                                                 grads = optimizer.get_unscaled_gradients(scaled_grads)
                                             else:
                                                 grads = tape.gradient(loss_value, model.trainable_variables)
@@ -5355,9 +5761,27 @@ Notes:
                             history_phase1["sparse_categorical_accuracy"].append(tr_acc)
                             history_phase1["val_loss"].append(val_loss)
                             history_phase1["val_sparse_categorical_accuracy"].append(val_acc)
+                            logger and logger.info(
+                                "Warmup epoch %d metrics for model %s -> train_loss=%.6f | train_acc=%.6f | val_loss=%.6f | val_acc=%.6f",
+                                epoch_idx + 1,
+                                model_key,
+                                tr_loss,
+                                tr_acc,
+                                val_loss,
+                                val_acc,
+                            )
+                            logger and logger.info(
+                                "Warmup epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)",
+                                epoch_idx + 1, model_key, tr_loss, val_loss
+                            )
                             # notify timing callback of manual epoch completion (it will log elapsed+ETA)
                             try:
-                                timing_cb.manual_epoch_end()
+                                timing_cb.manual_epoch_end(logs={
+                                    "loss": tr_loss,
+                                    "sparse_categorical_accuracy": tr_acc,
+                                    "val_loss": val_loss,
+                                    "val_sparse_categorical_accuracy": val_acc,
+                                })
                             except Exception:
                                 # fallback log
                                 logger and logger.info("Warmup epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)", epoch_idx + 1, model_key, tr_loss, val_loss)
@@ -5404,10 +5828,31 @@ Notes:
                             history_phase2["sparse_categorical_accuracy"].append(tr_acc)
                             history_phase2["val_loss"].append(val_loss)
                             history_phase2["val_sparse_categorical_accuracy"].append(val_acc)
+                            logger and logger.info(
+                                "Fine-tune epoch %d metrics for model %s -> train_loss=%.6f | train_acc=%.6f | val_loss=%.6f | val_acc=%.6f",
+                                epoch_idx + 1,
+                                model_key,
+                                tr_loss,
+                                tr_acc,
+                                val_loss,
+                                val_acc,
+                            )
+                            logger and logger.info(
+                                "Fine-tune epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)",
+                                epoch_idx + 1, model_key, tr_loss, val_loss
+                            )
                             try:
-                                timing_cb.manual_epoch_end()
+                                timing_cb.manual_epoch_end(logs={
+                                    "loss": tr_loss,
+                                    "sparse_categorical_accuracy": tr_acc,
+                                    "val_loss": val_loss,
+                                    "val_sparse_categorical_accuracy": val_acc,
+                                })
                             except Exception:
-                                logger and logger.info("Fine-tune epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)", epoch_idx + 1, model_key, tr_loss, val_loss)
+                                logger and logger.info(
+                                    "Fine-tune epoch %d completed for model %s (train_loss=%.4f val_loss=%.4f)",
+                                    epoch_idx + 1, model_key, tr_loss, val_loss
+                                )
 
                     # Merge histories (phase1 + phase2) into a single history structure
                     history = {}
@@ -5457,13 +5902,222 @@ Notes:
                         except Exception:
                             eval_res = [None]
 
+                    # Build predictions and detailed report for MLflow metrics/artifacts
+                    y_true = []
+                    y_pred = []
+                    try:
+                        for batch in test_ds:
+                            try:
+                                inputs_batch, labels_batch = batch
+                            except Exception:
+                                try:
+                                    inputs_batch, labels_batch = batch[0], batch[1]
+                                except Exception:
+                                    continue
+
+                            try:
+                                if isinstance(inputs_batch, dict):
+                                    preds = model(inputs_batch, training=False)
+                                elif isinstance(inputs_batch, (list, tuple)):
+                                    preds = model(list(inputs_batch), training=False)
+                                else:
+                                    preds = model(inputs_batch, training=False)
+                            except Exception:
+                                try:
+                                    preds = model.predict(inputs_batch, verbose=0)
+                                except Exception:
+                                    preds = model.predict(list(inputs_batch), verbose=0) if isinstance(inputs_batch, (list, tuple)) else model.predict(inputs_batch, verbose=0)
+
+                            try:
+                                preds_np = preds.numpy() if hasattr(preds, "numpy") else np.asarray(preds)
+                                pred_ints = np.argmax(preds_np, axis=1)
+                            except Exception:
+                                preds_np = np.asarray(preds)
+                                pred_ints = np.argmax(preds_np, axis=1)
+
+                            y_pred.extend(pred_ints.tolist())
+                            try:
+                                y_true.extend([int(x) for x in labels_batch.numpy().tolist()])
+                            except Exception:
+                                y_true.extend([int(x) for x in np.asarray(labels_batch).tolist()])
+                    except Exception:
+                        logger and logger.exception("Failed generating predictions for detailed metrics on %s", model_key)
+
+                    y_true = np.array(y_true, dtype=int) if len(y_true) else np.array([], dtype=int)
+                    y_pred = np.array(y_pred, dtype=int) if len(y_pred) else np.array([], dtype=int)
+
+                    try:
+                        y_true_names = le.inverse_transform(y_true) if y_true.size else np.array([], dtype=object)
+                        y_pred_names = le.inverse_transform(y_pred) if y_pred.size else np.array([], dtype=object)
+                        label_order = list(le.classes_)
+                    except Exception:
+                        y_true_names = [str(int(x)) for x in y_true.tolist()]
+                        y_pred_names = [str(int(x)) for x in y_pred.tolist()]
+                        label_order = list(map(str, sorted(set(y_true_names + y_pred_names)))) if (y_true_names or y_pred_names) else []
+
+                    try:
+                        report = TrainModelService.compute_metrics_from_predictions(y_true_names, y_pred_names, label_order)
+                    except Exception:
+                        try:
+                            cm = confusion_matrix(y_true, y_pred, labels=list(range(len(label_order))))
+                            precision, recall, f1, support = precision_recall_fscore_support(
+                                y_true,
+                                y_pred,
+                                labels=list(range(len(label_order))),
+                                zero_division=0,
+                            )
+                            per_class = {
+                                (label_order[i] if i < len(label_order) else str(i)): {
+                                    "precision": float(precision[i]) if i < len(precision) else 0.0,
+                                    "recall": float(recall[i]) if i < len(recall) else 0.0,
+                                    "f1-score": float(f1[i]) if i < len(f1) else 0.0,
+                                    "support": int(support[i]) if i < len(support) else 0,
+                                }
+                                for i in range(len(cm))
+                            }
+                            report = {
+                                "per_class": per_class,
+                                "macro_avg": {
+                                    "precision": float(np.mean(precision)) if precision.size else 0.0,
+                                    "recall": float(np.mean(recall)) if recall.size else 0.0,
+                                    "f1-score": float(np.mean(f1)) if f1.size else 0.0,
+                                },
+                                "accuracy": float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0,
+                                "confusion_matrix": cm.tolist(),
+                                "total_samples": int(len(y_true)),
+                                "labels": label_order,
+                            }
+                        except Exception:
+                            report = {
+                                "per_class": {},
+                                "macro_avg": {"precision": 0.0, "recall": 0.0, "f1-score": 0.0},
+                                "accuracy": 0.0,
+                                "confusion_matrix": [],
+                                "total_samples": int(len(y_true)),
+                                "labels": label_order,
+                            }
+
+                    # Log training / test metrics to MLflow
+                    try:
+                        _log_history_metrics_to_mlflow(history, model_key)
+
+                        if len(eval_res) >= 1 and eval_res[0] is not None:
+                            mlflow.log_metric("test_loss", float(eval_res[0]))
+                        if len(eval_res) >= 2 and eval_res[1] is not None:
+                            mlflow.log_metric("test_sparse_categorical_accuracy", float(eval_res[1]))
+
+                        mlflow.log_metric("test_accuracy", float(report.get("accuracy", 0.0)))
+                        mlflow.log_metric("test_macro_precision", float(report.get("macro_avg", {}).get("precision", 0.0)))
+                        mlflow.log_metric("test_macro_recall", float(report.get("macro_avg", {}).get("recall", 0.0)))
+                        mlflow.log_metric("test_macro_f1", float(report.get("macro_avg", {}).get("f1-score", 0.0)))
+                        mlflow.log_metric("test_total_samples", int(report.get("total_samples", 0)))
+
+                        for cname, cmets in (report.get("per_class") or {}).items():
+                            try:
+                                safe_cname = str(cname).replace(" ", "_")
+                                mlflow.log_metric(f"test_precision_{safe_cname}", float(cmets.get("precision", 0.0)))
+                                mlflow.log_metric(f"test_recall_{safe_cname}", float(cmets.get("recall", 0.0)))
+                                mlflow.log_metric(f"test_f1_{safe_cname}", float(cmets.get("f1-score", 0.0)))
+                                mlflow.log_metric(f"test_support_{safe_cname}", int(cmets.get("support", 0)))
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger and logger.exception("Failed logging MLflow metrics for %s", model_key)
+
+                    # Reintegrate the artifact logic: confusion matrix image, confusion matrix CSV, per-class CSV, and model signature
+                    cm_csv = os.path.join(out_dir, f"{model_key}_confusion_matrix.csv")
+                    per_class_csv = os.path.join(out_dir, f"{model_key}_per_class_metrics.csv")
+                    classes_meta = os.path.join(out_dir, f"{model_key}_class_names.txt")
+                    metrics_csv = os.path.join(out_dir, f"{model_key}_metrics_per_epoch.csv")
+
+                    try:
+                        cm_arr = np.array(report.get("confusion_matrix", []), dtype=int)
+                        with open(cm_csv, "w", newline="") as fh:
+                            writer = _csv.writer(fh)
+                            writer.writerow([""] + list(label_order))
+                            for i, row in enumerate(cm_arr):
+                                writer.writerow([label_order[i] if i < len(label_order) else str(i)] + list(row.tolist()))
+                        try:
+                            mlflow.log_artifact(cm_csv, artifact_path="confusion_matrix")
+                        except Exception:
+                            logger and logger.debug("Could not log confusion CSV to MLflow.")
+                    except Exception:
+                        logger and logger.exception("Failed writing/logging confusion CSV.")
+
+                    try:
+                        with open(per_class_csv, "w", newline="") as fh:
+                            writer = _csv.writer(fh)
+                            writer.writerow(["class_name", "precision", "recall", "f1", "support"])
+                            for cname, cmets in (report.get("per_class") or {}).items():
+                                writer.writerow([
+                                    cname,
+                                    float(cmets.get("precision", 0.0)),
+                                    float(cmets.get("recall", 0.0)),
+                                    float(cmets.get("f1-score", 0.0)),
+                                    int(cmets.get("support", 0)),
+                                ])
+                        try:
+                            mlflow.log_artifact(per_class_csv, artifact_path="per_class_metrics")
+                        except Exception:
+                            logger and logger.debug("Could not log per-class CSV to MLflow.")
+                    except Exception:
+                        logger and logger.exception("Failed writing/logging per-class CSV.")
+
+                    try:
+                        with open(classes_meta, "w") as fh:
+                            fh.write("\n".join(label_order))
+                        try:
+                            mlflow.log_artifact(classes_meta, artifact_path="metadata")
+                        except Exception:
+                            pass
+                    except Exception:
+                        logger and logger.debug("Failed saving class names file.")
+
+                    try:
+                        cm_paths = TrainModelService.plot_confusion_matrix_and_log_pandas_sklearn(report=report, artifact_dir=out_dir)
+                        logger and logger.info("Confusion matrix artifacts saved: %s", cm_paths)
+                    except Exception:
+                        logger and logger.exception("Failed plotting/logging confusion matrix via helper.")
+
+                    signature = None
+                    input_example = None
+
+                    try:
+                        mlflow.log_artifact(aux_meta_path, artifact_path="metadata")
+                        mlflow.log_artifact(metrics_csv, artifact_path="metrics")
+
+                        # Save architecture artifacts even if the model itself later fails to log.
+                        try:
+                            arch_paths = _save_model_architecture_artifacts(model, model_key, out_dir)
+                            logger.info("Saved model architecture artifacts for %s: %s", model_key, arch_paths)
+                        except Exception:
+                            logger and logger.exception("Could not save model architecture artifacts for %s.", model_key)
+
+                        log_result = _log_model_to_mlflow_resiliently(
+                            model=model,
+                            model_key=model_key,
+                            out_dir=out_dir,
+                        )
+                        logger.info("Model artifact logging result for %s: %s", model_key, log_result)
+                    except Exception:
+                        logger and logger.exception("Failed to log artifacts or model for %s", model_key)
+
                     # minimal packaging into results
                     results[model_key] = {
                         "history": history,
                         "eval": eval_res,
+                        "report": report,
+                        "confusion_matrix": np.array(report.get("confusion_matrix", []), dtype=int),
+                        "per_class_metrics": {
+                            "class_names": label_order,
+                            "precision": [float(report.get("per_class", {}).get(c, {}).get("precision", 0.0)) for c in label_order],
+                            "recall": [float(report.get("per_class", {}).get(c, {}).get("recall", 0.0)) for c in label_order],
+                            "f1": [float(report.get("per_class", {}).get(c, {}).get("f1-score", 0.0)) for c in label_order],
+                            "support": [int(report.get("per_class", {}).get(c, {}).get("support", 0)) for c in label_order],
+                        },
                     }
 
-                # cleanup model to free memory before next iteration
+                # no more training epochs after this model; keep the existing cleanup logic
                 try:
                     del model
                 except Exception:

@@ -1,17 +1,8 @@
 summary: "Endpoint for Image models training (All Behavior Types)"
 description: |
-  Trains **pretrained image models** to classify trajectory images among the behavior types (LOITERING, NORMAL, STOPPING, TRANSSHIPMENT).
+  Trains **a CSV file** that contains trajectory image data, SOG, COG and normalized timestamp arrays
+  to classify among the behavior types (LOITERING, NORMAL, STOPPING, TRANSSHIPMENT).
   Images are read from the CSV dataset (with extra feature arrays) which must follow the structure:
-
-  - image_resolution_224x224/
-
-    - LOITERING/
-
-    - NORMAL/
-
-    - STOPPING/
-
-    - TRANSSHIPMENT/
 
 tags:
 - "Train Machine Learning Models"
@@ -20,12 +11,20 @@ produces:
 parameters:
   - in: "body"
     name: "body"
-    description: "No request body required for this endpoint. The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
+    description: "Basic request body required for this endpoint (number of epochs and samples per label). The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
     required: false
     schema:
       type: "object"
-      properties: {}
-      example: {}
+      properties:
+        epochs:
+          type: integer
+          example: 12
+        per_label_n:
+          type: integer
+          example: 100
+        warmup_epochs:
+          type: integer
+          example: 3
 responses:
   200:
     description: |

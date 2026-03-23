@@ -428,14 +428,19 @@ def train_all_behavior_types_image_models_from_csv_controller():
         # Only allow these user-settable parameters
         #dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_320_rows_per_class")
         dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_100_rows_per_class")
+        epochs = data_request.get('epochs', 12)
         per_label_n = data_request.get('per_label_n', None)
+        warmup_epochs = data_request.get('warmup_epochs', 3)
         test_size = data_request.get('test_size', 0.2)
 
         # If you want to restrict allowed labels you can pass them here; by default TrainModelService will use the full set
         with current_app.app_context():
             result = TrainModelService.train_all_behavior_types_image_models_from_csv_separate_aux(
                 dataset_dir=dataset_dir,
-                models_dict=models_dict
+                models_dict=models_dict,
+                per_label_n=per_label_n,
+                epochs=epochs,
+                warmup_epochs=warmup_epochs
             )
 
             safe_result = TrainModelService.make_json_safe(result)

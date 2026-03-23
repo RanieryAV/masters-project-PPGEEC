@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libffi-dev \
     openjdk-21-jdk \
+    graphviz \
     cuda-nvcc-11-8 && \
     rm -rf /var/lib/apt/lists/*
 
