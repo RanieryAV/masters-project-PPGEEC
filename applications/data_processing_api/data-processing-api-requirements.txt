@@ -13,5 +13,3 @@ folium==0.17.0
 pyspark==3.5.1
 psutil
 pillow
-pydot
-graphviz

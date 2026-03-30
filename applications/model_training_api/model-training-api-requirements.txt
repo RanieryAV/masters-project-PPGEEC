@@ -15,3 +15,5 @@ pyspark==3.5.1
 numpy
 matplotlib
 seaborn
+pydot
+graphviz

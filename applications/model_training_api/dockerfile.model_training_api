@@ -29,9 +29,10 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 RUN ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # ----------------------------
-# CUDA environment variables
+# Graphviz & CUDA environment variables
 # ----------------------------
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV PATH="/usr/bin/graphviz:${PATH}"
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/graphviz:$LD_LIBRARY_PATH
 ENV CUDA_HOME=/usr/local/cuda
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility

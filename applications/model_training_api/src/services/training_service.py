@@ -4592,6 +4592,7 @@ Notes:
 
             summary_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_summary.txt")
             diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_diagram.png")
+            nested_diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_nested_model_diagram.png")
 
             # Save the textual summary first.
             try:
@@ -4611,9 +4612,19 @@ Notes:
                     to_file=diagram_path_local,
                     show_shapes=True,
                     show_layer_names=True,
+                    expand_nested=False,
+                    dpi=400,
+                )
+
+                _plot_model(
+                    model_obj,
+                    to_file=nested_diagram_path_local,
+                    show_shapes=True,
+                    show_layer_names=True,
                     expand_nested=True,
                     dpi=400,
                 )
+
                 diagram_saved = True
             except Exception as e_plot:
                 logger and logger.warning(
@@ -4661,10 +4672,15 @@ Notes:
                 mlflow.log_artifact(diagram_path_local, artifact_path="model_architecture")
             except Exception:
                 logger and logger.exception("Failed logging model diagram artifact for %s.", model_key_local)
+            try:
+                mlflow.log_artifact(nested_diagram_path_local, artifact_path="model_architecture")
+            except Exception:
+                logger and logger.exception("Failed logging nested model diagram artifact for %s.", model_key_local)
 
             return {
                 "summary": summary_path_local,
                 "diagram": diagram_path_local,
+                "nested_diagram": nested_diagram_path_local,
                 "artifact_dir": artifact_dir_local,
             }
 
@@ -5324,17 +5340,52 @@ Notes:
 
                     x = None
                     used_internal_backbone = False
+                    backbone_model = None
+
                     try:
                         if chosen_base is not None:
-                            if base_integration_success and integration_mode == "all_inputs":
+                            # Clone inside the active strategy scope so the variables belong to this scope.
+                            # This keeps the original tf.keras.applications architecture visible in
+                            # model.summary() / plot_model(expand_nested=True), and also avoids the
+                            # distribution-scope variable error.
+                            backbone_model = tf.keras.models.clone_model(chosen_base)
+                            try:
+                                backbone_model.set_weights(chosen_base.get_weights())
+                            except Exception:
+                                pass
+
+                            backbone_model._name = getattr(chosen_base, "name", f"{model_key}_backbone")
+                            backbone_model.trainable = True
+                            chosen_base = backbone_model  # keep later freeze/unfreeze logic working
+
+                            # For models_dict entries, always use the original pretrained backbone directly.
+                            # For a supplied custom base_tensorflow_model, keep the existing mode behavior.
+                            if base_tensorflow_model is None and iter_base is not None:
+                                x = chosen_base(image_preprocessed)
+                                base_integration_success = True
+                                integration_mode = "image_only"
+                            elif base_integration_success and integration_mode == "all_inputs":
                                 x = chosen_base([image_preprocessed] + aux_inputs)
                             elif base_integration_success and integration_mode == "image_only":
                                 x = chosen_base(image_preprocessed)
                             else:
-                                x = None
+                                x = chosen_base(image_preprocessed)
+                                base_integration_success = True
+                                integration_mode = "image_only"
+
+                            if hasattr(x, "shape") and len(x.shape) == 4:
+                                x = tf.keras.layers.GlobalAveragePooling2D(name=f"{model_key}_backbone_gap")(x)
+                        else:
+                            x = None
                     except Exception as e:
-                        logger and logger.exception("Error while calling chosen_base during model construction: %s", e)
-                        raise
+                        logger and logger.exception(
+                            "Error while building chosen_base inside strategy scope for model %s: %s",
+                            model_key,
+                            e,
+                        )
+                        x = None
+                        base_integration_success = False
+                        integration_mode = None
 
                     if x is None:
                         used_internal_backbone = True
@@ -5345,9 +5396,6 @@ Notes:
                         y = internal_conv3(y)
                         y = internal_gap(y)
                         x = tf.keras.layers.Dense(128, activation="relu", name="internal_head_dense")(y)
-
-                    if hasattr(x, "shape") and len(x.shape) == 4:
-                        x = tf.keras.layers.GlobalAveragePooling2D()(x)
 
                     head_dense1 = tf.keras.layers.Dense(256, activation="relu", name="head_dense1")
                     head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
