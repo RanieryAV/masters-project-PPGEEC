@@ -38,6 +38,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 ENV XLA_FLAGS=--xla_gpu_cuda_data_dir=/usr/local/cuda
+ENV TF_GPU_ALLOCATOR=cuda_malloc_async
 # ****************DEBUG ONLY************************
 # Force CPU training for TensorFlow to avoid potential GPU memory issues in a containerized environment
 #ENV CUDA_VISIBLE_DEVICES=""

@@ -33,7 +33,7 @@ models_dict = {
     #-------------------------------------------------------------------------------------------------------------------------------------
     # More model options for quick testing
     # 'resNet50_model': tf.keras.applications.ResNet50(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
-    'inceptionV3_model': tf.keras.applications.InceptionV3(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    # 'inceptionV3_model': tf.keras.applications.InceptionV3(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     # 'resNet101_model': tf.keras.applications.ResNet101(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #'resNet152_model': tf.keras.applications.ResNet152(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     # 'resNet50V2_model': tf.keras.applications.ResNet50V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
@@ -45,11 +45,11 @@ models_dict = {
     'denseNet169_model': tf.keras.applications.DenseNet169(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #'denseNet201_model': tf.keras.applications.DenseNet201(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'nasNetLarge_model': tf.keras.applications.NASNetLarge(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'nasNetLarge_model': tf.keras.applications.NASNetLarge(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
     #-------------------------------------------------------------------------------------------------------------------------------------
-    # 'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
 }
 
 training_bp = Blueprint('model_controller', __name__, url_prefix='/models')
