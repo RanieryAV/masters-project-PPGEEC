@@ -5310,32 +5310,74 @@ Notes:
                     image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
                     image_preprocessed = preprocess_layer(image_input)
 
-                    internal_conv1 = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same", name="internal_conv1")
+                    internal_conv1 = tf.keras.layers.Conv2D(32, 3, activation=None, use_bias=False, padding="same", name="internal_conv1")
+                    internal_bn1 = tf.keras.layers.BatchNormalization(name="internal_bn1")
+                    internal_act1 = tf.keras.layers.Activation("relu", name="internal_act1")
                     internal_pool1 = tf.keras.layers.MaxPool2D(name="internal_pool1")
-                    internal_conv2 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same", name="internal_conv2")
+
+                    internal_conv2 = tf.keras.layers.Conv2D(64, 3, activation=None, use_bias=False, padding="same", name="internal_conv2")
+                    internal_bn2 = tf.keras.layers.BatchNormalization(name="internal_bn2")
+                    internal_act2 = tf.keras.layers.Activation("relu", name="internal_act2")
                     internal_pool2 = tf.keras.layers.MaxPool2D(name="internal_pool2")
-                    internal_conv3 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same", name="internal_conv3")
+
+                    internal_conv3 = tf.keras.layers.Conv2D(128, 3, activation=None, use_bias=False, padding="same", name="internal_conv3")
+                    internal_bn3 = tf.keras.layers.BatchNormalization(name="internal_bn3")
+                    internal_act3 = tf.keras.layers.Activation("relu", name="internal_act3")
                     internal_gap = tf.keras.layers.GlobalAveragePooling2D(name="internal_gap")
+
+                    internal_head_dense = tf.keras.layers.Dense(128, activation=None, use_bias=False, name="internal_head_dense")
+                    internal_head_bn = tf.keras.layers.BatchNormalization(name="internal_head_bn")
+                    internal_head_act = tf.keras.layers.Activation("relu", name="internal_head_act")
 
                     aux_inputs = []
                     aux_processed = []
+                    aux_conv_layers = []
+                    aux_pool_layers = []
                     aux_dense_layers = []
                     aux_dropout_layers = []
+                    aux_norm_layers = []
+
                     if use_aux_inputs:
                         for col in aux_columns:
                             L = aux_col_lengths.get(col, 0)
                             if L <= 0:
                                 logger and logger.info("Skipping aux column %s because max length == 0", col)
                                 continue
+
                             inp = tf.keras.Input(shape=(L,), name=f"aux_{col}")
                             aux_inputs.append(inp)
-                            hidden_units = max(16, min(128, L * 2))
-                            aux_dense = tf.keras.layers.Dense(hidden_units, activation="relu", name=f"aux_dense_{col}")
-                            aux_drop = tf.keras.layers.Dropout(0.2, name=f"aux_drop_{col}")
-                            h = aux_dense(inp)
-                            h = aux_drop(h)
-                            aux_dense_layers.append(aux_dense)
-                            aux_dropout_layers.append(aux_drop)
+
+                            # dense_specs entries: (units, dropout_rate, dense_name, dropout_name)
+                            dense_specs = [
+                                (512, 0.2, f"aux_dense_{col}", f"aux_drop_{col}"),
+                                (256, 0.1, f"aux_dense2_{col}", f"aux_drop2_{col}"),
+                                (256, 0.1, f"aux_dense3_{col}", f"aux_drop3_{col}"),
+                                (64, None, f"aux_dense4_{col}", None),
+                            ]
+
+                            h = inp
+                            for units, dropout_rate, dense_name, drop_name in dense_specs:
+                                dense_layer = tf.keras.layers.Dense(
+                                    units,
+                                    activation=None,
+                                    use_bias=False,
+                                    name=dense_name,
+                                )
+                                bn_layer = tf.keras.layers.BatchNormalization(name=f"{dense_name}_bn")
+                                act_layer = tf.keras.layers.Activation("relu", name=f"{dense_name}_relu")
+
+                                h = dense_layer(h)
+                                h = bn_layer(h)
+                                h = act_layer(h)
+
+                                aux_dense_layers.append(dense_layer)
+                                aux_norm_layers.append(bn_layer)
+
+                                if dropout_rate is not None:
+                                    drop_layer = tf.keras.layers.Dropout(dropout_rate, name=drop_name)
+                                    h = drop_layer(h)
+                                    aux_dropout_layers.append(drop_layer)
+
                             aux_processed.append(h)
 
                     x = None
@@ -5390,28 +5432,62 @@ Notes:
                     if x is None:
                         used_internal_backbone = True
                         y = internal_conv1(image_preprocessed)
+                        y = internal_bn1(y)
+                        y = internal_act1(y)
                         y = internal_pool1(y)
-                        y = internal_conv2(y)
-                        y = internal_pool2(y)
-                        y = internal_conv3(y)
-                        y = internal_gap(y)
-                        x = tf.keras.layers.Dense(128, activation="relu", name="internal_head_dense")(y)
 
-                    head_dense1 = tf.keras.layers.Dense(256, activation="relu", name="head_dense1")
-                    head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
-                    x = head_dense1(x)
-                    x = head_drop1(x)
+                        y = internal_conv2(y)
+                        y = internal_bn2(y)
+                        y = internal_act2(y)
+                        y = internal_pool2(y)
+
+                        y = internal_conv3(y)
+                        y = internal_bn3(y)
+                        y = internal_act3(y)
+                        y = internal_gap(y)
+
+                        y = internal_head_dense(y)
+                        y = internal_head_bn(y)
+                        x = internal_head_act(y)
 
                     if aux_processed:
-                        merged_concat = tf.keras.layers.concatenate([x] + aux_processed, name="head_concat")
-                        head_dense2 = tf.keras.layers.Dense(128, activation="relu", name="head_dense2")
+                        # Clean fusion: all branches are 2D tensors here, so concatenation stays shape-safe.
+                        merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x] + aux_processed)
+
+                        head_dense1 = tf.keras.layers.Dense(256, activation=None, use_bias=False, name="head_dense1")
+                        head_bn1 = tf.keras.layers.BatchNormalization(name="head_bn1")
+                        head_act1 = tf.keras.layers.Activation("relu", name="head_act1")
+                        head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
+
+                        merged = head_dense1(merged_concat)
+                        merged = head_bn1(merged)
+                        merged = head_act1(merged)
+                        merged = head_drop1(merged)
+
+                        head_dense2 = tf.keras.layers.Dense(128, activation=None, use_bias=False, name="head_dense2")
+                        head_bn2 = tf.keras.layers.BatchNormalization(name="head_bn2")
+                        head_act2 = tf.keras.layers.Activation("relu", name="head_act2")
                         head_drop2 = tf.keras.layers.Dropout(0.3, name="head_drop2")
-                        merged = head_dense2(merged_concat)
+
+                        merged = head_dense2(merged)
+                        merged = head_bn2(merged)
+                        merged = head_act2(merged)
                         merged = head_drop2(merged)
+
                         outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
                         model_inputs = [image_input] + aux_inputs
                         model = tf.keras.Model(inputs=model_inputs, outputs=outputs, name=f"{model_key}_full")
                     else:
+                        head_dense1 = tf.keras.layers.Dense(256, activation=None, use_bias=False, name="head_dense1")
+                        head_bn1 = tf.keras.layers.BatchNormalization(name="head_bn1")
+                        head_act1 = tf.keras.layers.Activation("relu", name="head_act1")
+                        head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
+
+                        x = head_dense1(x)
+                        x = head_bn1(x)
+                        x = head_act1(x)
+                        x = head_drop1(x)
+
                         outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(x)
                         model = tf.keras.Model(inputs=image_input, outputs=outputs, name=f"{model_key}_full")
 
@@ -5422,8 +5498,11 @@ Notes:
                             logger and logger.info("Frozen chosen_base for warmup (phase 1) for model %s", model_key)
                         elif used_internal_backbone:
                             internal_conv1.trainable = False
+                            internal_bn1.trainable = False
                             internal_conv2.trainable = False
+                            internal_bn2.trainable = False
                             internal_conv3.trainable = False
+                            internal_bn3.trainable = False
                             logger and logger.info("Frozen internal backbone conv layers for warmup (phase 1) for model %s", model_key)
                     except Exception:
                         logger and logger.debug("Could not set backbone trainable flags for warmup for model %s", model_key)
@@ -5431,13 +5510,20 @@ Notes:
                     # ensure head layers trainable
                     try:
                         head_dense1.trainable = True
+                        head_bn1.trainable = True
                         head_drop1.trainable = True
                         if aux_processed:
                             head_dense2.trainable = True
+                            head_bn2.trainable = True
                             head_drop2.trainable = True
                         for a in aux_dense_layers:
                             try:
                                 a.trainable = True
+                            except Exception:
+                                pass
+                        for n in aux_norm_layers:
+                            try:
+                                n.trainable = True
                             except Exception:
                                 pass
                     except Exception:

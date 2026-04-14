@@ -14,22 +14,22 @@ models_dict = {
     #'mobileNetV3Small_model': tf.keras.applications.MobileNetV3Small(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'mobileNetV3Large_model': tf.keras.applications.MobileNetV3Large(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'mobileNetV3Large_model': tf.keras.applications.MobileNetV3Large(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'efficientNetB0_model': tf.keras.applications.EfficientNetB0(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
-    'efficientNetB1_model': tf.keras.applications.EfficientNetB1(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'efficientNetB0_model': tf.keras.applications.EfficientNetB0(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'efficientNetB1_model': tf.keras.applications.EfficientNetB1(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #'denseNet121_model': tf.keras.applications.DenseNet121(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'xception_model': tf.keras.applications.Xception(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'xception_model': tf.keras.applications.Xception(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #'vgg16_model': tf.keras.applications.VGG16(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'resNet152V2_model': tf.keras.applications.ResNet152V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'resNet152V2_model': tf.keras.applications.ResNet152V2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     # More model options for quick testing
     # 'resNet50_model': tf.keras.applications.ResNet50(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
@@ -41,14 +41,14 @@ models_dict = {
     # 'inceptionResNetV2_model': tf.keras.applications.InceptionResNetV2(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'vgg19_model': tf.keras.applications.VGG19(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
+    #'vgg19_model': tf.keras.applications.VGG19(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     'denseNet169_model': tf.keras.applications.DenseNet169(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #'denseNet201_model': tf.keras.applications.DenseNet201(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #'nasNetLarge_model': tf.keras.applications.NASNetLarge(input_shape=(120, 120, 3), include_top=False, weights='imagenet'),
     #-------------------------------------------------------------------------------------------------------------------------------------
     #IN USE (COMMENTED TO SPEED UP TRAINING)
-    'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
+    #'nasNetMobile_model': tf.keras.applications.NASNetMobile(input_shape=(120, 120, 3), include_top=False, weights='imagenet')
     #-------------------------------------------------------------------------------------------------------------------------------------
 }
 
