@@ -4360,7 +4360,8 @@ Notes:
 
         # shuffle small buffer
         if shuffle:
-            ds = ds.shuffle(buffer_size=min(1024, max(32, batch_size * 16)), seed=seed)
+            # Smaller shuffle buffer lowers RAM usage; it does not remove samples from the dataset.
+            ds = ds.shuffle(buffer_size=min(256, max(32, batch_size * 4)), seed=seed)
 
         # map: uint8 -> float32, resize, apply tf_preprocess_fn if available
         def _map_to_model_tensors(inputs, label):
@@ -4416,7 +4417,8 @@ Notes:
         except Exception:
             pass
 
-        ds = ds.prefetch(AUTOTUNE)
+        # Keep host-side buffering modest to reduce peak RAM usage.
+        ds = ds.prefetch(1)
 
         tried_device_prefetch = False
         try:
@@ -4443,6 +4445,7 @@ Notes:
         return ds, tried_device_prefetch
 
 
+    @staticmethod
     def train_all_behavior_types_image_models_from_csv_separate_aux(
         dataset_dir: str,
         matrix_column: str = "trajectory_image_matrix",
@@ -4456,7 +4459,7 @@ Notes:
         random_state: float = 42,
         img_size: tuple = (120, 120),
         epochs: int = 12,
-        batch_size: int = 24,
+        batch_size: int = 16,
         learning_rate: float = 0.001,
         callbacks_list: list = None,
         experiment_name: str = None,
@@ -5137,6 +5140,25 @@ Notes:
             json.dump(aux_meta, fh)
         logger and logger.info("Wrote aux_meta to %s", aux_meta_path)
 
+        # Free first-pass CSV scan structures as soon as they are no longer needed.
+        try:
+            del labels_list
+            del shapes_set
+            del total_rows
+            del skipped_rows
+            del label_to_indices
+            del chosen_labels
+            del chosen_set
+            del chosen_global_indices
+            del global_to_pos
+            del y_int_all
+            del indices
+            del train_sub_idx
+            del test_sub_idx
+        except Exception:
+            pass
+        gc.collect()
+
         # base model compatibility check (unchanged)
         base_integration_success = False
         integration_mode = None
@@ -5349,10 +5371,11 @@ Notes:
 
                             # dense_specs entries: (units, dropout_rate, dense_name, dropout_name)
                             dense_specs = [
-                                (512, 0.2, f"aux_dense_{col}", f"aux_drop_{col}"),
-                                (256, 0.1, f"aux_dense2_{col}", f"aux_drop2_{col}"),
-                                (256, 0.1, f"aux_dense3_{col}", f"aux_drop3_{col}"),
-                                (64, None, f"aux_dense4_{col}", None),
+                                (512, 0.1, f"aux_dense_{col}", f"aux_drop_{col}"),
+                                (512, 0.1, f"aux_dense2_{col}", f"aux_drop2_{col}"),
+                                (256, None, f"aux_dense3_{col}", None),
+                                (128, None, f"aux_dense4_{col}", None),
+                                (128, None, f"aux_dense5_{col}", None),
                             ]
 
                             h = inp
@@ -6257,6 +6280,11 @@ Notes:
                 except Exception:
                     pass
                 gc.collect()
+                try:
+                    tf.keras.backend.clear_session()
+                    gc.collect()
+                except Exception:
+                    pass
 
         except Exception as e:
             logger and logger.exception("Error during training: %s", e)
