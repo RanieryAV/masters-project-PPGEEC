@@ -916,13 +916,15 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
         else:
             base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
 
-        output_dir = os.path.join(base_output_dir, "csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events")
+        max_rows_per_behavior = 200  # You can adjust this value as needed
+
+        output_dir = os.path.join(base_output_dir, f"csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_{max_rows_per_behavior}_rows_per_class")
 
         ProcessDataService.generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
             spark=spark,
             output_dir=output_dir,
             behavior_types_to_generate_dataset=behavior_types_to_generate_dataset,
-            max_rows_per_behavior=100
+            max_rows_per_behavior=max_rows_per_behavior
         )
 
         logger.info("Task finished. Stopping Spark session...")

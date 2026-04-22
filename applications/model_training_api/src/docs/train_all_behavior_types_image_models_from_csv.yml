@@ -18,11 +18,20 @@ parameters:
       properties:
         epochs:
           type: integer
-          example: 12
+          example: 17
         per_label_n:
           type: integer
           example: 100
         warmup_epochs:
+          type: integer
+          example: 3
+        batch_size:
+          type: integer
+          example: 24
+        optimizer:
+          type: string
+          example: "adam"
+        patience:
           type: integer
           example: 3
 responses:

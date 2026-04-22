@@ -444,13 +444,21 @@ def train_all_behavior_types_image_models_from_csv_controller():
         logging.info("Endpoint /train_all_behavior_types_image_models_from_csv called")
         data_request = request.get_json() or {}
 
-        # Only allow these user-settable parameters
-        #dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_320_rows_per_class")
-        dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_100_rows_per_class")
         epochs = data_request.get('epochs', 12)
         per_label_n = data_request.get('per_label_n', None)
         warmup_epochs = data_request.get('warmup_epochs', 3)
+        batch_size = data_request.get('batch_size', 24)
+        patience = data_request.get('patience', 3)
+        optimizer = data_request.get('optimizer', 'adam')
         test_size = data_request.get('test_size', 0.2)
+
+        # Only allow these user-settable parameters
+        if per_label_n <= 100:
+            dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_100_rows_per_class")
+        elif per_label_n > 100 and per_label_n <= 200:
+            dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_200_rows_per_class")
+        elif per_label_n > 200 and per_label_n <= 320:
+            dataset_dir = data_request.get('dataset_dir', "/app/processed_output/csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_320_rows_per_class")
 
         # If you want to restrict allowed labels you can pass them here; by default TrainModelService will use the full set
         with current_app.app_context():
@@ -459,7 +467,10 @@ def train_all_behavior_types_image_models_from_csv_controller():
                 models_dict=models_dict,
                 per_label_n=per_label_n,
                 epochs=epochs,
-                warmup_epochs=warmup_epochs
+                batch_size=batch_size,
+                warmup_epochs=warmup_epochs,
+                optimizer=optimizer,
+                patience=patience
             )
 
             safe_result = TrainModelService.make_json_safe(result)
