@@ -449,7 +449,7 @@ def train_all_behavior_types_image_models_from_csv_controller():
         warmup_epochs = data_request.get('warmup_epochs', 3)
         batch_size = data_request.get('batch_size', 24)
         patience = data_request.get('patience', 3)
-        optimizer = data_request.get('optimizer', 'adam')
+        optimizer_name = data_request.get('optimizer_name', 'adam')
         test_size = data_request.get('test_size', 0.2)
 
         # Only allow these user-settable parameters
@@ -469,7 +469,7 @@ def train_all_behavior_types_image_models_from_csv_controller():
                 epochs=epochs,
                 batch_size=batch_size,
                 warmup_epochs=warmup_epochs,
-                optimizer=optimizer,
+                optimizer_name=optimizer_name,
                 patience=patience
             )
 

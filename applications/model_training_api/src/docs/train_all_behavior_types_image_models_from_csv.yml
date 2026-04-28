@@ -28,7 +28,7 @@ parameters:
         batch_size:
           type: integer
           example: 24
-        optimizer:
+        optimizer_name:
           type: string
           example: "adam"
         patience:

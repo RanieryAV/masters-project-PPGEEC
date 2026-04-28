@@ -4461,7 +4461,7 @@ Notes:
         epochs: int = 12,
         batch_size: int = 24,
         learning_rate: float = 0.001,
-        optimizer: Any = "adam",
+        optimizer_name: str = "adam",
         patience: int = 3,
         callbacks_list: list = None,
         experiment_name: str = None,
@@ -4501,75 +4501,40 @@ Notes:
                 return f"{mm}m{ss:02d}s"
             return f"{ss}s"
 
-        def _build_optimizer(optimizer, current_lr):
+        def _build_optimizer(optimizer_name: str, current_lr: float):
             # Accepts strings (e.g. "adam", "SGD", etc). If string is unrecognized, defaults to Adam.
             try:
-                if optimizer == "sgd" or "SGD":
+                if optimizer_name == "sgd" or optimizer_name == "SGD":
                     return tf.keras.optimizers.SGD(learning_rate=float(current_lr))
-                elif optimizer == "rmsprop" or "RMSPROP":
+                elif optimizer_name == "rmsprop" or optimizer_name == "RMSPROP":
                     return tf.keras.optimizers.RMSprop(learning_rate=float(current_lr))
-                elif optimizer == "adam" or "ADAM":
+                elif optimizer_name == "adam" or optimizer_name == "ADAM":
                     return tf.keras.optimizers.Adam(learning_rate=float(current_lr))
-                elif optimizer == "adamw" or "ADAMW":
+                elif optimizer_name == "adamw" or optimizer_name == "ADAMW":
                     return tf.keras.optimizers.AdamW(learning_rate=float(current_lr), weight_decay=0.0)
-                elif optimizer == "adadelta" or "ADADELTA":
+                elif optimizer_name == "adadelta" or optimizer_name == "ADADELTA":
                     return tf.keras.optimizers.Adadelta(learning_rate=float(current_lr))
-                elif optimizer == "adagrad" or "ADAGRAD":
+                elif optimizer_name == "adagrad" or optimizer_name == "ADAGRAD":
                     return tf.keras.optimizers.Adagrad(learning_rate=float(current_lr))
-                elif optimizer == "adamax" or "ADAMAX":
+                elif optimizer_name == "adamax" or optimizer_name == "ADAMAX":
                     return tf.keras.optimizers.Adamax(learning_rate=float(current_lr))
-                elif optimizer == "adafactor" or "ADAFACTOR":
+                elif optimizer_name == "adafactor" or optimizer_name == "ADAFACTOR":
                     return tf.keras.optimizers.Adafactor(learning_rate=float(current_lr))
-                elif optimizer == "nadam" or "NADAM":
+                elif optimizer_name == "nadam" or optimizer_name == "NADAM":
                     return tf.keras.optimizers.Nadam(learning_rate=float(current_lr))
-                elif optimizer == "ftrl" or "FTRL":
+                elif optimizer_name == "ftrl" or optimizer_name == "FTRL":
                     return tf.keras.optimizers.Ftrl(learning_rate=float(current_lr))
-                elif optimizer == "lion" or "LION":
+                elif optimizer_name == "lion" or optimizer_name == "LION":
                     return tf.keras.optimizers.Lion(learning_rate=float(current_lr))
-                elif optimizer == "lamb" or "LAMB":
+                elif optimizer_name == "lamb" or optimizer_name == "LAMB":
                     return tf.keras.optimizers.Lamb(learning_rate=float(current_lr))
-                elif optimizer == "muon" or "MUON":
+                elif optimizer_name == "muon" or optimizer_name == "MUON":
                     return tf.keras.optimizers.Muon(learning_rate=float(current_lr))
-                
-                logger.info("Optimizer specified as '%s' did not match built-in names; Check if you have the correct spelling.", str(optimizer))
+
+                logger.info("Optimizer specified as '%s' did not match built-in names; Check if you have the correct spelling.", str(optimizer_name))
             except Exception:
-                logger and logger.exception("Failed to build optimizer from string '%s'; falling back to default Adam.", str(optimizer))
+                logger and logger.exception("Failed to build optimizer from string '%s'; falling back to default Adam.", str(optimizer_name))
                 return tf.keras.optimizers.Adam(learning_rate=float(current_lr))
-
-
-        def _set_optimizer_learning_rate(opt_obj, new_lr):
-            """
-            Update the learning rate on the optimizer object in-place when possible.
-            Supports wrapped optimizers by also updating inner optimizer attributes.
-            """
-            try:
-                new_lr = float(new_lr)
-            except Exception:
-                return opt_obj
-
-            candidates = [opt_obj]
-            for attr_name in ("optimizer", "inner_optimizer"):
-                try:
-                    inner = getattr(opt_obj, attr_name, None)
-                    if inner is not None and inner is not opt_obj:
-                        candidates.append(inner)
-                except Exception:
-                    pass
-
-            for target in candidates:
-                try:
-                    lr_attr = getattr(target, "learning_rate", None)
-                    if hasattr(lr_attr, "assign"):
-                        lr_attr.assign(new_lr)
-                    elif lr_attr is not None:
-                        try:
-                            setattr(target, "learning_rate", new_lr)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            return opt_obj
-
 
         def _log_history_metrics_to_mlflow(history_obj, model_key_local):
             try:
@@ -5435,8 +5400,8 @@ Notes:
                             # dense_specs entries: (units, dropout_rate, dense_name, dropout_name)
                             dense_specs = [
                                 #(512, 0.2, f"aux_dense_{col}", f"aux_drop_{col}"),
-                                (128, 0.2, f"aux_dense_{col}", f"aux_drop_{col}"),
-                                #(128, None, f"aux_dense2_{col}", None),
+                                (128, None, f"aux_dense_{col}", None),
+                                (32, None, f"aux_dense2_{col}", None),
                                 # (128, None, f"aux_dense3_{col}", None),
                                 # (128, None, f"aux_dense4_{col}", None),
                             ]
@@ -5563,7 +5528,7 @@ Notes:
 
                     # compile inside strategy scope (ensures optimizer vars on GPU)
                     try:
-                        opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+                        opt = _build_optimizer(optimizer_name, learning_rate)
                         model.compile(
                             optimizer=opt,
                             loss=tf.keras.losses.SparseCategoricalCrossentropy(),
@@ -5574,7 +5539,7 @@ Notes:
                         )
                     except Exception:
                         model.compile(
-                            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                            optimizer=_build_optimizer(optimizer_name, learning_rate),
                             loss=tf.keras.losses.SparseCategoricalCrossentropy(),
                             metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
                         )
@@ -5706,7 +5671,7 @@ Notes:
                     mlflow.log_param("epochs_phase2", int(epochs))
                     mlflow.log_param("batch_size", batch_size)
                     mlflow.log_param("learning_rate", learning_rate)
-                    mlflow.log_param("optimizer", str(optimizer))
+                    mlflow.log_param("optimizer", str(optimizer_name))
                     mlflow.log_param("patience", int(patience))
                     mlflow.log_param("use_aux_inputs", bool(use_aux_inputs))
                     mlflow.log_param("aux_col_lengths", aux_col_lengths)
@@ -5777,7 +5742,8 @@ Notes:
 
                             # recompile with lower lr
                             try:
-                                opt2 = tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1)
+                                lower_lr = float(learning_rate * 0.1)
+                                opt2 = _build_optimizer(optimizer_name, lower_lr)
                                 model.compile(
                                     optimizer=opt2,
                                     loss=tf.keras.losses.SparseCategoricalCrossentropy(),
@@ -5787,8 +5753,9 @@ Notes:
                                     steps_per_execution=16 if gpu_available else 1,
                                 )
                             except Exception:
+                                lower_learning_rate = float(learning_rate * 0.1)
                                 model.compile(
-                                    optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1),
+                                    optimizer=_build_optimizer(optimizer_name, lower_learning_rate),
                                     loss=tf.keras.losses.SparseCategoricalCrossentropy(),
                                     metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
                                 )
@@ -5820,7 +5787,7 @@ Notes:
                         )
 
                         # Prepare optimizer/loss/metrics consistent with model.compile above
-                        optimizer = model.optimizer if hasattr(model, "optimizer") else tf.keras.optimizers.Adam(learning_rate=learning_rate)
+                        optimizer = model.optimizer if hasattr(model, "optimizer") else _build_optimizer(optimizer_name, learning_rate)
                         loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
                         train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
                         train_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="train_accuracy")
@@ -5974,7 +5941,8 @@ Notes:
 
                         # Re-create or adjust optimizer learning rate for fine-tuning
                         try:
-                            optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate * 0.1)
+                            other_lower_lr = float(learning_rate * 0.1)
+                            optimizer = _build_optimizer(optimizer_name, other_lower_lr)
                             try:
                                 policy_name = tf.keras.mixed_precision.global_policy().name
                                 if "mixed_float" in policy_name:
