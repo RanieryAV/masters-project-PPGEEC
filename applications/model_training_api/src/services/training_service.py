@@ -4728,159 +4728,429 @@ Notes:
                 "artifact_dir": artifact_dir_local,
             }
 
-        def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str):
-            import json
-            import os
-            import shutil
-            import tempfile
-            import sys as _sys
-            import yaml as _yaml
-
-            # 1) Try the normal MLflow Keras path first.
+        def _build_mlflow_signature(model_obj, input_example_local):
             try:
-                mlflow.keras.log_model(model, artifact_path="model")
-                logger.info("Logged Keras model to MLflow using the standard Keras path for %s.", model_key)
-                return {"mode": "mlflow.keras.log_model", "artifact_path": "model"}
-            except Exception as e1:
-                logger.warning(
-                    "Primary MLflow Keras logging failed for %s; trying MLflow TensorFlow/SavedModel fallback. Error: %s",
-                    model_key,
-                    e1,
-                )
+                import numpy as _np
+                from mlflow.models import ModelSignature
+                from mlflow.types.schema import Schema, TensorSpec
 
-            # 2) Build a full MLflow model directory manually around a raw SavedModel export.
-            #    This avoids Keras serialization/deepcopy issues while still creating MLflow
-            #    metadata files (MLmodel, conda.yaml, python_env.yaml, requirements.txt).
-            tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
-            data_model_dir = os.path.join(tmp_model_dir, "data", "model")
-            os.makedirs(data_model_dir, exist_ok=True)
+                def _normalize_shape(shape_local):
+                    try:
+                        shape_list_local = list(shape_local)
+                    except Exception:
+                        return None
+                    if not shape_list_local:
+                        return tuple()
+                    normalized_local = []
+                    for idx_local, dim_local in enumerate(shape_list_local):
+                        if dim_local is None:
+                            normalized_local.append(-1)
+                        else:
+                            try:
+                                normalized_local.append(int(dim_local))
+                            except Exception:
+                                normalized_local.append(dim_local)
+                    if normalized_local[0] != -1:
+                        normalized_local[0] = -1
+                    return tuple(normalized_local)
 
-            try:
-                # Raw TensorFlow export (works even when Keras save/log_model fails).
-                tf.saved_model.save(model, data_model_dir)
+                def _tensor_dtype(tensor_local):
+                    try:
+                        return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
+                    except Exception:
+                        return _np.dtype(_np.float32)
 
-                # MLflow metadata
-                try:
-                    from mlflow.models import Model as _MlflowModel
-                except Exception:
-                    from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
+                def _tensor_name(tensor_local, fallback_name_local):
+                    try:
+                        name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
+                        return name_local or fallback_name_local
+                    except Exception:
+                        return fallback_name_local
 
-                mlflow_model = _MlflowModel()
-                mlflow_model.add_flavor(
-                    "tensorflow",
-                    saved_model_dir=os.path.join("data", "model"),
-                    model_type="tf2-module",
-                )
+                input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
+                if not input_tensors_local:
+                    input_shape_local = getattr(model_obj, "input_shape", None)
+                    if input_shape_local is None:
+                        return None
+                    if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
+                        input_shape_iter_local = list(input_shape_local)
+                    else:
+                        input_shape_iter_local = [input_shape_local]
+                    input_tensors_local = []
+                    for idx_local, shape_local in enumerate(input_shape_iter_local):
+                        input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
 
-                try:
-                    mlflow.pyfunc.add_to_model(
-                        mlflow_model,
-                        loader_module="mlflow.tensorflow",
-                        conda_env="conda.yaml",
-                        python_env="python_env.yaml",
+                output_tensors_local = list(getattr(model_obj, "outputs", []) or [])
+                if not output_tensors_local:
+                    output_shape_local = getattr(model_obj, "output_shape", None)
+                    if output_shape_local is None:
+                        return None
+                    if isinstance(output_shape_local, (list, tuple)) and output_shape_local and isinstance(output_shape_local[0], (list, tuple)):
+                        output_shape_iter_local = list(output_shape_local)
+                    else:
+                        output_shape_iter_local = [output_shape_local]
+                    output_tensors_local = []
+                    for idx_local, shape_local in enumerate(output_shape_iter_local):
+                        output_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"output_{idx_local}"})())
+
+                input_specs_local = []
+                for idx_local, tensor_local in enumerate(input_tensors_local):
+                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                    if shape_local is None:
+                        return None
+                    input_specs_local.append(
+                        TensorSpec(
+                            _tensor_dtype(tensor_local),
+                            shape_local,
+                            name=_tensor_name(tensor_local, f"input_{idx_local}"),
+                        )
                     )
-                except Exception:
-                    # Keep the MLflow model valid even if pyfunc metadata helper changes.
-                    pass
 
-                mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
+                output_specs_local = []
+                for idx_local, tensor_local in enumerate(output_tensors_local):
+                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                    if shape_local is None:
+                        return None
+                    output_specs_local.append(
+                        TensorSpec(
+                            _tensor_dtype(tensor_local),
+                            shape_local,
+                            name=_tensor_name(tensor_local, f"output_{idx_local}"),
+                        )
+                    )
 
-                # Environment files
-                try:
-                    conda_env = mlflow.tensorflow.get_default_conda_env()
-                except Exception:
-                    conda_env = {
-                        "name": "mlflow-env",
-                        "channels": ["conda-forge"],
-                        "dependencies": [
-                            f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
-                            {"pip": [f"tensorflow=={tf.__version__}"]},
-                        ],
-                    }
+                if not input_specs_local:
+                    return None
 
-                try:
-                    pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
-                except Exception:
-                    pip_reqs = [f"tensorflow=={tf.__version__}"]
+                return ModelSignature(
+                    inputs=Schema(input_specs_local),
+                    outputs=Schema(output_specs_local) if output_specs_local else None,
+                )
+            except Exception as e_sig:
+                logger and logger.debug(
+                    "Could not build MLflow signature for %s from model shapes: %s",
+                    model_key,
+                    str(e_sig),
+                )
+                return None
 
-                with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
-                    _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
+        
+        def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str, register_model_name: str = None):
+                    import json
+                    import os
+                    import shutil
+                    import tempfile
+                    import sys as _sys
+                    import yaml as _yaml
+                    import inspect as _inspect
 
-                with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
-                    fh.write("\n".join(pip_reqs) + "\n")
+                    input_example_local = _build_mlflow_input_example(model)
+                    signature_local = _build_mlflow_signature(model, input_example_local)
 
-                # Best-effort python_env.yaml that matches the MLflow layout.
-                try:
-                    import importlib.metadata as _importlib_metadata
-                    pip_ver = _importlib_metadata.version("pip")
-                    setuptools_ver = _importlib_metadata.version("setuptools")
-                    wheel_ver = _importlib_metadata.version("wheel")
-                except Exception:
-                    pip_ver = "unknown"
-                    setuptools_ver = "unknown"
-                    wheel_ver = "unknown"
+                    # 1) Prefer an MLflow pyfunc logged model that wraps a raw SavedModel artifact.
+                    #    This avoids Keras/TensorFlow serialization paths that can fail on custom
+                    #    lambdas / numpy_function preprocessing, while still creating a real
+                    #    LoggedModel that can be registered and deployed.
+                    tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
+                    data_model_dir = os.path.join(tmp_model_dir, "data", "model")
+                    os.makedirs(data_model_dir, exist_ok=True)
 
-                python_env_payload = {
-                    "python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
-                    "build_dependencies": [
-                        f"pip=={pip_ver}",
-                        f"setuptools=={setuptools_ver}",
-                        f"wheel=={wheel_ver}",
-                    ],
-                    "dependencies": ["-r requirements.txt"],
-                }
-                with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
-                    _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
+                    try:
+                        # Export a raw TensorFlow SavedModel first. This is the same artifact
+                        # that the previous fallback already managed to create successfully.
+                        tf.saved_model.save(model, data_model_dir)
 
-                manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
-                with open(manifest_path, "w", encoding="utf-8") as fh:
-                    json.dump(
-                        {
-                            "model_key": model_key,
-                            "export_mode": "tf.saved_model.save",
+                        class _SavedModelPyFuncWrapper(mlflow.pyfunc.PythonModel):
+                            def load_context(self, context):
+                                import tensorflow as _tf
+
+                                self._loaded_model = _tf.saved_model.load(context.artifacts["saved_model_dir"])
+                                self._infer_fn = None
+                                self._input_keys = []
+
+                                try:
+                                    signatures = getattr(self._loaded_model, "signatures", None) or {}
+                                    if isinstance(signatures, dict) and signatures:
+                                        self._infer_fn = signatures.get("serving_default") or next(iter(signatures.values()))
+                                except Exception:
+                                    self._infer_fn = None
+
+                                try:
+                                    if self._infer_fn is not None:
+                                        structured_input_signature = getattr(self._infer_fn, "structured_input_signature", None)
+                                        if (
+                                            structured_input_signature
+                                            and isinstance(structured_input_signature, tuple)
+                                            and len(structured_input_signature) >= 2
+                                            and isinstance(structured_input_signature[1], dict)
+                                        ):
+                                            self._input_keys = list(structured_input_signature[1].keys())
+                                except Exception:
+                                    self._input_keys = []
+
+                            def _coerce_inputs(self, model_input):
+                                import numpy as _np
+                                import pandas as _pd
+                                import tensorflow as _tf
+
+                                if isinstance(model_input, dict):
+                                    return {k: _tf.convert_to_tensor(v) for k, v in model_input.items()}
+
+                                if isinstance(model_input, _pd.DataFrame):
+                                    if self._input_keys:
+                                        data = {}
+                                        for key in self._input_keys:
+                                            if key in model_input.columns:
+                                                col_values = model_input[key].to_numpy()
+                                                try:
+                                                    data[key] = _tf.convert_to_tensor(_np.asarray(col_values))
+                                                except Exception:
+                                                    data[key] = _tf.convert_to_tensor(col_values)
+                                        if data:
+                                            return data
+                                    try:
+                                        return _tf.convert_to_tensor(model_input.to_numpy())
+                                    except Exception:
+                                        return model_input.to_numpy()
+
+                                if isinstance(model_input, (list, tuple)):
+                                    try:
+                                        return _tf.convert_to_tensor(_np.asarray(model_input))
+                                    except Exception:
+                                        return [_tf.convert_to_tensor(x) for x in model_input]
+
+                                try:
+                                    return _tf.convert_to_tensor(model_input)
+                                except Exception:
+                                    return model_input
+
+                            def _coerce_outputs(self, outputs):
+                                import numpy as _np
+
+                                if isinstance(outputs, dict):
+                                    converted = {}
+                                    for k, v in outputs.items():
+                                        try:
+                                            converted[k] = v.numpy() if hasattr(v, "numpy") else _np.asarray(v)
+                                        except Exception:
+                                            converted[k] = v
+                                    return converted
+                                return outputs.numpy() if hasattr(outputs, "numpy") else _np.asarray(outputs)
+
+                            def predict(self, context, model_input):
+                                if self._infer_fn is None:
+                                    raise RuntimeError("SavedModel serving signature is unavailable.")
+                                inputs = self._coerce_inputs(model_input)
+                                if isinstance(inputs, dict):
+                                    outputs = self._infer_fn(**inputs)
+                                else:
+                                    outputs = self._infer_fn(inputs)
+                                return self._coerce_outputs(outputs)
+
+                        log_model_fn = mlflow.pyfunc.log_model
+                        log_model_sig = _inspect.signature(log_model_fn)
+                        log_model_kwargs = {
+                            "python_model": _SavedModelPyFuncWrapper(),
+                            "artifacts": {"saved_model_dir": data_model_dir},
+                            "input_example": input_example_local,
+                            "signature": signature_local,
+                        }
+
+                        # Different MLflow versions expose either `name` or `artifact_path`.
+                        # Prefer the available parameter without changing the rest of the pipeline.
+                        if "name" in log_model_sig.parameters:
+                            log_model_kwargs["name"] = "model"
+                        elif "artifact_path" in log_model_sig.parameters:
+                            log_model_kwargs["artifact_path"] = "model"
+
+                        # Pass registered_model_name only when the installed MLflow version supports it.
+                        if "registered_model_name" in log_model_sig.parameters and register_model_name:
+                            log_model_kwargs["registered_model_name"] = register_model_name
+
+                        model_info = log_model_fn(**log_model_kwargs)
+                        logger.info("Logged pyfunc model to MLflow using the SavedModel wrapper for %s.", model_key)
+
+                        registration_info = None
+                        if register_model_name and "registered_model_name" not in log_model_sig.parameters:
+                            try:
+                                active_run = mlflow.active_run()
+                                if active_run is not None:
+                                    mv = mlflow.register_model(
+                                        model_uri=getattr(model_info, "model_uri", f"runs:/{active_run.info.run_id}/model"),
+                                        name=register_model_name,
+                                    )
+                                    registration_info = {
+                                        "name": mv.name,
+                                        "version": mv.version,
+                                        "stage": getattr(mv, "current_stage", None),
+                                        "status": getattr(mv, "status", None),
+                                    }
+                            except Exception:
+                                logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                                registration_info = None
+
+                        return {
+                            "mode": "mlflow.pyfunc.log_model",
                             "artifact_path": "model",
-                            "mlflow_dir": True,
-                        },
-                        fh,
-                        indent=2,
-                    )
+                            "model_uri": getattr(model_info, "model_uri", None),
+                            "registered_model": registration_info if register_model_name else register_model_name,
+                        }
 
-                mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
-                logger.info(
-                    "Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.",
-                    model_key,
-                )
-                return {
-                    "mode": "tf.saved_model.save + mlflow_model_dir",
-                    "artifact_path": "model",
-                    "registered_model_ready": True,
-                }
+                    except Exception as e1:
+                        logger.warning(
+                            "Primary MLflow pyfunc logging failed for %s; trying MLflow SavedModel fallback. Error: %s",
+                            model_key,
+                            e1,
+                        )
 
-            except Exception as e2:
-                logger.exception("TensorFlow/MLflow export failed for %s", model_key)
+                    # 2) Build a full MLflow model directory manually around a raw SavedModel export.
+                    #    This preserves the previous non-destructive fallback behavior.
+                    try:
+                        # MLflow metadata
+                        try:
+                            from mlflow.models import Model as _MlflowModel
+                        except Exception:
+                            from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
 
-                # 3) Last-resort fallback: keep the core artifacts so nothing is lost.
-                try:
-                    weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
-                    model.save_weights(weights_path)
+                        mlflow_model = _MlflowModel()
+                        mlflow_model.add_flavor(
+                            "tensorflow",
+                            saved_model_dir=os.path.join("data", "model"),
+                            model_type="tf2-module",
+                        )
 
-                    summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
-                    with open(summary_path, "w", encoding="utf-8") as fh:
-                        model.summary(print_fn=lambda s: fh.write(s + "\n"))
+                        try:
+                            mlflow.pyfunc.add_to_model(
+                                mlflow_model,
+                                loader_module="mlflow.tensorflow",
+                                conda_env="conda.yaml",
+                                python_env="python_env.yaml",
+                            )
+                        except Exception:
+                            # Keep the MLflow model valid even if pyfunc metadata helper changes.
+                            pass
 
-                    mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
-                    logger.warning("Saved weights + summary fallback artifact for %s.", model_key)
-                    return {
-                        "mode": "weights_and_summary",
-                        "artifact_path": f"fallback_{model_key}",
-                        "error": str(e2),
-                    }
-                except Exception as e3:
-                    logger.exception("Final fallback also failed for %s", model_key)
-                    return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
-            finally:
-                shutil.rmtree(tmp_model_dir, ignore_errors=True)
-        # --- early GPU setup ---
+                        mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
+
+                        # Environment files
+                        try:
+                            conda_env = mlflow.tensorflow.get_default_conda_env()
+                        except Exception:
+                            conda_env = {
+                                "name": "mlflow-env",
+                                "channels": ["conda-forge"],
+                                "dependencies": [
+                                    f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                                    {"pip": [f"tensorflow=={tf.__version__}"]},
+                                ],
+                            }
+
+                        try:
+                            pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
+                        except Exception:
+                            pip_reqs = [f"tensorflow=={tf.__version__}"]
+
+                        with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
+                            _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
+
+                        with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
+                            fh.write("\n".join(pip_reqs) + "\n")
+
+                        # Best-effort python_env.yaml that matches the MLflow layout.
+                        try:
+                            import importlib.metadata as _importlib_metadata
+                            pip_ver = _importlib_metadata.version("pip")
+                            setuptools_ver = _importlib_metadata.version("setuptools")
+                            wheel_ver = _importlib_metadata.version("wheel")
+                        except Exception:
+                            pip_ver = "unknown"
+                            setuptools_ver = "unknown"
+                            wheel_ver = "unknown"
+
+                        python_env_payload = {
+                            "python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                            "build_dependencies": [
+                                f"pip=={pip_ver}",
+                                f"setuptools=={setuptools_ver}",
+                                f"wheel=={wheel_ver}",
+                            ],
+                            "dependencies": ["-r requirements.txt"],
+                        }
+                        with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
+                            _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
+
+                        manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
+                        with open(manifest_path, "w", encoding="utf-8") as fh:
+                            json.dump(
+                                {
+                                    "model_key": model_key,
+                                    "export_mode": "tf.saved_model.save",
+                                    "artifact_path": "model",
+                                    "mlflow_dir": True,
+                                },
+                                fh,
+                                indent=2,
+                            )
+
+                        mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
+                        logger.info(
+                            "Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.",
+                            model_key,
+                        )
+
+                        if register_model_name:
+                            try:
+                                active_run = mlflow.active_run()
+                                if active_run is not None:
+                                    mv = mlflow.register_model(
+                                        model_uri=f"runs:/{active_run.info.run_id}/model",
+                                        name=register_model_name,
+                                    )
+                                    registration_info = {
+                                        "name": mv.name,
+                                        "version": mv.version,
+                                        "stage": getattr(mv, "current_stage", None),
+                                        "status": getattr(mv, "status", None),
+                                    }
+                                else:
+                                    registration_info = None
+                            except Exception:
+                                logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                                registration_info = None
+                        else:
+                            registration_info = None
+
+                        return {
+                            "mode": "tf.saved_model.save + mlflow_model_dir",
+                            "artifact_path": "model",
+                            "registered_model_ready": True,
+                            "registered_model": registration_info,
+                        }
+
+                    except Exception as e2:
+                        logger.exception("TensorFlow/MLflow export failed for %s", model_key)
+
+                        # 3) Last-resort fallback: keep the core artifacts so nothing is lost.
+                        try:
+                            weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
+                            model.save_weights(weights_path)
+
+                            summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
+                            with open(summary_path, "w", encoding="utf-8") as fh:
+                                model.summary(print_fn=lambda s: fh.write(s + "\n"))
+
+                            mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
+                            logger.warning("Saved weights + summary fallback artifact for %s.", model_key)
+                            return {
+                                "mode": "weights_and_summary",
+                                "artifact_path": f"fallback_{model_key}",
+                                "error": str(e2),
+                            }
+                        except Exception as e3:
+                            logger.exception("Final fallback also failed for %s", model_key)
+                            return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
+                    finally:
+                        shutil.rmtree(tmp_model_dir, ignore_errors=True)# --- early GPU setup ---
         gpu_available = False
         try:
             gpus = tf.config.experimental.list_physical_devices("GPU")
@@ -6233,6 +6503,7 @@ Notes:
                             model=model,
                             model_key=model_key,
                             out_dir=out_dir,
+                            register_model_name=register_model_name,
                         )
                         logger.info("Model artifact logging result for %s: %s", model_key, log_result)
                     except Exception:
