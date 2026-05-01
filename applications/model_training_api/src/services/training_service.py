@@ -4361,7 +4361,7 @@ Notes:
         # shuffle small buffer
         if shuffle:
             # Smaller shuffle buffer lowers RAM usage; it does not remove samples from the dataset.
-            ds = ds.shuffle(buffer_size=min(256, max(32, batch_size * 4)), seed=seed)
+            ds = ds.shuffle(buffer_size=min(64, max(32, batch_size * 4)), seed=seed)
 
         # map: uint8 -> float32, resize, apply tf_preprocess_fn if available
         def _map_to_model_tensors(inputs, label):
@@ -4860,13 +4860,56 @@ Notes:
                         # that the previous fallback already managed to create successfully.
                         tf.saved_model.save(model, data_model_dir)
 
+                        # Persist the original model input names/order so the pyfunc wrapper can
+                        # reconstruct positional inputs even when the loaded SavedModel exposes
+                        # generic tensor names (inputs, inputs_1, ...).
+                        input_keys_path = os.path.join(tmp_model_dir, "input_keys.json")
+                        try:
+                            model_input_keys_local = []
+                            for inp in list(getattr(model, "inputs", []) or []):
+                                try:
+                                    model_input_keys_local.append(str(getattr(inp, "name", "")).split(":")[0])
+                                except Exception:
+                                    continue
+                            if model_input_keys_local:
+                                with open(input_keys_path, "w", encoding="utf-8") as fh:
+                                    json.dump(model_input_keys_local, fh)
+                            else:
+                                input_keys_path = None
+                        except Exception:
+                            input_keys_path = None
+
                         class _SavedModelPyFuncWrapper(mlflow.pyfunc.PythonModel):
                             def load_context(self, context):
+                                import json as _json
+                                import os as _os
                                 import tensorflow as _tf
 
-                                self._loaded_model = _tf.saved_model.load(context.artifacts["saved_model_dir"])
+                                saved_model_dir = context.artifacts["saved_model_dir"]
+                                self._loaded_model = None
                                 self._infer_fn = None
                                 self._input_keys = []
+                                self._can_call_model_directly = False
+
+                                # Load the original input order if it was persisted at log time.
+                                try:
+                                    input_keys_file = context.artifacts.get("input_keys_file")
+                                    if input_keys_file and _os.path.exists(input_keys_file):
+                                        with open(input_keys_file, "r", encoding="utf-8") as fh:
+                                            self._input_keys = list(_json.load(fh) or [])
+                                except Exception:
+                                    self._input_keys = []
+
+                                # Prefer loading as a Keras model so inference can run directly in eager mode,
+                                # which avoids depending on a SavedModel serving signature.
+                                try:
+                                    self._loaded_model = _tf.keras.models.load_model(saved_model_dir, compile=False)
+                                    self._can_call_model_directly = True
+                                except Exception:
+                                    try:
+                                        self._loaded_model = _tf.saved_model.load(saved_model_dir)
+                                    except Exception:
+                                        self._loaded_model = None
 
                                 try:
                                     signatures = getattr(self._loaded_model, "signatures", None) or {}
@@ -4876,7 +4919,7 @@ Notes:
                                     self._infer_fn = None
 
                                 try:
-                                    if self._infer_fn is not None:
+                                    if self._infer_fn is not None and not self._input_keys:
                                         structured_input_signature = getattr(self._infer_fn, "structured_input_signature", None)
                                         if (
                                             structured_input_signature
@@ -4886,28 +4929,62 @@ Notes:
                                         ):
                                             self._input_keys = list(structured_input_signature[1].keys())
                                 except Exception:
-                                    self._input_keys = []
+                                    self._input_keys = self._input_keys or []
+
+                                # If a Keras model was loaded and no explicit input order was saved,
+                                # fall back to the input tensor names exposed by the loaded model.
+                                try:
+                                    if not self._input_keys and self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                                        keras_input_keys = []
+                                        for inp in list(getattr(self._loaded_model, "inputs", []) or []):
+                                            try:
+                                                keras_input_keys.append(str(getattr(inp, "name", "")).split(":")[0])
+                                            except Exception:
+                                                continue
+                                        if keras_input_keys:
+                                            self._input_keys = keras_input_keys
+                                except Exception:
+                                    pass
 
                             def _coerce_inputs(self, model_input):
                                 import numpy as _np
                                 import pandas as _pd
                                 import tensorflow as _tf
 
+                                # For this model, the exported callable expects positional tensor inputs
+                                # in the exact order of model.inputs. Convert dict/DataFrame inputs into
+                                # that ordered list so eager calls match the SavedModel / Keras signature.
                                 if isinstance(model_input, dict):
+                                    if self._input_keys:
+                                        ordered = []
+                                        missing = []
+                                        for key in self._input_keys:
+                                            if key in model_input:
+                                                try:
+                                                    ordered.append(_tf.convert_to_tensor(model_input[key]))
+                                                except Exception:
+                                                    ordered.append(model_input[key])
+                                            else:
+                                                missing.append(key)
+                                        if ordered and not missing:
+                                            return ordered
                                     return {k: _tf.convert_to_tensor(v) for k, v in model_input.items()}
 
                                 if isinstance(model_input, _pd.DataFrame):
                                     if self._input_keys:
-                                        data = {}
+                                        ordered = []
+                                        missing = []
                                         for key in self._input_keys:
                                             if key in model_input.columns:
                                                 col_values = model_input[key].to_numpy()
                                                 try:
-                                                    data[key] = _tf.convert_to_tensor(_np.asarray(col_values))
+                                                    ordered.append(_tf.convert_to_tensor(_np.asarray(col_values)))
                                                 except Exception:
-                                                    data[key] = _tf.convert_to_tensor(col_values)
-                                        if data:
-                                            return data
+                                                    ordered.append(_tf.convert_to_tensor(col_values))
+                                            else:
+                                                missing.append(key)
+                                        if ordered and not missing:
+                                            return ordered
                                     try:
                                         return _tf.convert_to_tensor(model_input.to_numpy())
                                     except Exception:
@@ -4915,9 +4992,13 @@ Notes:
 
                                 if isinstance(model_input, (list, tuple)):
                                     try:
-                                        return _tf.convert_to_tensor(_np.asarray(model_input))
+                                        # Preserve list/tuple order as-is for positional signatures.
+                                        return [
+                                            _tf.convert_to_tensor(x) if not hasattr(x, "shape") else _tf.convert_to_tensor(x)
+                                            for x in model_input
+                                        ]
                                     except Exception:
-                                        return [_tf.convert_to_tensor(x) for x in model_input]
+                                        return list(model_input)
 
                                 try:
                                     return _tf.convert_to_tensor(model_input)
@@ -4938,20 +5019,104 @@ Notes:
                                 return outputs.numpy() if hasattr(outputs, "numpy") else _np.asarray(outputs)
 
                             def predict(self, context, model_input):
-                                if self._infer_fn is None:
-                                    raise RuntimeError("SavedModel serving signature is unavailable.")
                                 inputs = self._coerce_inputs(model_input)
-                                if isinstance(inputs, dict):
-                                    outputs = self._infer_fn(**inputs)
-                                else:
-                                    outputs = self._infer_fn(inputs)
-                                return self._coerce_outputs(outputs)
+
+                                def _to_positional_inputs(preferred_inputs):
+                                    import tensorflow as _tf
+                                    import numpy as _np
+                                    import pandas as _pd
+
+                                    # Always prefer the original model input order persisted at log time.
+                                    input_names = list(self._input_keys or [])
+                                    if not input_names:
+                                        try:
+                                            if self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                                                for inp in list(getattr(self._loaded_model, "inputs", []) or []):
+                                                    try:
+                                                        input_names.append(str(getattr(inp, "name", "")).split(":")[0])
+                                                    except Exception:
+                                                        input_names.append("")
+                                        except Exception:
+                                            input_names = []
+
+                                    if input_names:
+                                        source_dict = None
+                                        if isinstance(preferred_inputs, dict):
+                                            source_dict = preferred_inputs
+                                        elif isinstance(model_input, dict):
+                                            source_dict = model_input
+
+                                        if source_dict is not None:
+                                            ordered = []
+                                            for key in input_names:
+                                                if key in source_dict:
+                                                    try:
+                                                        ordered.append(_tf.convert_to_tensor(source_dict[key]))
+                                                    except Exception:
+                                                        ordered.append(source_dict[key])
+                                            if len(ordered) == len(input_names):
+                                                return ordered
+
+                                    # If the input is a DataFrame and we have named keys, extract columns in order.
+                                    if isinstance(model_input, _pd.DataFrame) and input_names:
+                                        ordered = []
+                                        for key in input_names:
+                                            if key in model_input.columns:
+                                                try:
+                                                    ordered.append(_tf.convert_to_tensor(_np.asarray(model_input[key].to_numpy())))
+                                                except Exception:
+                                                    ordered.append(_tf.convert_to_tensor(model_input[key].to_numpy()))
+                                        if len(ordered) == len(input_names):
+                                            return ordered
+
+                                    # Fall back to whatever we already have if it's already positional.
+                                    if isinstance(preferred_inputs, (list, tuple)):
+                                        return list(preferred_inputs)
+                                    return preferred_inputs
+
+                                positional_inputs = _to_positional_inputs(inputs)
+
+                                # 1) Preferred path: direct eager call on the loaded Keras model.
+                                #    For multi-input models, Keras expects a positional list that matches
+                                #    model.inputs order rather than a dict.
+                                if self._can_call_model_directly and self._loaded_model is not None:
+                                    try:
+                                        outputs = self._loaded_model(positional_inputs, training=False)
+                                        return self._coerce_outputs(outputs)
+                                    except Exception:
+                                        # Fall through to SavedModel signature or callable fallback below.
+                                        pass
+
+                                # 2) SavedModel serving signature, when available.
+                                if self._infer_fn is not None:
+                                    try:
+                                        if isinstance(positional_inputs, (list, tuple)):
+                                            outputs = self._infer_fn(*positional_inputs)
+                                        elif isinstance(positional_inputs, dict):
+                                            outputs = self._infer_fn(**positional_inputs)
+                                        else:
+                                            outputs = self._infer_fn(positional_inputs)
+                                        return self._coerce_outputs(outputs)
+                                    except Exception:
+                                        pass
+
+                                # 3) Last-resort callable fallback.
+                                if self._loaded_model is not None and callable(self._loaded_model):
+                                    try:
+                                        outputs = self._loaded_model(positional_inputs, training=False)
+                                    except TypeError:
+                                        outputs = self._loaded_model(positional_inputs)
+                                    return self._coerce_outputs(outputs)
+
+                                raise RuntimeError(
+                                    "SavedModel serving signature is unavailable and the loaded model could not be called directly."
+                                )
 
                         log_model_fn = mlflow.pyfunc.log_model
                         log_model_sig = _inspect.signature(log_model_fn)
                         log_model_kwargs = {
                             "python_model": _SavedModelPyFuncWrapper(),
-                            "artifacts": {"saved_model_dir": data_model_dir},
+                            "artifacts": {"saved_model_dir": data_model_dir, "input_keys_file": input_keys_path},
                             "input_example": input_example_local,
                             "signature": signature_local,
                         }
@@ -5593,16 +5758,14 @@ Notes:
             if pre_fn is None:
                 return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
 
+            # Avoid tf.numpy_function / PyFunc inside the exported model because
+            # MLflow reloads the model in a fresh process during its inference check.
+            # Most Keras application preprocess_input functions are TensorFlow-safe,
+            # and the fallback scaling lambda is also graph-safe.
             def _tf_preprocess(x):
-                def _np_call(x_np):
-                    try:
-                        out = pre_fn(x_np)
-                    except Exception:
-                        out = x_np
-                    out = np.asarray(out, dtype=np.float32)
-                    return out
-
-                y = tf.numpy_function(_np_call, [x], Tout=tf.float32)
+                x = tf.cast(x, tf.float32)
+                y = pre_fn(x)
+                y = tf.cast(y, tf.float32)
                 try:
                     y.set_shape([None, img_size[0], img_size[1], 3])
                 except Exception:
