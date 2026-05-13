@@ -4361,7 +4361,7 @@ Notes:
         # shuffle small buffer
         if shuffle:
             # Smaller shuffle buffer lowers RAM usage; it does not remove samples from the dataset.
-            ds = ds.shuffle(buffer_size=min(64, max(32, batch_size * 4)), seed=seed)
+            ds = ds.shuffle(buffer_size=min(24, max(32, batch_size * 4)), seed=seed)
 
         # map: uint8 -> float32, resize, apply tf_preprocess_fn if available
         def _map_to_model_tensors(inputs, label):
@@ -4494,8 +4494,1547 @@ Notes:
             except Exception:
                 logger and logger.exception("Failed to build optimizer from string '%s'; falling back to default Adam.", str(optimizer_name))
                 return tf.keras.optimizers.Adam(learning_rate=float(current_lr))
-    
+
     @staticmethod
+    def _log_history_metrics_to_mlflow(history_obj, model_key_local, out_dir):
+        try:
+            import csv as _csv
+            history_dict = {}
+            if isinstance(history_obj, dict):
+                history_dict = history_obj
+            elif hasattr(history_obj, "history"):
+                history_dict = history_obj.history or {}
+
+            if not history_dict:
+                return 0
+
+            n_epochs_total_local = 0
+            for values in history_dict.values():
+                try:
+                    n_epochs_total_local = max(n_epochs_total_local, len(values))
+                except Exception:
+                    pass
+
+            for epoch_idx_local in range(n_epochs_total_local):
+                for metric_name_local, values_local in history_dict.items():
+                    try:
+                        if epoch_idx_local < len(values_local):
+                            metric_value = values_local[epoch_idx_local]
+                            if metric_value is not None:
+                                mlflow.log_metric(metric_name_local, float(metric_value), step=int(epoch_idx_local + 1))
+                    except Exception:
+                        pass
+
+            metrics_csv_local = os.path.join(out_dir, f"{model_key_local}_metrics_per_epoch.csv")
+            try:
+                with open(metrics_csv_local, "w", newline="") as fh:
+                    writer = _csv.writer(fh)
+                    header = ["epoch"] + list(history_dict.keys())
+                    writer.writerow(header)
+                    for e_local in range(n_epochs_total_local):
+                        row = [e_local + 1]
+                        for k_local in history_dict.keys():
+                            vals_local = history_dict.get(k_local, [])
+                            row.append(vals_local[e_local] if e_local < len(vals_local) else "")
+                        writer.writerow(row)
+                try:
+                    mlflow.log_artifact(metrics_csv_local, artifact_path="metrics")
+                    logger and logger.info("Logged per-epoch metrics CSV to MLflow: %s", metrics_csv_local)
+                except Exception:
+                    logger and logger.debug("Couldn't log per-epoch metrics CSV to MLflow.")
+            except Exception:
+                logger and logger.exception("Failed writing per-epoch metrics CSV.")
+            return n_epochs_total_local
+        except Exception:
+            logger and logger.exception("Failed logging history metrics to MLflow.")
+            return 0
+
+    @staticmethod
+    def _build_mlflow_input_example(model_obj, fallback_img_size=(120, 120)):
+        try:
+            import numpy as _np
+
+            def _normalize_name(tensor_local, fallback_name_local):
+                try:
+                    name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
+                except Exception:
+                    name_local = ""
+                return name_local or fallback_name_local
+
+            def _normalize_shape(shape_local):
+                try:
+                    shape_list_local = list(shape_local)
+                except Exception:
+                    return None
+                if not shape_list_local:
+                    return tuple()
+                normalized_local = []
+                for idx_local, dim_local in enumerate(shape_list_local):
+                    if idx_local == 0:
+                        normalized_local.append(1)
+                    elif dim_local is None:
+                        normalized_local.append(1)
+                    else:
+                        try:
+                            normalized_local.append(int(dim_local))
+                        except Exception:
+                            normalized_local.append(1)
+                return tuple(normalized_local)
+
+            def _dtype_from_tensor(tensor_local):
+                try:
+                    return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
+                except Exception:
+                    return _np.dtype(_np.float32)
+
+            def _dummy_for_tensor(tensor_local):
+                try:
+                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                    dtype_local = _dtype_from_tensor(tensor_local)
+                    if shape_local is None:
+                        return _np.zeros((1,), dtype=dtype_local)
+                    return _np.zeros(shape_local, dtype=dtype_local)
+                except Exception:
+                    return _np.zeros((1,), dtype=_np.float32)
+
+            input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
+            if not input_tensors_local:
+                input_shape_local = getattr(model_obj, "input_shape", None)
+                if input_shape_local is None:
+                    return _np.zeros((1, int(fallback_img_size[0]), int(fallback_img_size[1]), 3), dtype=_np.float32)
+                if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
+                    input_shape_iter_local = list(input_shape_local)
+                else:
+                    input_shape_iter_local = [input_shape_local]
+                input_tensors_local = []
+                for idx_local, shape_local in enumerate(input_shape_iter_local):
+                    input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
+
+            if len(input_tensors_local) == 1:
+                return _dummy_for_tensor(input_tensors_local[0])
+
+            example_local = {}
+            used_names_local = set()
+            for idx_local, inp_local in enumerate(input_tensors_local):
+                base_name_local = _normalize_name(inp_local, f"input_{idx_local}")
+                input_name_local = base_name_local
+                suffix_local = 1
+                while input_name_local in used_names_local:
+                    input_name_local = f"{base_name_local}_{suffix_local}"
+                    suffix_local += 1
+                used_names_local.add(input_name_local)
+                example_local[input_name_local] = _dummy_for_tensor(inp_local)
+            return example_local
+        except Exception:
+            return _np.zeros((1, int(fallback_img_size[0]), int(fallback_img_size[1]), 3), dtype=_np.float32)
+
+    @staticmethod
+    def _save_model_architecture_artifacts(model_obj, model_key_local, out_dir_local):
+        """
+        Save a model diagram PNG and a plain-text model.summary() artifact.
+        Falls back to a text-rendered PNG when tensorflow's plot_model backend
+        is unavailable (e.g., missing pydot/graphviz).
+        """
+        import os
+        import textwrap as _textwrap
+
+        artifact_dir_local = os.path.join(out_dir_local, "model_architecture")
+        os.makedirs(artifact_dir_local, exist_ok=True)
+
+        summary_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_summary.txt")
+        diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_diagram.png")
+        nested_diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_nested_model_diagram.png")
+
+        try:
+            with open(summary_path_local, "w", encoding="utf-8") as fh:
+                model_obj.summary(print_fn=lambda s: fh.write(s + "\n"))
+        except Exception as e_sum:
+            with open(summary_path_local, "w", encoding="utf-8") as fh:
+                fh.write(f"Could not generate model.summary(): {e_sum}\n")
+
+        diagram_saved = False
+        try:
+            from tensorflow.keras.utils import plot_model as _plot_model
+            _plot_model(model_obj, to_file=diagram_path_local, show_shapes=True, show_layer_names=True, expand_nested=False, dpi=400)
+            _plot_model(model_obj, to_file=nested_diagram_path_local, show_shapes=True, show_layer_names=True, expand_nested=True, dpi=400)
+            diagram_saved = True
+        except Exception as e_plot:
+            logger and logger.warning("Could not save model diagram artifact for %s with plot_model: %s", model_key_local, str(e_plot))
+
+        if not diagram_saved:
+            try:
+                import matplotlib.pyplot as _plt
+                
+                fig = _plt.figure(figsize=(12, 0.35 * max(12, len(open(summary_path_local, encoding="utf-8").read().splitlines()))))
+                _plt.axis("off")
+                with open(summary_path_local, "r", encoding="utf-8") as fh:
+                    summary_text_local = fh.read()
+
+                # keep the PNG reasonably compact
+                summary_text_local = "\n".join(summary_text_local.splitlines()[:250])
+                summary_text_local = _textwrap.shorten(summary_text_local, width=12000, placeholder="\n...[truncated]...")
+                _plt.text(
+                    0.01,
+                    0.99,
+                    summary_text_local,
+                    va="top",
+                    ha="left",
+                    family="monospace",
+                    fontsize=8,
+                )
+                _plt.savefig(diagram_path_local, bbox_inches="tight")
+                _plt.close(fig)
+                diagram_saved = True
+            except Exception as e_fallback:
+                with open(diagram_path_local.replace(".png", ".txt"), "w", encoding="utf-8") as fh:
+                    fh.write(f"Could not render diagram PNG for {model_key_local}: {e_fallback}\n")
+
+        try:
+            mlflow.log_artifact(summary_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging model summary artifact for %s.", model_key_local)
+        try:
+            mlflow.log_artifact(diagram_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging model diagram artifact for %s.", model_key_local)
+        try:
+            mlflow.log_artifact(nested_diagram_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging nested model diagram artifact for %s.", model_key_local)
+
+        return {"summary": summary_path_local, "diagram": diagram_path_local, "nested_diagram": nested_diagram_path_local, "artifact_dir": artifact_dir_local}
+
+    @staticmethod
+    def _build_mlflow_signature(model_obj):
+        try:
+            import numpy as _np
+            from mlflow.models import ModelSignature
+            from mlflow.types.schema import Schema, TensorSpec
+
+            def _normalize_shape(shape_local):
+                try:
+                    shape_list_local = list(shape_local)
+                except Exception:
+                    return None
+                if not shape_list_local:
+                    return tuple()
+                normalized_local = []
+                for idx_local, dim_local in enumerate(shape_list_local):
+                    if idx_local == 0:
+                        normalized_local.append(-1)
+                    elif dim_local is None:
+                        normalized_local.append(-1)
+                    else:
+                        try:
+                            normalized_local.append(int(dim_local))
+                        except Exception:
+                            normalized_local.append(dim_local)
+                return tuple(normalized_local)
+
+            def _tensor_dtype(tensor_local):
+                try:
+                    return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
+                except Exception:
+                    return _np.dtype(_np.float32)
+
+            def _tensor_name(tensor_local, fallback_name_local):
+                try:
+                    name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
+                    return name_local or fallback_name_local
+                except Exception:
+                    return fallback_name_local
+
+            input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
+            if not input_tensors_local:
+                input_shape_local = getattr(model_obj, "input_shape", None)
+                if input_shape_local is None:
+                    return None
+                if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
+                    input_shape_iter_local = list(input_shape_local)
+                else:
+                    input_shape_iter_local = [input_shape_local]
+                input_tensors_local = []
+                for idx_local, shape_local in enumerate(input_shape_iter_local):
+                    input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
+
+            output_tensors_local = list(getattr(model_obj, "outputs", []) or [])
+            if not output_tensors_local:
+                output_shape_local = getattr(model_obj, "output_shape", None)
+                if output_shape_local is None:
+                    return None
+                if isinstance(output_shape_local, (list, tuple)) and output_shape_local and isinstance(output_shape_local[0], (list, tuple)):
+                    output_shape_iter_local = list(output_shape_local)
+                else:
+                    output_shape_iter_local = [output_shape_local]
+                output_tensors_local = []
+                for idx_local, shape_local in enumerate(output_shape_iter_local):
+                    output_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"output_{idx_local}"})())
+
+            input_specs_local = []
+            for idx_local, tensor_local in enumerate(input_tensors_local):
+                shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                if shape_local is None:
+                    return None
+                input_specs_local.append(TensorSpec(_tensor_dtype(tensor_local), shape_local, name=_tensor_name(tensor_local, f"input_{idx_local}")))
+
+            output_specs_local = []
+            for idx_local, tensor_local in enumerate(output_tensors_local):
+                shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                if shape_local is None:
+                    return None
+                output_specs_local.append(TensorSpec(_tensor_dtype(tensor_local), shape_local, name=_tensor_name(tensor_local, f"output_{idx_local}")))
+
+            if not input_specs_local:
+                return None
+
+            return ModelSignature(inputs=Schema(input_specs_local), outputs=Schema(output_specs_local) if output_specs_local else None)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str, register_model_name: str = None, input_example_local=None, signature_local=None):
+        import json
+        import os
+        import shutil
+        import tempfile
+        import sys as _sys
+        import yaml as _yaml
+        import inspect as _inspect
+
+        if input_example_local is None:
+            input_example_local = TrainModelService._build_mlflow_input_example(model)
+        if signature_local is None:
+            signature_local = TrainModelService._build_mlflow_signature(model)
+
+        tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
+        data_model_dir = os.path.join(tmp_model_dir, "data", "model")
+        os.makedirs(data_model_dir, exist_ok=True)
+
+        try:
+            tf.saved_model.save(model, data_model_dir)
+
+            input_keys_path = os.path.join(tmp_model_dir, "input_keys.json")
+            try:
+                model_input_keys_local = []
+                for idx_local, inp in enumerate(list(getattr(model, "inputs", []) or [])):
+                    try:
+                        model_input_keys_local.append(str(getattr(inp, "name", "")).split(":")[0] or f"input_{idx_local}")
+                    except Exception:
+                        model_input_keys_local.append(f"input_{idx_local}")
+                if model_input_keys_local:
+                    with open(input_keys_path, "w", encoding="utf-8") as fh:
+                        json.dump(model_input_keys_local, fh)
+                else:
+                    input_keys_path = None
+            except Exception:
+                input_keys_path = None
+
+            class _SavedModelPyFuncWrapper(mlflow.pyfunc.PythonModel):
+                def load_context(self, context):
+                    import json as _json
+                    import os as _os
+                    import tensorflow as _tf
+
+                    saved_model_dir = context.artifacts["saved_model_dir"]
+                    self._loaded_model = None
+                    self._infer_fn = None
+                    self._input_keys = []
+                    self._can_call_model_directly = False
+
+                    try:
+                        input_keys_file = context.artifacts.get("input_keys_file")
+                        if input_keys_file and _os.path.exists(input_keys_file):
+                            with open(input_keys_file, "r", encoding="utf-8") as fh:
+                                self._input_keys = list(_json.load(fh) or [])
+                    except Exception:
+                        self._input_keys = []
+
+                    try:
+                        self._loaded_model = _tf.keras.models.load_model(saved_model_dir, compile=False)
+                        self._can_call_model_directly = True
+                    except Exception:
+                        try:
+                            self._loaded_model = _tf.saved_model.load(saved_model_dir)
+                        except Exception:
+                            self._loaded_model = None
+
+                    try:
+                        signatures = getattr(self._loaded_model, "signatures", None) or {}
+                        if isinstance(signatures, dict) and signatures:
+                            self._infer_fn = signatures.get("serving_default") or next(iter(signatures.values()))
+                    except Exception:
+                        self._infer_fn = None
+
+                    try:
+                        if self._infer_fn is not None and not self._input_keys:
+                            structured_input_signature = getattr(self._infer_fn, "structured_input_signature", None)
+                            if structured_input_signature and isinstance(structured_input_signature, tuple) and len(structured_input_signature) >= 2 and isinstance(structured_input_signature[1], dict):
+                                self._input_keys = list(structured_input_signature[1].keys())
+                    except Exception:
+                        self._input_keys = self._input_keys or []
+
+                    try:
+                        if not self._input_keys and self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                            keras_input_keys = []
+                            for idx_local, inp in enumerate(list(getattr(self._loaded_model, "inputs", []) or [])):
+                                try:
+                                    keras_input_keys.append(str(getattr(inp, "name", "")).split(":")[0] or f"input_{idx_local}")
+                                except Exception:
+                                    keras_input_keys.append(f"input_{idx_local}")
+                            if keras_input_keys:
+                                self._input_keys = keras_input_keys
+                    except Exception:
+                        pass
+
+                def _coerce_inputs(self, model_input):
+                    import numpy as _np
+                    import pandas as _pd
+                    import tensorflow as _tf
+
+                    if isinstance(model_input, dict):
+                        if self._input_keys:
+                            ordered = []
+                            missing = []
+                            for key in self._input_keys:
+                                if key in model_input:
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(model_input[key]))
+                                    except Exception:
+                                        ordered.append(model_input[key])
+                                else:
+                                    missing.append(key)
+                            if ordered and not missing:
+                                return ordered
+                        return {k: _tf.convert_to_tensor(v) for k, v in model_input.items()}
+
+                    if isinstance(model_input, _pd.DataFrame):
+                        if self._input_keys:
+                            ordered = []
+                            missing = []
+                            for key in self._input_keys:
+                                if key in model_input.columns:
+                                    col_values = model_input[key].to_numpy()
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(_np.asarray(col_values)))
+                                    except Exception:
+                                        ordered.append(_tf.convert_to_tensor(col_values))
+                                else:
+                                    missing.append(key)
+                            if ordered and not missing:
+                                return ordered
+                        try:
+                            return _tf.convert_to_tensor(model_input.to_numpy())
+                        except Exception:
+                            return model_input.to_numpy()
+
+                    if isinstance(model_input, (list, tuple)):
+                        try:
+                            return [_tf.convert_to_tensor(x) if not hasattr(x, "shape") else _tf.convert_to_tensor(x) for x in model_input]
+                        except Exception:
+                            return list(model_input)
+
+                    try:
+                        return _tf.convert_to_tensor(model_input)
+                    except Exception:
+                        return model_input
+
+                def _coerce_outputs(self, outputs):
+                    import numpy as _np
+                    if isinstance(outputs, dict):
+                        converted = {}
+                        for k, v in outputs.items():
+                            try:
+                                converted[k] = v.numpy() if hasattr(v, "numpy") else _np.asarray(v)
+                            except Exception:
+                                converted[k] = v
+                        return converted
+                    return outputs.numpy() if hasattr(outputs, "numpy") else _np.asarray(outputs)
+
+                def predict(self, context, model_input):
+                    inputs = self._coerce_inputs(model_input)
+
+                    def _to_positional_inputs(preferred_inputs):
+                        import tensorflow as _tf
+                        import numpy as _np
+                        import pandas as _pd
+
+                        input_names = list(self._input_keys or [])
+                        if not input_names:
+                            try:
+                                if self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                                    for idx_local, inp in enumerate(list(getattr(self._loaded_model, "inputs", []) or [])):
+                                        try:
+                                            input_names.append(str(getattr(inp, "name", "")).split(":")[0] or f"input_{idx_local}")
+                                        except Exception:
+                                            input_names.append(f"input_{idx_local}")
+                            except Exception:
+                                input_names = []
+
+                        if input_names:
+                            source_dict = None
+                            if isinstance(preferred_inputs, dict):
+                                source_dict = preferred_inputs
+                            elif isinstance(model_input, dict):
+                                source_dict = model_input
+
+                            if source_dict is not None:
+                                ordered = []
+                                for key in input_names:
+                                    if key in source_dict:
+                                        try:
+                                            ordered.append(_tf.convert_to_tensor(source_dict[key]))
+                                        except Exception:
+                                            ordered.append(source_dict[key])
+                                if len(ordered) == len(input_names):
+                                    return ordered
+
+                        if isinstance(model_input, _pd.DataFrame) and input_names:
+                            ordered = []
+                            for key in input_names:
+                                if key in model_input.columns:
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(_np.asarray(model_input[key].to_numpy())))
+                                    except Exception:
+                                        ordered.append(_tf.convert_to_tensor(model_input[key].to_numpy()))
+                            if len(ordered) == len(input_names):
+                                return ordered
+
+                        if isinstance(preferred_inputs, (list, tuple)):
+                            return list(preferred_inputs)
+                        return preferred_inputs
+
+                    positional_inputs = _to_positional_inputs(inputs)
+
+                    if self._can_call_model_directly and self._loaded_model is not None:
+                        try:
+                            outputs = self._loaded_model(positional_inputs, training=False)
+                            return self._coerce_outputs(outputs)
+                        except Exception:
+                            pass
+
+                    if self._infer_fn is not None:
+                        try:
+                            if isinstance(positional_inputs, (list, tuple)):
+                                outputs = self._infer_fn(*positional_inputs)
+                            elif isinstance(positional_inputs, dict):
+                                outputs = self._infer_fn(**positional_inputs)
+                            else:
+                                outputs = self._infer_fn(positional_inputs)
+                            return self._coerce_outputs(outputs)
+                        except Exception:
+                            pass
+
+                    if self._loaded_model is not None and callable(self._loaded_model):
+                        try:
+                            outputs = self._loaded_model(positional_inputs, training=False)
+                        except TypeError:
+                            outputs = self._loaded_model(positional_inputs)
+                        return self._coerce_outputs(outputs)
+
+                    raise RuntimeError("SavedModel serving signature is unavailable and the loaded model could not be called directly.")
+
+            log_model_fn = mlflow.pyfunc.log_model
+            log_model_sig = _inspect.signature(log_model_fn)
+            log_model_kwargs = {
+                "python_model": _SavedModelPyFuncWrapper(),
+                "artifacts": {"saved_model_dir": data_model_dir, "input_keys_file": input_keys_path},
+                "input_example": input_example_local,
+                "signature": signature_local,
+            }
+
+            if "name" in log_model_sig.parameters:
+                log_model_kwargs["name"] = "model"
+            elif "artifact_path" in log_model_sig.parameters:
+                log_model_kwargs["artifact_path"] = "model"
+
+            if "registered_model_name" in log_model_sig.parameters and register_model_name:
+                log_model_kwargs["registered_model_name"] = register_model_name
+
+            model_info = log_model_fn(**log_model_kwargs)
+            logger.info("Logged pyfunc model to MLflow using the SavedModel wrapper for %s.", model_key)
+
+            registration_info = None
+            if register_model_name and "registered_model_name" not in log_model_sig.parameters:
+                try:
+                    active_run = mlflow.active_run()
+                    if active_run is not None:
+                        mv = mlflow.register_model(model_uri=getattr(model_info, "model_uri", f"runs:/{active_run.info.run_id}/model"), name=register_model_name)
+                        registration_info = {"name": mv.name, "version": mv.version, "stage": getattr(mv, "current_stage", None), "status": getattr(mv, "status", None)}
+                except Exception:
+                    logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                    registration_info = None
+
+            return {"mode": "mlflow.pyfunc.log_model", "artifact_path": "model", "model_uri": getattr(model_info, "model_uri", None), "registered_model": registration_info if register_model_name else register_model_name}
+
+        except Exception as e1:
+            logger.warning("Primary MLflow pyfunc logging failed for %s; trying MLflow SavedModel fallback. Error: %s", model_key, e1)
+
+        try:
+            from mlflow.models import Model as _MlflowModel
+        except Exception:
+            from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
+
+        try:
+            mlflow_model = _MlflowModel()
+            mlflow_model.add_flavor("tensorflow", saved_model_dir=os.path.join("data", "model"), model_type="tf2-module")
+
+            try:
+                mlflow.pyfunc.add_to_model(mlflow_model, loader_module="mlflow.tensorflow", conda_env="conda.yaml", python_env="python_env.yaml")
+            except Exception:
+                pass
+
+            mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
+
+            try:
+                conda_env = mlflow.tensorflow.get_default_conda_env()
+            except Exception:
+                conda_env = {"name": "mlflow-env", "channels": ["conda-forge"], "dependencies": [f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}", {"pip": [f"tensorflow=={tf.__version__}"]}]}
+
+            try:
+                pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
+            except Exception:
+                pip_reqs = [f"tensorflow=={tf.__version__}"]
+
+            with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
+                _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
+
+            with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(pip_reqs) + "\n")
+
+            try:
+                import importlib.metadata as _importlib_metadata
+                pip_ver = _importlib_metadata.version("pip")
+                setuptools_ver = _importlib_metadata.version("setuptools")
+                wheel_ver = _importlib_metadata.version("wheel")
+            except Exception:
+                pip_ver = "unknown"
+                setuptools_ver = "unknown"
+                wheel_ver = "unknown"
+
+            python_env_payload = {"python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}", "build_dependencies": [f"pip=={pip_ver}", f"setuptools=={setuptools_ver}", f"wheel=={wheel_ver}"], "dependencies": ["-r requirements.txt"]}
+            with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
+                _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
+
+            manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                json.dump({"model_key": model_key, "export_mode": "tf.saved_model.save", "artifact_path": "model", "mlflow_dir": True}, fh, indent=2)
+
+            mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
+            logger.info("Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.", model_key)
+
+            if register_model_name:
+                try:
+                    active_run = mlflow.active_run()
+                    if active_run is not None:
+                        mv = mlflow.register_model(model_uri=f"runs:/{active_run.info.run_id}/model", name=register_model_name)
+                        registration_info = {"name": mv.name, "version": mv.version, "stage": getattr(mv, "current_stage", None), "status": getattr(mv, "status", None)}
+                    else:
+                        registration_info = None
+                except Exception:
+                    logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                    registration_info = None
+            else:
+                registration_info = None
+
+            return {"mode": "tf.saved_model.save + mlflow_model_dir", "artifact_path": "model", "registered_model_ready": True, "registered_model": registration_info}
+
+        except Exception as e2:
+            logger.exception("TensorFlow/MLflow export failed for %s", model_key)
+            try:
+                weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
+                model.save_weights(weights_path)
+
+                summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
+                with open(summary_path, "w", encoding="utf-8") as fh:
+                    model.summary(print_fn=lambda s: fh.write(s + "\n"))
+
+                mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
+                logger.warning("Saved weights + summary fallback artifact for %s", model_key)
+                return {"mode": "weights_and_summary", "artifact_path": f"fallback_{model_key}", "error": str(e2)}
+            except Exception as e3:
+                logger.exception("Final fallback also failed for %s", model_key)
+                return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
+        finally:
+            shutil.rmtree(tmp_model_dir, ignore_errors=True)
+
+    @staticmethod
+    def _parse_field_text_local(text):
+        if text is None or (isinstance(text, str) and text.strip() == ""):
+            return None
+        s = text.strip()
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            pass
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _sample_dataset_devices(ds, n_samples=3):
+        observed = set()
+        try:
+            it = iter(ds)
+            for _ in range(n_samples):
+                try:
+                    batch = next(it)
+                except Exception:
+                    break
+
+                elems = batch if isinstance(batch, (list, tuple)) else (batch,)
+
+                def _collect_devices(x):
+                    devs = set()
+                    if isinstance(x, (list, tuple)):
+                        for y in x:
+                            devs |= _collect_devices(y)
+                    else:
+                        try:
+                            d = getattr(x, "device", None)
+                            if d:
+                                devs.add(d)
+                            else:
+                                devs.add("host:CPU")
+                        except Exception:
+                            devs.add("host:CPU")
+                    return devs
+
+                for el in elems:
+                    observed |= _collect_devices(el)
+        except Exception:
+            pass
+        return observed
+
+    @staticmethod
+    def _make_preprocess_layer(pre_fn, img_size):
+        if pre_fn is None:
+            return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
+
+        def _tf_preprocess(x):
+            x = tf.cast(x, tf.float32)
+            y = pre_fn(x)
+            y = tf.cast(y, tf.float32)
+            try:
+                y.set_shape([None, img_size[0], img_size[1], 3])
+            except Exception:
+                pass
+            return y
+
+        return tf.keras.layers.Lambda(_tf_preprocess, name="model_preprocess")
+    
+    def _build_mlflow_input_example(model_obj, fallback_img_size=(120, 120)):
+        try:
+            import numpy as _np
+
+            def _normalize_name(tensor_local, fallback_name_local):
+                try:
+                    name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
+                except Exception:
+                    name_local = ""
+                return name_local or fallback_name_local
+
+            def _normalize_shape(shape_local):
+                try:
+                    shape_list_local = list(shape_local)
+                except Exception:
+                    return None
+                if not shape_list_local:
+                    return tuple()
+                normalized_local = []
+                for idx_local, dim_local in enumerate(shape_list_local):
+                    if idx_local == 0:
+                        normalized_local.append(1)
+                    elif dim_local is None:
+                        normalized_local.append(1)
+                    else:
+                        try:
+                            normalized_local.append(int(dim_local))
+                        except Exception:
+                            normalized_local.append(1)
+                return tuple(normalized_local)
+
+            def _dtype_from_tensor(tensor_local):
+                try:
+                    return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
+                except Exception:
+                    return _np.dtype(_np.float32)
+
+            def _dummy_for_tensor(tensor_local):
+                try:
+                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                    dtype_local = _dtype_from_tensor(tensor_local)
+                    if shape_local is None:
+                        return _np.zeros((1,), dtype=dtype_local)
+                    return _np.zeros(shape_local, dtype=dtype_local)
+                except Exception:
+                    return _np.zeros((1,), dtype=_np.float32)
+
+            input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
+            if not input_tensors_local:
+                input_shape_local = getattr(model_obj, "input_shape", None)
+                if input_shape_local is None:
+                    return _np.zeros((1, int(fallback_img_size[0]), int(fallback_img_size[1]), 3), dtype=_np.float32)
+                if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
+                    input_shape_iter_local = list(input_shape_local)
+                else:
+                    input_shape_iter_local = [input_shape_local]
+                input_tensors_local = []
+                for idx_local, shape_local in enumerate(input_shape_iter_local):
+                    input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
+
+            if len(input_tensors_local) == 1:
+                return _dummy_for_tensor(input_tensors_local[0])
+
+            example_local = {}
+            used_names_local = set()
+            for idx_local, inp_local in enumerate(input_tensors_local):
+                base_name_local = _normalize_name(inp_local, f"input_{idx_local}")
+                input_name_local = base_name_local
+                suffix_local = 1
+                while input_name_local in used_names_local:
+                    input_name_local = f"{base_name_local}_{suffix_local}"
+                    suffix_local += 1
+                used_names_local.add(input_name_local)
+                example_local[input_name_local] = _dummy_for_tensor(inp_local)
+            return example_local
+        except Exception:
+            return _np.zeros((1, int(fallback_img_size[0]), int(fallback_img_size[1]), 3), dtype=_np.float32)
+
+
+    def _save_model_architecture_artifacts(model_obj, model_key_local, out_dir_local):
+        """
+        Save a model diagram PNG and a plain-text model.summary() artifact.
+        Falls back to a text-rendered PNG when tensorflow's plot_model backend
+        is unavailable (e.g., missing pydot/graphviz).
+        """
+        import os
+        import io
+        import re as _re
+        import textwrap as _textwrap
+
+        artifact_dir_local = os.path.join(out_dir_local, "model_architecture")
+        os.makedirs(artifact_dir_local, exist_ok=True)
+
+        summary_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_summary.txt")
+        diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_diagram.png")
+        nested_diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_nested_model_diagram.png")
+
+        # Save the textual summary first.
+        try:
+            with open(summary_path_local, "w", encoding="utf-8") as fh:
+                model_obj.summary(print_fn=lambda s: fh.write(s + "\n"))
+        except Exception as e_sum:
+            with open(summary_path_local, "w", encoding="utf-8") as fh:
+                fh.write(f"Could not generate model.summary(): {e_sum}\n")
+
+        # Try the native TensorFlow diagram path.
+        diagram_saved = False
+        try:
+            from tensorflow.keras.utils import plot_model as _plot_model
+
+            _plot_model(
+                model_obj,
+                to_file=diagram_path_local,
+                show_shapes=True,
+                show_layer_names=True,
+                expand_nested=False,
+                dpi=400,
+            )
+
+            _plot_model(
+                model_obj,
+                to_file=nested_diagram_path_local,
+                show_shapes=True,
+                show_layer_names=True,
+                expand_nested=True,
+                dpi=400,
+            )
+
+            diagram_saved = True
+        except Exception as e_plot:
+            logger and logger.warning(
+                "Could not save model diagram artifact for %s with plot_model: %s",
+                model_key_local,
+                str(e_plot),
+            )
+
+        # Fallback: render the summary text into a PNG so a diagram artifact always exists.
+        if not diagram_saved:
+            try:
+                import matplotlib.pyplot as _plt
+
+                fig = _plt.figure(figsize=(12, 0.35 * max(12, len(open(summary_path_local, encoding="utf-8").read().splitlines()))))
+                _plt.axis("off")
+                with open(summary_path_local, "r", encoding="utf-8") as fh:
+                    summary_text_local = fh.read()
+
+                # keep the PNG reasonably compact
+                summary_text_local = "\n".join(summary_text_local.splitlines()[:250])
+                summary_text_local = _textwrap.shorten(summary_text_local, width=12000, placeholder="\n...[truncated]...")
+                _plt.text(
+                    0.01,
+                    0.99,
+                    summary_text_local,
+                    va="top",
+                    ha="left",
+                    family="monospace",
+                    fontsize=8,
+                )
+                _plt.savefig(diagram_path_local, bbox_inches="tight")
+                _plt.close(fig)
+                diagram_saved = True
+            except Exception as e_fallback:
+                # As a last resort, create a small text file with the same name so logging does not break.
+                with open(diagram_path_local.replace(".png", ".txt"), "w", encoding="utf-8") as fh:
+                    fh.write(f"Could not render diagram PNG for {model_key_local}: {e_fallback}\n")
+
+        # Log both artifacts to MLflow.
+        try:
+            mlflow.log_artifact(summary_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging model summary artifact for %s.", model_key_local)
+        try:
+            mlflow.log_artifact(diagram_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging model diagram artifact for %s.", model_key_local)
+        try:
+            mlflow.log_artifact(nested_diagram_path_local, artifact_path="model_architecture")
+        except Exception:
+            logger and logger.exception("Failed logging nested model diagram artifact for %s.", model_key_local)
+
+        return {
+            "summary": summary_path_local,
+            "diagram": diagram_path_local,
+            "nested_diagram": nested_diagram_path_local,
+            "artifact_dir": artifact_dir_local,
+        }
+
+    def _build_mlflow_signature(model_obj, input_example_local):
+        try:
+            import numpy as _np
+            from mlflow.models import ModelSignature
+            from mlflow.types.schema import Schema, TensorSpec
+
+            def _normalize_shape(shape_local):
+                try:
+                    shape_list_local = list(shape_local)
+                except Exception:
+                    return None
+                if not shape_list_local:
+                    return tuple()
+                normalized_local = []
+                for idx_local, dim_local in enumerate(shape_list_local):
+                    if dim_local is None:
+                        normalized_local.append(-1)
+                    else:
+                        try:
+                            normalized_local.append(int(dim_local))
+                        except Exception:
+                            normalized_local.append(dim_local)
+                if normalized_local[0] != -1:
+                    normalized_local[0] = -1
+                return tuple(normalized_local)
+
+            def _tensor_dtype(tensor_local):
+                try:
+                    return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
+                except Exception:
+                    return _np.dtype(_np.float32)
+
+            def _tensor_name(tensor_local, fallback_name_local):
+                try:
+                    name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
+                    return name_local or fallback_name_local
+                except Exception:
+                    return fallback_name_local
+
+            input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
+            if not input_tensors_local:
+                input_shape_local = getattr(model_obj, "input_shape", None)
+                if input_shape_local is None:
+                    return None
+                if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
+                    input_shape_iter_local = list(input_shape_local)
+                else:
+                    input_shape_iter_local = [input_shape_local]
+                input_tensors_local = []
+                for idx_local, shape_local in enumerate(input_shape_iter_local):
+                    input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
+
+            output_tensors_local = list(getattr(model_obj, "outputs", []) or [])
+            if not output_tensors_local:
+                output_shape_local = getattr(model_obj, "output_shape", None)
+                if output_shape_local is None:
+                    return None
+                if isinstance(output_shape_local, (list, tuple)) and output_shape_local and isinstance(output_shape_local[0], (list, tuple)):
+                    output_shape_iter_local = list(output_shape_local)
+                else:
+                    output_shape_iter_local = [output_shape_local]
+                output_tensors_local = []
+                for idx_local, shape_local in enumerate(output_shape_iter_local):
+                    output_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"output_{idx_local}"})())
+
+            input_specs_local = []
+            for idx_local, tensor_local in enumerate(input_tensors_local):
+                shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                if shape_local is None:
+                    return None
+                input_specs_local.append(
+                    TensorSpec(
+                        _tensor_dtype(tensor_local),
+                        shape_local,
+                        name=_tensor_name(tensor_local, f"input_{idx_local}"),
+                    )
+                )
+
+            output_specs_local = []
+            for idx_local, tensor_local in enumerate(output_tensors_local):
+                shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
+                if shape_local is None:
+                    return None
+                output_specs_local.append(
+                    TensorSpec(
+                        _tensor_dtype(tensor_local),
+                        shape_local,
+                        name=_tensor_name(tensor_local, f"output_{idx_local}"),
+                    )
+                )
+
+            if not input_specs_local:
+                return None
+
+            return ModelSignature(
+                inputs=Schema(input_specs_local),
+                outputs=Schema(output_specs_local) if output_specs_local else None,
+            )
+        except Exception as e_sig:
+            logger and logger.debug(
+                "Could not build MLflow signature for %s from model shapes: %s",
+                model_key,
+                str(e_sig),
+            )
+            return None
+
+    
+    def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str, register_model_name: str = None, fallback_img_size=(120, 120)):
+        import json
+        import os
+        import shutil
+        import tempfile
+        import sys as _sys
+        import yaml as _yaml
+        import inspect as _inspect
+
+        input_example_local = TrainModelService._build_mlflow_input_example(model, fallback_img_size=fallback_img_size)
+        signature_local = TrainModelService._build_mlflow_signature(model, input_example_local)
+
+        # 1) Prefer an MLflow pyfunc logged model that wraps a raw SavedModel artifact.
+        #    This avoids Keras/TensorFlow serialization paths that can fail on custom
+        #    lambdas / numpy_function preprocessing, while still creating a real
+        #    LoggedModel that can be registered and deployed.
+        tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
+        data_model_dir = os.path.join(tmp_model_dir, "data", "model")
+        os.makedirs(data_model_dir, exist_ok=True)
+
+        try:
+            # Export a raw TensorFlow SavedModel first. This is the same artifact
+            # that the previous fallback already managed to create successfully.
+            tf.saved_model.save(model, data_model_dir)
+
+            # Persist the original model input names/order so the pyfunc wrapper can
+            # reconstruct positional inputs even when the loaded SavedModel exposes
+            # generic tensor names (inputs, inputs_1, ...).
+            input_keys_path = os.path.join(tmp_model_dir, "input_keys.json")
+            try:
+                model_input_keys_local = []
+                for inp in list(getattr(model, "inputs", []) or []):
+                    try:
+                        model_input_keys_local.append(str(getattr(inp, "name", "")).split(":")[0])
+                    except Exception:
+                        continue
+                if model_input_keys_local:
+                    with open(input_keys_path, "w", encoding="utf-8") as fh:
+                        json.dump(model_input_keys_local, fh)
+                else:
+                    input_keys_path = None
+            except Exception:
+                input_keys_path = None
+
+            class _SavedModelPyFuncWrapper(mlflow.pyfunc.PythonModel):
+                def load_context(self, context):
+                    import json as _json
+                    import os as _os
+                    import tensorflow as _tf
+
+                    saved_model_dir = context.artifacts["saved_model_dir"]
+                    self._loaded_model = None
+                    self._infer_fn = None
+                    self._input_keys = []
+                    self._can_call_model_directly = False
+
+                    # Load the original input order if it was persisted at log time.
+                    try:
+                        input_keys_file = context.artifacts.get("input_keys_file")
+                        if input_keys_file and _os.path.exists(input_keys_file):
+                            with open(input_keys_file, "r", encoding="utf-8") as fh:
+                                self._input_keys = list(_json.load(fh) or [])
+                    except Exception:
+                        self._input_keys = []
+
+                    # Prefer loading as a Keras model so inference can run directly in eager mode,
+                    # which avoids depending on a SavedModel serving signature.
+                    try:
+                        self._loaded_model = _tf.keras.models.load_model(saved_model_dir, compile=False)
+                        self._can_call_model_directly = True
+                    except Exception:
+                        try:
+                            self._loaded_model = _tf.saved_model.load(saved_model_dir)
+                        except Exception:
+                            self._loaded_model = None
+
+                    try:
+                        signatures = getattr(self._loaded_model, "signatures", None) or {}
+                        if isinstance(signatures, dict) and signatures:
+                            self._infer_fn = signatures.get("serving_default") or next(iter(signatures.values()))
+                    except Exception:
+                        self._infer_fn = None
+
+                    try:
+                        if self._infer_fn is not None and not self._input_keys:
+                            structured_input_signature = getattr(self._infer_fn, "structured_input_signature", None)
+                            if (
+                                structured_input_signature
+                                and isinstance(structured_input_signature, tuple)
+                                and len(structured_input_signature) >= 2
+                                and isinstance(structured_input_signature[1], dict)
+                            ):
+                                self._input_keys = list(structured_input_signature[1].keys())
+                    except Exception:
+                        self._input_keys = self._input_keys or []
+
+                    # If a Keras model was loaded and no explicit input order was saved,
+                    # fall back to the input tensor names exposed by the loaded model.
+                    try:
+                        if not self._input_keys and self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                            keras_input_keys = []
+                            for inp in list(getattr(self._loaded_model, "inputs", []) or []):
+                                try:
+                                    keras_input_keys.append(str(getattr(inp, "name", "")).split(":")[0])
+                                except Exception:
+                                    continue
+                            if keras_input_keys:
+                                self._input_keys = keras_input_keys
+                    except Exception:
+                        pass
+
+                def _coerce_inputs(self, model_input):
+                    import numpy as _np
+                    import pandas as _pd
+                    import tensorflow as _tf
+
+                    # For this model, the exported callable expects positional tensor inputs
+                    # in the exact order of model.inputs. Convert dict/DataFrame inputs into
+                    # that ordered list so eager calls match the SavedModel / Keras signature.
+                    if isinstance(model_input, dict):
+                        if self._input_keys:
+                            ordered = []
+                            missing = []
+                            for key in self._input_keys:
+                                if key in model_input:
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(model_input[key]))
+                                    except Exception:
+                                        ordered.append(model_input[key])
+                                else:
+                                    missing.append(key)
+                            if ordered and not missing:
+                                return ordered
+                        return {k: _tf.convert_to_tensor(v) for k, v in model_input.items()}
+
+                    if isinstance(model_input, _pd.DataFrame):
+                        if self._input_keys:
+                            ordered = []
+                            missing = []
+                            for key in self._input_keys:
+                                if key in model_input.columns:
+                                    col_values = model_input[key].to_numpy()
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(_np.asarray(col_values)))
+                                    except Exception:
+                                        ordered.append(_tf.convert_to_tensor(col_values))
+                                else:
+                                    missing.append(key)
+                            if ordered and not missing:
+                                return ordered
+                        try:
+                            return _tf.convert_to_tensor(model_input.to_numpy())
+                        except Exception:
+                            return model_input.to_numpy()
+
+                    if isinstance(model_input, (list, tuple)):
+                        try:
+                            # Preserve list/tuple order as-is for positional signatures.
+                            return [
+                                _tf.convert_to_tensor(x) if not hasattr(x, "shape") else _tf.convert_to_tensor(x)
+                                for x in model_input
+                            ]
+                        except Exception:
+                            return list(model_input)
+
+                    try:
+                        return _tf.convert_to_tensor(model_input)
+                    except Exception:
+                        return model_input
+
+                def _coerce_outputs(self, outputs):
+                    import numpy as _np
+
+                    if isinstance(outputs, dict):
+                        converted = {}
+                        for k, v in outputs.items():
+                            try:
+                                converted[k] = v.numpy() if hasattr(v, "numpy") else _np.asarray(v)
+                            except Exception:
+                                converted[k] = v
+                        return converted
+                    return outputs.numpy() if hasattr(outputs, "numpy") else _np.asarray(outputs)
+
+                def predict(self, context, model_input):
+                    inputs = self._coerce_inputs(model_input)
+
+                    def _to_positional_inputs(preferred_inputs):
+                        import tensorflow as _tf
+                        import numpy as _np
+                        import pandas as _pd
+
+                        # Always prefer the original model input order persisted at log time.
+                        input_names = list(self._input_keys or [])
+                        if not input_names:
+                            try:
+                                if self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
+                                    for inp in list(getattr(self._loaded_model, "inputs", []) or []):
+                                        try:
+                                            input_names.append(str(getattr(inp, "name", "")).split(":")[0])
+                                        except Exception:
+                                            input_names.append("")
+                            except Exception:
+                                input_names = []
+
+                        if input_names:
+                            source_dict = None
+                            if isinstance(preferred_inputs, dict):
+                                source_dict = preferred_inputs
+                            elif isinstance(model_input, dict):
+                                source_dict = model_input
+
+                            if source_dict is not None:
+                                ordered = []
+                                for key in input_names:
+                                    if key in source_dict:
+                                        try:
+                                            ordered.append(_tf.convert_to_tensor(source_dict[key]))
+                                        except Exception:
+                                            ordered.append(source_dict[key])
+                                if len(ordered) == len(input_names):
+                                    return ordered
+
+                        # If the input is a DataFrame and we have named keys, extract columns in order.
+                        if isinstance(model_input, _pd.DataFrame) and input_names:
+                            ordered = []
+                            for key in input_names:
+                                if key in model_input.columns:
+                                    try:
+                                        ordered.append(_tf.convert_to_tensor(_np.asarray(model_input[key].to_numpy())))
+                                    except Exception:
+                                        ordered.append(_tf.convert_to_tensor(model_input[key].to_numpy()))
+                            if len(ordered) == len(input_names):
+                                return ordered
+
+                        # Fall back to whatever we already have if it's already positional.
+                        if isinstance(preferred_inputs, (list, tuple)):
+                            return list(preferred_inputs)
+                        return preferred_inputs
+
+                    positional_inputs = _to_positional_inputs(inputs)
+
+                    # 1) Preferred path: direct eager call on the loaded Keras model.
+                    #    For multi-input models, Keras expects a positional list that matches
+                    #    model.inputs order rather than a dict.
+                    if self._can_call_model_directly and self._loaded_model is not None:
+                        try:
+                            outputs = self._loaded_model(positional_inputs, training=False)
+                            return self._coerce_outputs(outputs)
+                        except Exception:
+                            # Fall through to SavedModel signature or callable fallback below.
+                            pass
+
+                    # 2) SavedModel serving signature, when available.
+                    if self._infer_fn is not None:
+                        try:
+                            if isinstance(positional_inputs, (list, tuple)):
+                                outputs = self._infer_fn(*positional_inputs)
+                            elif isinstance(positional_inputs, dict):
+                                outputs = self._infer_fn(**positional_inputs)
+                            else:
+                                outputs = self._infer_fn(positional_inputs)
+                            return self._coerce_outputs(outputs)
+                        except Exception:
+                            pass
+
+                    # 3) Last-resort callable fallback.
+                    if self._loaded_model is not None and callable(self._loaded_model):
+                        try:
+                            outputs = self._loaded_model(positional_inputs, training=False)
+                        except TypeError:
+                            outputs = self._loaded_model(positional_inputs)
+                        return self._coerce_outputs(outputs)
+
+                    raise RuntimeError(
+                        "SavedModel serving signature is unavailable and the loaded model could not be called directly."
+                    )
+
+            log_model_fn = mlflow.pyfunc.log_model
+            log_model_sig = _inspect.signature(log_model_fn)
+            log_model_kwargs = {
+                "python_model": _SavedModelPyFuncWrapper(),
+                "artifacts": {"saved_model_dir": data_model_dir, "input_keys_file": input_keys_path},
+                "input_example": input_example_local,
+                "signature": signature_local,
+            }
+
+            # Different MLflow versions expose either `name` or `artifact_path`.
+            # Prefer the available parameter without changing the rest of the pipeline.
+            if "name" in log_model_sig.parameters:
+                log_model_kwargs["name"] = "model"
+            elif "artifact_path" in log_model_sig.parameters:
+                log_model_kwargs["artifact_path"] = "model"
+
+            # Pass registered_model_name only when the installed MLflow version supports it.
+            if "registered_model_name" in log_model_sig.parameters and register_model_name:
+                log_model_kwargs["registered_model_name"] = register_model_name
+
+            model_info = log_model_fn(**log_model_kwargs)
+            logger.info("Logged pyfunc model to MLflow using the SavedModel wrapper for %s.", model_key)
+
+            registration_info = None
+            if register_model_name and "registered_model_name" not in log_model_sig.parameters:
+                try:
+                    active_run = mlflow.active_run()
+                    if active_run is not None:
+                        mv = mlflow.register_model(
+                            model_uri=getattr(model_info, "model_uri", f"runs:/{active_run.info.run_id}/model"),
+                            name=register_model_name,
+                        )
+                        registration_info = {
+                            "name": mv.name,
+                            "version": mv.version,
+                            "stage": getattr(mv, "current_stage", None),
+                            "status": getattr(mv, "status", None),
+                        }
+                except Exception:
+                    logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                    registration_info = None
+
+            return {
+                "mode": "mlflow.pyfunc.log_model",
+                "artifact_path": "model",
+                "model_uri": getattr(model_info, "model_uri", None),
+                "registered_model": registration_info if register_model_name else register_model_name,
+            }
+
+        except Exception as e1:
+            logger.warning(
+                "Primary MLflow pyfunc logging failed for %s; trying MLflow SavedModel fallback. Error: %s",
+                model_key,
+                e1,
+            )
+
+        # 2) Build a full MLflow model directory manually around a raw SavedModel export.
+        #    This preserves the previous non-destructive fallback behavior.
+        try:
+            # MLflow metadata
+            try:
+                from mlflow.models import Model as _MlflowModel
+            except Exception:
+                from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
+
+            mlflow_model = _MlflowModel()
+            mlflow_model.add_flavor(
+                "tensorflow",
+                saved_model_dir=os.path.join("data", "model"),
+                model_type="tf2-module",
+            )
+
+            try:
+                mlflow.pyfunc.add_to_model(
+                    mlflow_model,
+                    loader_module="mlflow.tensorflow",
+                    conda_env="conda.yaml",
+                    python_env="python_env.yaml",
+                )
+            except Exception:
+                # Keep the MLflow model valid even if pyfunc metadata helper changes.
+                pass
+
+            mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
+
+            # Environment files
+            try:
+                conda_env = mlflow.tensorflow.get_default_conda_env()
+            except Exception:
+                conda_env = {
+                    "name": "mlflow-env",
+                    "channels": ["conda-forge"],
+                    "dependencies": [
+                        f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                        {"pip": [f"tensorflow=={tf.__version__}"]},
+                    ],
+                }
+
+            try:
+                pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
+            except Exception:
+                pip_reqs = [f"tensorflow=={tf.__version__}"]
+
+            with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
+                _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
+
+            with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(pip_reqs) + "\n")
+
+            # Best-effort python_env.yaml that matches the MLflow layout.
+            try:
+                import importlib.metadata as _importlib_metadata
+                pip_ver = _importlib_metadata.version("pip")
+                setuptools_ver = _importlib_metadata.version("setuptools")
+                wheel_ver = _importlib_metadata.version("wheel")
+            except Exception:
+                pip_ver = "unknown"
+                setuptools_ver = "unknown"
+                wheel_ver = "unknown"
+
+            python_env_payload = {
+                "python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                "build_dependencies": [
+                    f"pip=={pip_ver}",
+                    f"setuptools=={setuptools_ver}",
+                    f"wheel=={wheel_ver}",
+                ],
+                "dependencies": ["-r requirements.txt"],
+            }
+            with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
+                _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
+
+            manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "model_key": model_key,
+                        "export_mode": "tf.saved_model.save",
+                        "artifact_path": "model",
+                        "mlflow_dir": True,
+                    },
+                    fh,
+                    indent=2,
+                )
+
+            mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
+            logger.info(
+                "Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.",
+                model_key,
+            )
+
+            if register_model_name:
+                try:
+                    active_run = mlflow.active_run()
+                    if active_run is not None:
+                        mv = mlflow.register_model(
+                            model_uri=f"runs:/{active_run.info.run_id}/model",
+                            name=register_model_name,
+                        )
+                        registration_info = {
+                            "name": mv.name,
+                            "version": mv.version,
+                            "stage": getattr(mv, "current_stage", None),
+                            "status": getattr(mv, "status", None),
+                        }
+                    else:
+                        registration_info = None
+                except Exception:
+                    logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
+                    registration_info = None
+            else:
+                registration_info = None
+
+            return {
+                "mode": "tf.saved_model.save + mlflow_model_dir",
+                "artifact_path": "model",
+                "registered_model_ready": True,
+                "registered_model": registration_info,
+            }
+
+        except Exception as e2:
+            logger.exception("TensorFlow/MLflow export failed for %s", model_key)
+
+            # 3) Last-resort fallback: keep the core artifacts so nothing is lost.
+            try:
+                weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
+                model.save_weights(weights_path)
+
+                summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
+                with open(summary_path, "w", encoding="utf-8") as fh:
+                    model.summary(print_fn=lambda s: fh.write(s + "\n"))
+
+                mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
+                logger.warning("Saved weights + summary fallback artifact for %s.", model_key)
+                return {
+                    "mode": "weights_and_summary",
+                    "artifact_path": f"fallback_{model_key}",
+                    "error": str(e2),
+                }
+            except Exception as e3:
+                logger.exception("Final fallback also failed for %s", model_key)
+                return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
+        finally:
+            shutil.rmtree(tmp_model_dir, ignore_errors=True)
+
+    # Optional check: log whether sample batches appear to land on GPU
+    def _sample_dataset_devices(ds, n_samples=3):
+        observed = set()
+        try:
+            it = iter(ds)
+            for _ in range(n_samples):
+                try:
+                    batch = next(it)
+                except Exception:
+                    break
+
+                elems = batch if isinstance(batch, (list, tuple)) else (batch,)
+
+                def _collect_devices(x):
+                    devs = set()
+                    if isinstance(x, (list, tuple)):
+                        for y in x:
+                            devs |= _collect_devices(y)
+                    else:
+                        try:
+                            d = getattr(x, "device", None)
+                            if d:
+                                devs.add(d)
+                            else:
+                                devs.add("host:CPU")
+                        except Exception:
+                            devs.add("host:CPU")
+                    return devs
+
+                for el in elems:
+                    observed |= _collect_devices(el)
+        except Exception:
+            pass
+        return observed
+    
     def train_all_behavior_types_image_models_from_csv_separate_aux(
         dataset_dir: str,
         matrix_column: str = "trajectory_image_matrix",
@@ -4537,786 +6076,8 @@ Notes:
         import os as _os
         import random as _random
 
-        def _log_history_metrics_to_mlflow(history_obj, model_key_local):
-            try:
-                history_dict = {}
-                if isinstance(history_obj, dict):
-                    history_dict = history_obj
-                elif hasattr(history_obj, "history"):
-                    history_dict = history_obj.history or {}
-
-                if not history_dict:
-                    return 0
-
-                n_epochs_total_local = 0
-                for values in history_dict.values():
-                    try:
-                        n_epochs_total_local = max(n_epochs_total_local, len(values))
-                    except Exception:
-                        pass
-
-                for epoch_idx_local in range(n_epochs_total_local):
-                    for metric_name_local, values_local in history_dict.items():
-                        try:
-                            if epoch_idx_local < len(values_local):
-                                metric_value = values_local[epoch_idx_local]
-                                if metric_value is not None:
-                                    mlflow.log_metric(
-                                        metric_name_local,
-                                        float(metric_value),
-                                        step=int(epoch_idx_local + 1),
-                                    )
-                        except Exception:
-                            pass
-
-                metrics_csv_local = os.path.join(out_dir, f"{model_key_local}_metrics_per_epoch.csv")
-                try:
-                    with open(metrics_csv_local, "w", newline="") as fh:
-                        writer = _csv.writer(fh)
-                        header = ["epoch"] + list(history_dict.keys())
-                        writer.writerow(header)
-                        for e_local in range(n_epochs_total_local):
-                            row = [e_local + 1]
-                            for k_local in history_dict.keys():
-                                vals_local = history_dict.get(k_local, [])
-                                row.append(vals_local[e_local] if e_local < len(vals_local) else "")
-                            writer.writerow(row)
-                    try:
-                        mlflow.log_artifact(metrics_csv_local, artifact_path="metrics")
-                        logger and logger.info("Logged per-epoch metrics CSV to MLflow: %s", metrics_csv_local)
-                    except Exception:
-                        logger and logger.debug("Couldn't log per-epoch metrics CSV to MLflow.")
-                except Exception:
-                    logger and logger.exception("Failed writing per-epoch metrics CSV.")
-                return n_epochs_total_local
-            except Exception:
-                logger and logger.exception("Failed logging history metrics to MLflow.")
-                return 0
-
-        def _build_mlflow_input_example(model_obj):
-            try:
-                model_inputs_local = list(getattr(model_obj, "inputs", []) or [])
-                if len(model_inputs_local) <= 1:
-                    return np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
-
-                example_local = {}
-                for inp_local in model_inputs_local:
-                    try:
-                        input_name_local = str(getattr(inp_local, "name", "input")).split(":")[0]
-                    except Exception:
-                        input_name_local = "input"
-
-                    if "image" in input_name_local.lower():
-                        example_local[input_name_local] = np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
-                    else:
-                        matched_col_local = None
-                        for col_local in aux_columns:
-                            if col_local in input_name_local:
-                                matched_col_local = col_local
-                                break
-                        L_local = int(aux_col_lengths.get(matched_col_local, 0) or 0) if matched_col_local else 0
-                        example_local[input_name_local] = np.zeros((1, L_local), dtype=np.float32)
-                return example_local
-            except Exception:
-                return np.zeros((1, img_size[0], img_size[1], 3), dtype=np.float32)
-
-
-        def _save_model_architecture_artifacts(model_obj, model_key_local, out_dir_local):
-            """
-            Save a model diagram PNG and a plain-text model.summary() artifact.
-            Falls back to a text-rendered PNG when tensorflow's plot_model backend
-            is unavailable (e.g., missing pydot/graphviz).
-            """
-            import os
-            import io
-            import re as _re
-            import textwrap as _textwrap
-
-            artifact_dir_local = os.path.join(out_dir_local, "model_architecture")
-            os.makedirs(artifact_dir_local, exist_ok=True)
-
-            summary_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_summary.txt")
-            diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_model_diagram.png")
-            nested_diagram_path_local = os.path.join(artifact_dir_local, f"{model_key_local}_nested_model_diagram.png")
-
-            # Save the textual summary first.
-            try:
-                with open(summary_path_local, "w", encoding="utf-8") as fh:
-                    model_obj.summary(print_fn=lambda s: fh.write(s + "\n"))
-            except Exception as e_sum:
-                with open(summary_path_local, "w", encoding="utf-8") as fh:
-                    fh.write(f"Could not generate model.summary(): {e_sum}\n")
-
-            # Try the native TensorFlow diagram path.
-            diagram_saved = False
-            try:
-                from tensorflow.keras.utils import plot_model as _plot_model
-
-                _plot_model(
-                    model_obj,
-                    to_file=diagram_path_local,
-                    show_shapes=True,
-                    show_layer_names=True,
-                    expand_nested=False,
-                    dpi=400,
-                )
-
-                _plot_model(
-                    model_obj,
-                    to_file=nested_diagram_path_local,
-                    show_shapes=True,
-                    show_layer_names=True,
-                    expand_nested=True,
-                    dpi=400,
-                )
-
-                diagram_saved = True
-            except Exception as e_plot:
-                logger and logger.warning(
-                    "Could not save model diagram artifact for %s with plot_model: %s",
-                    model_key_local,
-                    str(e_plot),
-                )
-
-            # Fallback: render the summary text into a PNG so a diagram artifact always exists.
-            if not diagram_saved:
-                try:
-                    import matplotlib.pyplot as _plt
-
-                    fig = _plt.figure(figsize=(12, 0.35 * max(12, len(open(summary_path_local, encoding="utf-8").read().splitlines()))))
-                    _plt.axis("off")
-                    with open(summary_path_local, "r", encoding="utf-8") as fh:
-                        summary_text_local = fh.read()
-
-                    # keep the PNG reasonably compact
-                    summary_text_local = "\n".join(summary_text_local.splitlines()[:250])
-                    summary_text_local = _textwrap.shorten(summary_text_local, width=12000, placeholder="\n...[truncated]...")
-                    _plt.text(
-                        0.01,
-                        0.99,
-                        summary_text_local,
-                        va="top",
-                        ha="left",
-                        family="monospace",
-                        fontsize=8,
-                    )
-                    _plt.savefig(diagram_path_local, bbox_inches="tight")
-                    _plt.close(fig)
-                    diagram_saved = True
-                except Exception as e_fallback:
-                    # As a last resort, create a small text file with the same name so logging does not break.
-                    with open(diagram_path_local.replace(".png", ".txt"), "w", encoding="utf-8") as fh:
-                        fh.write(f"Could not render diagram PNG for {model_key_local}: {e_fallback}\n")
-
-            # Log both artifacts to MLflow.
-            try:
-                mlflow.log_artifact(summary_path_local, artifact_path="model_architecture")
-            except Exception:
-                logger and logger.exception("Failed logging model summary artifact for %s.", model_key_local)
-            try:
-                mlflow.log_artifact(diagram_path_local, artifact_path="model_architecture")
-            except Exception:
-                logger and logger.exception("Failed logging model diagram artifact for %s.", model_key_local)
-            try:
-                mlflow.log_artifact(nested_diagram_path_local, artifact_path="model_architecture")
-            except Exception:
-                logger and logger.exception("Failed logging nested model diagram artifact for %s.", model_key_local)
-
-            return {
-                "summary": summary_path_local,
-                "diagram": diagram_path_local,
-                "nested_diagram": nested_diagram_path_local,
-                "artifact_dir": artifact_dir_local,
-            }
-
-        def _build_mlflow_signature(model_obj, input_example_local):
-            try:
-                import numpy as _np
-                from mlflow.models import ModelSignature
-                from mlflow.types.schema import Schema, TensorSpec
-
-                def _normalize_shape(shape_local):
-                    try:
-                        shape_list_local = list(shape_local)
-                    except Exception:
-                        return None
-                    if not shape_list_local:
-                        return tuple()
-                    normalized_local = []
-                    for idx_local, dim_local in enumerate(shape_list_local):
-                        if dim_local is None:
-                            normalized_local.append(-1)
-                        else:
-                            try:
-                                normalized_local.append(int(dim_local))
-                            except Exception:
-                                normalized_local.append(dim_local)
-                    if normalized_local[0] != -1:
-                        normalized_local[0] = -1
-                    return tuple(normalized_local)
-
-                def _tensor_dtype(tensor_local):
-                    try:
-                        return _np.dtype(getattr(tensor_local, "dtype", _np.float32))
-                    except Exception:
-                        return _np.dtype(_np.float32)
-
-                def _tensor_name(tensor_local, fallback_name_local):
-                    try:
-                        name_local = str(getattr(tensor_local, "name", "")).split(":")[0].strip()
-                        return name_local or fallback_name_local
-                    except Exception:
-                        return fallback_name_local
-
-                input_tensors_local = list(getattr(model_obj, "inputs", []) or [])
-                if not input_tensors_local:
-                    input_shape_local = getattr(model_obj, "input_shape", None)
-                    if input_shape_local is None:
-                        return None
-                    if isinstance(input_shape_local, (list, tuple)) and input_shape_local and isinstance(input_shape_local[0], (list, tuple)):
-                        input_shape_iter_local = list(input_shape_local)
-                    else:
-                        input_shape_iter_local = [input_shape_local]
-                    input_tensors_local = []
-                    for idx_local, shape_local in enumerate(input_shape_iter_local):
-                        input_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"input_{idx_local}"})())
-
-                output_tensors_local = list(getattr(model_obj, "outputs", []) or [])
-                if not output_tensors_local:
-                    output_shape_local = getattr(model_obj, "output_shape", None)
-                    if output_shape_local is None:
-                        return None
-                    if isinstance(output_shape_local, (list, tuple)) and output_shape_local and isinstance(output_shape_local[0], (list, tuple)):
-                        output_shape_iter_local = list(output_shape_local)
-                    else:
-                        output_shape_iter_local = [output_shape_local]
-                    output_tensors_local = []
-                    for idx_local, shape_local in enumerate(output_shape_iter_local):
-                        output_tensors_local.append(type("_TensorSpecProxy", (), {"shape": shape_local, "dtype": _np.float32, "name": f"output_{idx_local}"})())
-
-                input_specs_local = []
-                for idx_local, tensor_local in enumerate(input_tensors_local):
-                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
-                    if shape_local is None:
-                        return None
-                    input_specs_local.append(
-                        TensorSpec(
-                            _tensor_dtype(tensor_local),
-                            shape_local,
-                            name=_tensor_name(tensor_local, f"input_{idx_local}"),
-                        )
-                    )
-
-                output_specs_local = []
-                for idx_local, tensor_local in enumerate(output_tensors_local):
-                    shape_local = _normalize_shape(getattr(tensor_local, "shape", None))
-                    if shape_local is None:
-                        return None
-                    output_specs_local.append(
-                        TensorSpec(
-                            _tensor_dtype(tensor_local),
-                            shape_local,
-                            name=_tensor_name(tensor_local, f"output_{idx_local}"),
-                        )
-                    )
-
-                if not input_specs_local:
-                    return None
-
-                return ModelSignature(
-                    inputs=Schema(input_specs_local),
-                    outputs=Schema(output_specs_local) if output_specs_local else None,
-                )
-            except Exception as e_sig:
-                logger and logger.debug(
-                    "Could not build MLflow signature for %s from model shapes: %s",
-                    model_key,
-                    str(e_sig),
-                )
-                return None
-
         
-        def _log_model_to_mlflow_resiliently(model, model_key: str, out_dir: str, register_model_name: str = None):
-                    import json
-                    import os
-                    import shutil
-                    import tempfile
-                    import sys as _sys
-                    import yaml as _yaml
-                    import inspect as _inspect
-
-                    input_example_local = _build_mlflow_input_example(model)
-                    signature_local = _build_mlflow_signature(model, input_example_local)
-
-                    # 1) Prefer an MLflow pyfunc logged model that wraps a raw SavedModel artifact.
-                    #    This avoids Keras/TensorFlow serialization paths that can fail on custom
-                    #    lambdas / numpy_function preprocessing, while still creating a real
-                    #    LoggedModel that can be registered and deployed.
-                    tmp_model_dir = tempfile.mkdtemp(prefix=f"{model_key}_mlflow_model_")
-                    data_model_dir = os.path.join(tmp_model_dir, "data", "model")
-                    os.makedirs(data_model_dir, exist_ok=True)
-
-                    try:
-                        # Export a raw TensorFlow SavedModel first. This is the same artifact
-                        # that the previous fallback already managed to create successfully.
-                        tf.saved_model.save(model, data_model_dir)
-
-                        # Persist the original model input names/order so the pyfunc wrapper can
-                        # reconstruct positional inputs even when the loaded SavedModel exposes
-                        # generic tensor names (inputs, inputs_1, ...).
-                        input_keys_path = os.path.join(tmp_model_dir, "input_keys.json")
-                        try:
-                            model_input_keys_local = []
-                            for inp in list(getattr(model, "inputs", []) or []):
-                                try:
-                                    model_input_keys_local.append(str(getattr(inp, "name", "")).split(":")[0])
-                                except Exception:
-                                    continue
-                            if model_input_keys_local:
-                                with open(input_keys_path, "w", encoding="utf-8") as fh:
-                                    json.dump(model_input_keys_local, fh)
-                            else:
-                                input_keys_path = None
-                        except Exception:
-                            input_keys_path = None
-
-                        class _SavedModelPyFuncWrapper(mlflow.pyfunc.PythonModel):
-                            def load_context(self, context):
-                                import json as _json
-                                import os as _os
-                                import tensorflow as _tf
-
-                                saved_model_dir = context.artifacts["saved_model_dir"]
-                                self._loaded_model = None
-                                self._infer_fn = None
-                                self._input_keys = []
-                                self._can_call_model_directly = False
-
-                                # Load the original input order if it was persisted at log time.
-                                try:
-                                    input_keys_file = context.artifacts.get("input_keys_file")
-                                    if input_keys_file and _os.path.exists(input_keys_file):
-                                        with open(input_keys_file, "r", encoding="utf-8") as fh:
-                                            self._input_keys = list(_json.load(fh) or [])
-                                except Exception:
-                                    self._input_keys = []
-
-                                # Prefer loading as a Keras model so inference can run directly in eager mode,
-                                # which avoids depending on a SavedModel serving signature.
-                                try:
-                                    self._loaded_model = _tf.keras.models.load_model(saved_model_dir, compile=False)
-                                    self._can_call_model_directly = True
-                                except Exception:
-                                    try:
-                                        self._loaded_model = _tf.saved_model.load(saved_model_dir)
-                                    except Exception:
-                                        self._loaded_model = None
-
-                                try:
-                                    signatures = getattr(self._loaded_model, "signatures", None) or {}
-                                    if isinstance(signatures, dict) and signatures:
-                                        self._infer_fn = signatures.get("serving_default") or next(iter(signatures.values()))
-                                except Exception:
-                                    self._infer_fn = None
-
-                                try:
-                                    if self._infer_fn is not None and not self._input_keys:
-                                        structured_input_signature = getattr(self._infer_fn, "structured_input_signature", None)
-                                        if (
-                                            structured_input_signature
-                                            and isinstance(structured_input_signature, tuple)
-                                            and len(structured_input_signature) >= 2
-                                            and isinstance(structured_input_signature[1], dict)
-                                        ):
-                                            self._input_keys = list(structured_input_signature[1].keys())
-                                except Exception:
-                                    self._input_keys = self._input_keys or []
-
-                                # If a Keras model was loaded and no explicit input order was saved,
-                                # fall back to the input tensor names exposed by the loaded model.
-                                try:
-                                    if not self._input_keys and self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
-                                        keras_input_keys = []
-                                        for inp in list(getattr(self._loaded_model, "inputs", []) or []):
-                                            try:
-                                                keras_input_keys.append(str(getattr(inp, "name", "")).split(":")[0])
-                                            except Exception:
-                                                continue
-                                        if keras_input_keys:
-                                            self._input_keys = keras_input_keys
-                                except Exception:
-                                    pass
-
-                            def _coerce_inputs(self, model_input):
-                                import numpy as _np
-                                import pandas as _pd
-                                import tensorflow as _tf
-
-                                # For this model, the exported callable expects positional tensor inputs
-                                # in the exact order of model.inputs. Convert dict/DataFrame inputs into
-                                # that ordered list so eager calls match the SavedModel / Keras signature.
-                                if isinstance(model_input, dict):
-                                    if self._input_keys:
-                                        ordered = []
-                                        missing = []
-                                        for key in self._input_keys:
-                                            if key in model_input:
-                                                try:
-                                                    ordered.append(_tf.convert_to_tensor(model_input[key]))
-                                                except Exception:
-                                                    ordered.append(model_input[key])
-                                            else:
-                                                missing.append(key)
-                                        if ordered and not missing:
-                                            return ordered
-                                    return {k: _tf.convert_to_tensor(v) for k, v in model_input.items()}
-
-                                if isinstance(model_input, _pd.DataFrame):
-                                    if self._input_keys:
-                                        ordered = []
-                                        missing = []
-                                        for key in self._input_keys:
-                                            if key in model_input.columns:
-                                                col_values = model_input[key].to_numpy()
-                                                try:
-                                                    ordered.append(_tf.convert_to_tensor(_np.asarray(col_values)))
-                                                except Exception:
-                                                    ordered.append(_tf.convert_to_tensor(col_values))
-                                            else:
-                                                missing.append(key)
-                                        if ordered and not missing:
-                                            return ordered
-                                    try:
-                                        return _tf.convert_to_tensor(model_input.to_numpy())
-                                    except Exception:
-                                        return model_input.to_numpy()
-
-                                if isinstance(model_input, (list, tuple)):
-                                    try:
-                                        # Preserve list/tuple order as-is for positional signatures.
-                                        return [
-                                            _tf.convert_to_tensor(x) if not hasattr(x, "shape") else _tf.convert_to_tensor(x)
-                                            for x in model_input
-                                        ]
-                                    except Exception:
-                                        return list(model_input)
-
-                                try:
-                                    return _tf.convert_to_tensor(model_input)
-                                except Exception:
-                                    return model_input
-
-                            def _coerce_outputs(self, outputs):
-                                import numpy as _np
-
-                                if isinstance(outputs, dict):
-                                    converted = {}
-                                    for k, v in outputs.items():
-                                        try:
-                                            converted[k] = v.numpy() if hasattr(v, "numpy") else _np.asarray(v)
-                                        except Exception:
-                                            converted[k] = v
-                                    return converted
-                                return outputs.numpy() if hasattr(outputs, "numpy") else _np.asarray(outputs)
-
-                            def predict(self, context, model_input):
-                                inputs = self._coerce_inputs(model_input)
-
-                                def _to_positional_inputs(preferred_inputs):
-                                    import tensorflow as _tf
-                                    import numpy as _np
-                                    import pandas as _pd
-
-                                    # Always prefer the original model input order persisted at log time.
-                                    input_names = list(self._input_keys or [])
-                                    if not input_names:
-                                        try:
-                                            if self._loaded_model is not None and hasattr(self._loaded_model, "inputs"):
-                                                for inp in list(getattr(self._loaded_model, "inputs", []) or []):
-                                                    try:
-                                                        input_names.append(str(getattr(inp, "name", "")).split(":")[0])
-                                                    except Exception:
-                                                        input_names.append("")
-                                        except Exception:
-                                            input_names = []
-
-                                    if input_names:
-                                        source_dict = None
-                                        if isinstance(preferred_inputs, dict):
-                                            source_dict = preferred_inputs
-                                        elif isinstance(model_input, dict):
-                                            source_dict = model_input
-
-                                        if source_dict is not None:
-                                            ordered = []
-                                            for key in input_names:
-                                                if key in source_dict:
-                                                    try:
-                                                        ordered.append(_tf.convert_to_tensor(source_dict[key]))
-                                                    except Exception:
-                                                        ordered.append(source_dict[key])
-                                            if len(ordered) == len(input_names):
-                                                return ordered
-
-                                    # If the input is a DataFrame and we have named keys, extract columns in order.
-                                    if isinstance(model_input, _pd.DataFrame) and input_names:
-                                        ordered = []
-                                        for key in input_names:
-                                            if key in model_input.columns:
-                                                try:
-                                                    ordered.append(_tf.convert_to_tensor(_np.asarray(model_input[key].to_numpy())))
-                                                except Exception:
-                                                    ordered.append(_tf.convert_to_tensor(model_input[key].to_numpy()))
-                                        if len(ordered) == len(input_names):
-                                            return ordered
-
-                                    # Fall back to whatever we already have if it's already positional.
-                                    if isinstance(preferred_inputs, (list, tuple)):
-                                        return list(preferred_inputs)
-                                    return preferred_inputs
-
-                                positional_inputs = _to_positional_inputs(inputs)
-
-                                # 1) Preferred path: direct eager call on the loaded Keras model.
-                                #    For multi-input models, Keras expects a positional list that matches
-                                #    model.inputs order rather than a dict.
-                                if self._can_call_model_directly and self._loaded_model is not None:
-                                    try:
-                                        outputs = self._loaded_model(positional_inputs, training=False)
-                                        return self._coerce_outputs(outputs)
-                                    except Exception:
-                                        # Fall through to SavedModel signature or callable fallback below.
-                                        pass
-
-                                # 2) SavedModel serving signature, when available.
-                                if self._infer_fn is not None:
-                                    try:
-                                        if isinstance(positional_inputs, (list, tuple)):
-                                            outputs = self._infer_fn(*positional_inputs)
-                                        elif isinstance(positional_inputs, dict):
-                                            outputs = self._infer_fn(**positional_inputs)
-                                        else:
-                                            outputs = self._infer_fn(positional_inputs)
-                                        return self._coerce_outputs(outputs)
-                                    except Exception:
-                                        pass
-
-                                # 3) Last-resort callable fallback.
-                                if self._loaded_model is not None and callable(self._loaded_model):
-                                    try:
-                                        outputs = self._loaded_model(positional_inputs, training=False)
-                                    except TypeError:
-                                        outputs = self._loaded_model(positional_inputs)
-                                    return self._coerce_outputs(outputs)
-
-                                raise RuntimeError(
-                                    "SavedModel serving signature is unavailable and the loaded model could not be called directly."
-                                )
-
-                        log_model_fn = mlflow.pyfunc.log_model
-                        log_model_sig = _inspect.signature(log_model_fn)
-                        log_model_kwargs = {
-                            "python_model": _SavedModelPyFuncWrapper(),
-                            "artifacts": {"saved_model_dir": data_model_dir, "input_keys_file": input_keys_path},
-                            "input_example": input_example_local,
-                            "signature": signature_local,
-                        }
-
-                        # Different MLflow versions expose either `name` or `artifact_path`.
-                        # Prefer the available parameter without changing the rest of the pipeline.
-                        if "name" in log_model_sig.parameters:
-                            log_model_kwargs["name"] = "model"
-                        elif "artifact_path" in log_model_sig.parameters:
-                            log_model_kwargs["artifact_path"] = "model"
-
-                        # Pass registered_model_name only when the installed MLflow version supports it.
-                        if "registered_model_name" in log_model_sig.parameters and register_model_name:
-                            log_model_kwargs["registered_model_name"] = register_model_name
-
-                        model_info = log_model_fn(**log_model_kwargs)
-                        logger.info("Logged pyfunc model to MLflow using the SavedModel wrapper for %s.", model_key)
-
-                        registration_info = None
-                        if register_model_name and "registered_model_name" not in log_model_sig.parameters:
-                            try:
-                                active_run = mlflow.active_run()
-                                if active_run is not None:
-                                    mv = mlflow.register_model(
-                                        model_uri=getattr(model_info, "model_uri", f"runs:/{active_run.info.run_id}/model"),
-                                        name=register_model_name,
-                                    )
-                                    registration_info = {
-                                        "name": mv.name,
-                                        "version": mv.version,
-                                        "stage": getattr(mv, "current_stage", None),
-                                        "status": getattr(mv, "status", None),
-                                    }
-                            except Exception:
-                                logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
-                                registration_info = None
-
-                        return {
-                            "mode": "mlflow.pyfunc.log_model",
-                            "artifact_path": "model",
-                            "model_uri": getattr(model_info, "model_uri", None),
-                            "registered_model": registration_info if register_model_name else register_model_name,
-                        }
-
-                    except Exception as e1:
-                        logger.warning(
-                            "Primary MLflow pyfunc logging failed for %s; trying MLflow SavedModel fallback. Error: %s",
-                            model_key,
-                            e1,
-                        )
-
-                    # 2) Build a full MLflow model directory manually around a raw SavedModel export.
-                    #    This preserves the previous non-destructive fallback behavior.
-                    try:
-                        # MLflow metadata
-                        try:
-                            from mlflow.models import Model as _MlflowModel
-                        except Exception:
-                            from mlflow.models.model import Model as _MlflowModel  # pragma: no cover
-
-                        mlflow_model = _MlflowModel()
-                        mlflow_model.add_flavor(
-                            "tensorflow",
-                            saved_model_dir=os.path.join("data", "model"),
-                            model_type="tf2-module",
-                        )
-
-                        try:
-                            mlflow.pyfunc.add_to_model(
-                                mlflow_model,
-                                loader_module="mlflow.tensorflow",
-                                conda_env="conda.yaml",
-                                python_env="python_env.yaml",
-                            )
-                        except Exception:
-                            # Keep the MLflow model valid even if pyfunc metadata helper changes.
-                            pass
-
-                        mlflow_model.save(os.path.join(tmp_model_dir, "MLmodel"))
-
-                        # Environment files
-                        try:
-                            conda_env = mlflow.tensorflow.get_default_conda_env()
-                        except Exception:
-                            conda_env = {
-                                "name": "mlflow-env",
-                                "channels": ["conda-forge"],
-                                "dependencies": [
-                                    f"python={_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
-                                    {"pip": [f"tensorflow=={tf.__version__}"]},
-                                ],
-                            }
-
-                        try:
-                            pip_reqs = mlflow.tensorflow.get_default_pip_requirements()
-                        except Exception:
-                            pip_reqs = [f"tensorflow=={tf.__version__}"]
-
-                        with open(os.path.join(tmp_model_dir, "conda.yaml"), "w", encoding="utf-8") as fh:
-                            _yaml.safe_dump(conda_env, stream=fh, default_flow_style=False)
-
-                        with open(os.path.join(tmp_model_dir, "requirements.txt"), "w", encoding="utf-8") as fh:
-                            fh.write("\n".join(pip_reqs) + "\n")
-
-                        # Best-effort python_env.yaml that matches the MLflow layout.
-                        try:
-                            import importlib.metadata as _importlib_metadata
-                            pip_ver = _importlib_metadata.version("pip")
-                            setuptools_ver = _importlib_metadata.version("setuptools")
-                            wheel_ver = _importlib_metadata.version("wheel")
-                        except Exception:
-                            pip_ver = "unknown"
-                            setuptools_ver = "unknown"
-                            wheel_ver = "unknown"
-
-                        python_env_payload = {
-                            "python": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
-                            "build_dependencies": [
-                                f"pip=={pip_ver}",
-                                f"setuptools=={setuptools_ver}",
-                                f"wheel=={wheel_ver}",
-                            ],
-                            "dependencies": ["-r requirements.txt"],
-                        }
-                        with open(os.path.join(tmp_model_dir, "python_env.yaml"), "w", encoding="utf-8") as fh:
-                            _yaml.safe_dump(python_env_payload, stream=fh, default_flow_style=False)
-
-                        manifest_path = os.path.join(tmp_model_dir, f"{model_key}_mlflow_export_manifest.json")
-                        with open(manifest_path, "w", encoding="utf-8") as fh:
-                            json.dump(
-                                {
-                                    "model_key": model_key,
-                                    "export_mode": "tf.saved_model.save",
-                                    "artifact_path": "model",
-                                    "mlflow_dir": True,
-                                },
-                                fh,
-                                indent=2,
-                            )
-
-                        mlflow.log_artifacts(tmp_model_dir, artifact_path="model")
-                        logger.info(
-                            "Logged TensorFlow SavedModel wrapped as MLflow artifacts for %s.",
-                            model_key,
-                        )
-
-                        if register_model_name:
-                            try:
-                                active_run = mlflow.active_run()
-                                if active_run is not None:
-                                    mv = mlflow.register_model(
-                                        model_uri=f"runs:/{active_run.info.run_id}/model",
-                                        name=register_model_name,
-                                    )
-                                    registration_info = {
-                                        "name": mv.name,
-                                        "version": mv.version,
-                                        "stage": getattr(mv, "current_stage", None),
-                                        "status": getattr(mv, "status", None),
-                                    }
-                                else:
-                                    registration_info = None
-                            except Exception:
-                                logger.exception("Failed to register model %s under %s.", model_key, register_model_name)
-                                registration_info = None
-                        else:
-                            registration_info = None
-
-                        return {
-                            "mode": "tf.saved_model.save + mlflow_model_dir",
-                            "artifact_path": "model",
-                            "registered_model_ready": True,
-                            "registered_model": registration_info,
-                        }
-
-                    except Exception as e2:
-                        logger.exception("TensorFlow/MLflow export failed for %s", model_key)
-
-                        # 3) Last-resort fallback: keep the core artifacts so nothing is lost.
-                        try:
-                            weights_path = os.path.join(out_dir, f"{model_key}.weights.h5")
-                            model.save_weights(weights_path)
-
-                            summary_path = os.path.join(out_dir, f"{model_key}_model_summary.txt")
-                            with open(summary_path, "w", encoding="utf-8") as fh:
-                                model.summary(print_fn=lambda s: fh.write(s + "\n"))
-
-                            mlflow.log_artifacts(out_dir, artifact_path=f"fallback_{model_key}")
-                            logger.warning("Saved weights + summary fallback artifact for %s.", model_key)
-                            return {
-                                "mode": "weights_and_summary",
-                                "artifact_path": f"fallback_{model_key}",
-                                "error": str(e2),
-                            }
-                        except Exception as e3:
-                            logger.exception("Final fallback also failed for %s", model_key)
-                            return {"mode": "failed", "artifact_path": None, "error": f"{e2} | fallback failed: {e3}"}
-                    finally:
-                        shutil.rmtree(tmp_model_dir, ignore_errors=True)# --- early GPU setup ---
+        # --- early GPU setup ---
         gpu_available = False
         try:
             gpus = tf.config.experimental.list_physical_devices("GPU")
@@ -5380,20 +6141,6 @@ Notes:
         total_rows = 0
         skipped_rows = 0
 
-        def _parse_field_text_local(text):
-            if text is None or (isinstance(text, str) and text.strip() == ""):
-                return None
-            s = text.strip()
-            try:
-                return ast.literal_eval(s)
-            except Exception:
-                pass
-            try:
-                return json.loads(s)
-            except Exception:
-                pass
-            return None
-
         for idx, fpath in enumerate(csv_files):
             try:
                 try:
@@ -5429,7 +6176,7 @@ Notes:
                             # aux stats
                             for col in aux_columns:
                                 raw = row.get(col, None)
-                                parsed = _parse_field_text_local(raw)
+                                parsed = TrainModelService._parse_field_text_local(raw)
                                 if parsed is None:
                                     continue
                                 try:
@@ -5447,7 +6194,7 @@ Notes:
 
                             # detect image shape
                             mat_text = row.get(matrix_column, None)
-                            parsed_mat = _parse_field_text_local(mat_text)
+                            parsed_mat = TrainModelService._parse_field_text_local(mat_text)
                             if parsed_mat is not None:
                                 try:
                                     if isinstance(parsed_mat, list) and len(parsed_mat) > 0:
@@ -5719,62 +6466,6 @@ Notes:
             use_aux_inputs=use_aux_inputs,
         )
 
-        # Optional check: log whether sample batches appear to land on GPU
-        def _sample_dataset_devices(ds, n_samples=3):
-            observed = set()
-            try:
-                it = iter(ds)
-                for _ in range(n_samples):
-                    try:
-                        batch = next(it)
-                    except Exception:
-                        break
-
-                    elems = batch if isinstance(batch, (list, tuple)) else (batch,)
-
-                    def _collect_devices(x):
-                        devs = set()
-                        if isinstance(x, (list, tuple)):
-                            for y in x:
-                                devs |= _collect_devices(y)
-                        else:
-                            try:
-                                d = getattr(x, "device", None)
-                                if d:
-                                    devs.add(d)
-                                else:
-                                    devs.add("host:CPU")
-                            except Exception:
-                                devs.add("host:CPU")
-                        return devs
-
-                    for el in elems:
-                        observed |= _collect_devices(el)
-            except Exception:
-                pass
-            return observed
-
-        # build preprocess layer for inside-model preprocessing
-        def _make_preprocess_layer(pre_fn):
-            if pre_fn is None:
-                return tf.keras.layers.Lambda(lambda x: x, name="identity_preprocess")
-
-            # Avoid tf.numpy_function / PyFunc inside the exported model because
-            # MLflow reloads the model in a fresh process during its inference check.
-            # Most Keras application preprocess_input functions are TensorFlow-safe,
-            # and the fallback scaling lambda is also graph-safe.
-            def _tf_preprocess(x):
-                x = tf.cast(x, tf.float32)
-                y = pre_fn(x)
-                y = tf.cast(y, tf.float32)
-                try:
-                    y.set_shape([None, img_size[0], img_size[1], 3])
-                except Exception:
-                    pass
-                return y
-
-            return tf.keras.layers.Lambda(_tf_preprocess, name="model_preprocess")
-
         # iterate models and build/compile inside device strategy scope if GPU available
         results = {}
         iter_items = (models_dict.items() if models_dict else [("custom", None)])
@@ -5801,7 +6492,7 @@ Notes:
                     exp_name = f"{prefix}_{exp_name}"
 
                 per_model_pre_fn = TrainModelService._get_preprocess_fn_for_model(model_key)
-                preprocess_layer = _make_preprocess_layer(per_model_pre_fn)
+                preprocess_layer = TrainModelService._make_preprocess_layer(per_model_pre_fn, img_size)
 
                 with strategy.scope() if strategy is not None else tf.device("/CPU:0"):
                     image_input = tf.keras.Input(shape=(img_size[0], img_size[1], 3), name="image_input")
@@ -5835,8 +6526,8 @@ Notes:
                             dense_specs = [
                                 #(512, 0.2, f"aux_dense_{col}", f"aux_drop_{col}"),
                                 (128, None, f"aux_dense_{col}", None),
-                                (32, None, f"aux_dense2_{col}", None),
-                                # (128, None, f"aux_dense3_{col}", None),
+                                #(32, 0.2, f"aux_dense2_{col}", f"aux_drop2_{col}"),
+                                #(16, None, f"aux_dense3_{col}", None),
                                 # (128, None, f"aux_dense4_{col}", None),
                             ]
 
@@ -6074,8 +6765,8 @@ Notes:
 
                 # Small device-placement check & log (keeps your helper usage)
                 try:
-                    observed_train_devices = _sample_dataset_devices(train_ds, n_samples=4)
-                    observed_test_devices = _sample_dataset_devices(test_ds, n_samples=2)
+                    observed_train_devices = TrainModelService._sample_dataset_devices(train_ds, n_samples=4)
+                    observed_test_devices = TrainModelService._sample_dataset_devices(test_ds, n_samples=2)
                     observed_train_devices_n = {str(d) for d in observed_train_devices}
                     observed_test_devices_n = {str(d) for d in observed_test_devices}
                     found_gpu_on_train = any(("GPU" in d or "gpu" in d or "/device:GPU" in d) for d in observed_train_devices_n)
@@ -6569,7 +7260,7 @@ Notes:
 
                     # Log training / test metrics to MLflow
                     try:
-                        _log_history_metrics_to_mlflow(history, model_key)
+                        TrainModelService._log_history_metrics_to_mlflow(history, model_key, out_dir)
 
                         if len(eval_res) >= 1 and eval_res[0] is not None:
                             mlflow.log_metric("test_loss", float(eval_res[0]))
@@ -6658,16 +7349,17 @@ Notes:
 
                         # Save architecture artifacts even if the model itself later fails to log.
                         try:
-                            arch_paths = _save_model_architecture_artifacts(model, model_key, out_dir)
+                            arch_paths = TrainModelService._save_model_architecture_artifacts(model, model_key, out_dir)
                             logger.info("Saved model architecture artifacts for %s: %s", model_key, arch_paths)
                         except Exception:
                             logger and logger.exception("Could not save model architecture artifacts for %s.", model_key)
 
-                        log_result = _log_model_to_mlflow_resiliently(
+                        log_result = TrainModelService._log_model_to_mlflow_resiliently(
                             model=model,
                             model_key=model_key,
                             out_dir=out_dir,
                             register_model_name=register_model_name,
+                            fallback_img_size=img_size,
                         )
                         logger.info("Model artifact logging result for %s: %s", model_key, log_result)
                     except Exception:
