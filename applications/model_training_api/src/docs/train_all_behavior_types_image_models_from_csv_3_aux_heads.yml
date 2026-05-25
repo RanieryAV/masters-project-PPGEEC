@@ -1,0 +1,58 @@
+summary: "Endpoint for Image models training (All Behavior Types)"
+description: |
+  Trains **a CSV file** that contains trajectory image data, SOG, COG and normalized timestamp arrays
+  to classify among the behavior types (LOITERING, NORMAL, STOPPING, TRANSSHIPMENT).
+  Images are read from the CSV dataset (with extra feature arrays) which must follow the structure:
+
+tags:
+- "Train Machine Learning Models"
+produces:
+- "application/json"
+parameters:
+  - in: "body"
+    name: "body"
+    description: "Basic request body required for this endpoint (number of epochs and samples per label). The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
+    required: false
+    schema:
+      type: "object"
+      properties:
+        epochs:
+          type: integer
+          example: 17
+        per_label_n:
+          type: integer
+          example: 100
+        warmup_epochs:
+          type: integer
+          example: 3
+        batch_size:
+          type: integer
+          example: 24
+        optimizer_name:
+          type: string
+          example: "adam"
+        patience:
+          type: integer
+          example: 3
+responses:
+  200:
+    description: |
+      Image models trained and logged in MLflow. Response contains training results per pretrained model.
+    schema:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Image models trained and logged in MLflow"
+        details:
+          type: object
+  500:
+    description: Internal Server Error
+    schema:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal Server Error"
+        details:
+          type: string

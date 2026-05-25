@@ -41,7 +41,7 @@ ENV XLA_FLAGS=--xla_gpu_cuda_data_dir=/usr/local/cuda
 ENV TF_GPU_ALLOCATOR=cuda_malloc_async
 # ****************DEBUG ONLY************************
 # Force CPU training for TensorFlow to avoid potential GPU memory issues in a containerized environment
-#ENV CUDA_VISIBLE_DEVICES=""
+ENV CUDA_VISIBLE_DEVICES=""
 # ****************DEBUG ONLY************************
 
 WORKDIR /app
