@@ -8136,18 +8136,18 @@ Notes:
         sog_cog_side = int(max(1, max(aux_col_lengths.get(sog_col, 0), aux_col_lengths.get(cog_col, 0))))
         ts_len = int(aux_col_lengths.get(timestamp_col, 0))
 
-        # Cap effective batch size for the 2-aux path to reduce peak memory use.
-        effective_batch_size = int(batch_size)
-        if effective_batch_size > 8:
-            try:
-                logger and logger.warning(
-                    "Capping 2-aux effective batch size from %d to %d to reduce memory pressure.",
-                    batch_size,
-                    8,
-                )
-            except Exception:
-                pass
-            effective_batch_size = 8
+        # # Cap effective batch size for the 2-aux path to reduce peak memory use.
+        # effective_batch_size = int(batch_size)
+        # if effective_batch_size > 16:
+        #     try:
+        #         logger and logger.warning(
+        #             "Capping 2-aux effective batch size from %d to %d to reduce memory pressure.",
+        #             batch_size,
+        #             8,
+        #         )
+        #     except Exception:
+        #         pass
+        #     effective_batch_size = 8
 
         # ---------------------------------------------------------------------
         # Sampling per_label_n
@@ -8314,7 +8314,7 @@ Notes:
             img_size=img_size,
             preprocess_fn=None,
             tf_preprocess_fn=tf_preprocess_fn,
-            batch_size=effective_batch_size,
+            batch_size=batch_size,
             shuffle=True,
             seed=int(random_state),
             use_aux_inputs=use_aux_inputs,
@@ -8329,7 +8329,7 @@ Notes:
             img_size=img_size,
             preprocess_fn=None,
             tf_preprocess_fn=tf_preprocess_fn,
-            batch_size=effective_batch_size,
+            batch_size=batch_size,
             shuffle=False,
             seed=int(random_state),
             use_aux_inputs=use_aux_inputs,
@@ -8430,33 +8430,75 @@ Notes:
                         y = internal_gap(y)
                         x = tf.keras.layers.Dense(128, activation="relu", name="internal_head_dense")(y)
 
-                    head_dense1 = tf.keras.layers.Dense(256, activation="relu", name="head_dense1")
-                    head_drop1 = tf.keras.layers.Dropout(0.5, name="head_drop1")
+                    head_dense1 = tf.keras.layers.Dense(192, activation="relu", name="head_dense1")
+                    head_drop1 = tf.keras.layers.Dropout(0.2, name="head_drop1")
+                    head_dense2 = tf.keras.layers.Dense(64, activation="relu", name="head_dense2")
+                    # head_drop2 = tf.keras.layers.Dropout(0.5, name="head_drop2")
                     x = head_dense1(x)
                     x = head_drop1(x)
+                    x = head_dense2(x)
+                    # x = head_drop2(x)
 
                     sog_cog_branch = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same", name="sog_cog_conv1")(sog_cog_input)
                     sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool1")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same", name="sog_cog_conv2")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool2")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same", name="sog_cog_conv3")(sog_cog_branch)
+                    # sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool3")(sog_cog_branch)
+                    # sog_cog_branch = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same", name="sog_cog_conv4")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.GlobalAveragePooling2D(name="sog_cog_gap")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dense(128, activation="relu", name="sog_cog_dense")(sog_cog_branch)
-                    #sog_cog_branch = tf.keras.layers.Dropout(0.2, name="sog_cog_drop")(sog_cog_branch)
+                    sog_cog_branch = tf.keras.layers.Dropout(0.2, name="sog_cog_drop")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dense(64, activation="relu", name="sog_cog_dense2")(sog_cog_branch)
                     # sog_cog_branch = tf.keras.layers.Dense(32, activation="relu", name="sog_cog_dense3")(sog_cog_branch)
 
 
-                    timestamp_branch = tf.keras.layers.Dense(128, activation="relu", name="timestamp_dense")(timestamp_input)
-                    # timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
-                    # timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Reshape(
+                        (ts_len if ts_len > 0 else 1, 1),
+                        name="timestamp_reshape"
+                    )(timestamp_input)
+                    timestamp_branch = tf.keras.layers.Conv1D(
+                        32,
+                        3,
+                        activation="relu",
+                        padding="same",
+                        name="timestamp_conv1"
+                    )(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.MaxPool1D(name="timestamp_pool1")(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.Conv1D(
+                    #     64,
+                    #     3,
+                    #     activation="relu",
+                    #     padding="same",
+                    #     name="timestamp_conv2"
+                    # )(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.MaxPool1D(name="timestamp_pool2")(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.Conv1D(
+                    #     128,
+                    #     3,
+                    #     activation="relu",
+                    #     padding="same",
+                    #     name="timestamp_conv3"
+                    # )(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.MaxPool1D(name="timestamp_pool3")(timestamp_branch)
+                    # timestamp_branch = tf.keras.layers.Conv1D(
+                    #     256,
+                    #     3,
+                    #     activation="relu",
+                    #     padding="same",
+                    #     name="timestamp_conv4"
+                    # )(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.GlobalAveragePooling1D(name="timestamp_gap")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Dense(128, activation="relu", name="timestamp_dense")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
                     merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x, sog_cog_branch, timestamp_branch])
 
-                    head_dense2 = tf.keras.layers.Dense(128, activation="relu", name="head_dense2")
-                    head_drop2 = tf.keras.layers.Dropout(0.3, name="head_drop2")
-                    merged = head_dense2(merged_concat)
-                    merged = head_drop2(merged)
+                    head_dense3 = tf.keras.layers.Dense(128, activation="relu", name="head_dense3")
+                    head_drop3 = tf.keras.layers.Dropout(0.3, name="head_drop3")
+                    merged = head_dense3(merged_concat)
+                    merged = head_drop3(merged)
 
                     outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
                     model = tf.keras.Model(
@@ -8479,7 +8521,7 @@ Notes:
                         head_dense1.trainable = True
                         head_drop1.trainable = True
                         head_dense2.trainable = True
-                        head_drop2.trainable = True
+                        # head_drop2.trainable = True
                     except Exception:
                         pass
 
@@ -8624,6 +8666,11 @@ Notes:
                         )
                 except Exception:
                     pass
+                
+                # batch_size_that_will_be_logged_to_mlflow = batch_size
+                
+                # if batch_size != effective_batch_size:
+                #     batch_size_that_will_be_logged_to_mlflow = effective_batch_size
 
                 mlflow.set_experiment(exp_name)
                 with mlflow.start_run(run_name=f"{model_key}_train_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"):
@@ -8631,7 +8678,7 @@ Notes:
                     mlflow.log_param("num_classes", len(le.classes_))
                     mlflow.log_param("warmup_epochs", int(warmup_epochs))
                     mlflow.log_param("epochs_phase2", int(epochs))
-                    mlflow.log_param("batch_size", batch_size)
+                    mlflow.log_param("batch_size", int(batch_size))
                     mlflow.log_param("learning_rate", learning_rate)
                     mlflow.log_param("optimizer", str(optimizer_name))
                     mlflow.log_param("patience", int(patience))
