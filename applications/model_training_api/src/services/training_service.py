@@ -8620,7 +8620,7 @@ Notes:
                     timestamp_branch = tf.keras.layers.GlobalAveragePooling1D(name="timestamp_gap")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dense(128, activation="relu", name="timestamp_dense")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
-                    timestamp_branch = tf.keras.layers.Dense(32, activation="relu", name="timestamp_dense2")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
                     merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x, sog_cog_branch, timestamp_branch])
 
