@@ -2032,13 +2032,13 @@ Notes:
         # Plot confusion matrix on ax
         im = ax.imshow(cm_arr, interpolation="nearest", cmap=_plt.cm.Blues)
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.ax.set_ylabel("Count", rotation=-90, va="bottom")
+        cbar.ax.set_ylabel("Quantidade de amostras", rotation=-90, va="bottom")
 
         # hide matrix yticklabels (we'll show class names in the left column)
         ax.set(xticks=list(range(n_cols)), yticks=list(range(n_rows)),
             xticklabels=display_labels[:n_cols], yticklabels=[''] * n_rows,
-            ylabel="True label", xlabel="Predicted label",
-            title="Confusion matrix (test set)")
+            ylabel="Rótulo Verdadeiro", xlabel="Rótulo Predito pelo Modelo",#"True label" "Predicted label"
+            title="Matriz de Confusão (conjunto de teste)")
         _plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
 
         # place ylabel slightly inside the matrix so it doesn't collide with left column
@@ -2100,8 +2100,8 @@ Notes:
             ax_pr.text(class_x, class_y, class_name, ha="left", va="center", fontsize=10, fontweight="normal")
 
             # Precision and Recall lines shown as percentages, below the class name
-            ax_pr.text(pr_x, p_y, f"P: {prec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
-            ax_pr.text(pr_x, r_y, f"R: {rec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
+            ax_pr.text(pr_x, p_y, f"Precisão: {prec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
+            ax_pr.text(pr_x, r_y, f"Recall: {rec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
 
         # Final layout tweaks: ensure enough bottom margin so x ticklabels show fully
         fig.tight_layout()
@@ -6035,6 +6035,85 @@ Notes:
             pass
         return observed
     
+    def _export_selected_rows_to_csv(save_processed_dataset_csv, ds, out_csv_path):
+        import os
+        import csv as _csv
+        import json
+        import numpy as np
+        import tensorflow as tf
+
+        if not save_processed_dataset_csv:
+            return 0
+
+        out_dir = os.path.dirname(out_csv_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        def _tensor_to_serializable(x):
+            if isinstance(x, tf.Tensor):
+                x = x.numpy()
+            if isinstance(x, np.ndarray):
+                return json.dumps(x.tolist(), ensure_ascii=False)
+            if isinstance(x, (list, tuple)):
+                return json.dumps(np.asarray(x).tolist(), ensure_ascii=False)
+            if isinstance(x, (np.generic,)):
+                return x.item()
+            return x
+
+        written = 0
+        writer = None
+        fieldnames = None
+
+        with open(out_csv_path, "w", newline="", encoding="utf-8") as out_f:
+            for batch in ds:
+                inputs, labels = batch
+
+                # Caso use_aux_inputs=True: inputs = (image, sog_cog, timestamp)
+                # Caso use_aux_inputs=False: inputs = image
+                if isinstance(inputs, (tuple, list)):
+                    batch_size = int(labels.shape[0]) if hasattr(labels, "shape") and labels.shape[0] is not None else len(labels)
+                    for i in range(batch_size):
+                        image = inputs[0][i]
+                        sog_cog = inputs[1][i] if len(inputs) > 1 else None
+                        timestamp = inputs[2][i] if len(inputs) > 2 else None
+                        label = labels[i]
+
+                        row = {
+                            "image": _tensor_to_serializable(image),
+                            "sog_cog_matrix": _tensor_to_serializable(sog_cog) if sog_cog is not None else "",
+                            "timestamp_vector": _tensor_to_serializable(timestamp) if timestamp is not None else "",
+                            "label": int(label.numpy()) if isinstance(label, tf.Tensor) else int(label),
+                        }
+
+                        if writer is None:
+                            fieldnames = list(row.keys())
+                            writer = _csv.DictWriter(out_f, fieldnames=fieldnames, extrasaction="ignore")
+                            writer.writeheader()
+
+                        writer.writerow(row)
+                        written += 1
+                else:
+                    # Caso sem aux inputs
+                    batch_size = int(labels.shape[0]) if hasattr(labels, "shape") and labels.shape[0] is not None else len(labels)
+                    for i in range(batch_size):
+                        image = inputs[i]
+                        label = labels[i]
+
+                        row = {
+                            "image": _tensor_to_serializable(image),
+                            "label": int(label.numpy()) if isinstance(label, tf.Tensor) else int(label),
+                        }
+
+                        if writer is None:
+                            fieldnames = list(row.keys())
+                            writer = _csv.DictWriter(out_f, fieldnames=fieldnames, extrasaction="ignore")
+                            writer.writeheader()
+
+                        writer.writerow(row)
+                        written += 1
+
+        return written
+    
     def train_all_behavior_types_image_models_from_csv_separate_3_aux_heads(
         dataset_dir: str,
         matrix_column: str = "trajectory_image_matrix",
@@ -6059,6 +6138,7 @@ Notes:
         warmup_epochs: int = 3,
         enable_mixed_precision: bool = True,
         tf_preprocess_fn: Callable = None,
+        save_processed_dataset_csv: bool = False,
     ):
         """
         Training pipeline that prefers GPU usage, while keeping the generator-backed input pipeline.
@@ -6466,6 +6546,27 @@ Notes:
             use_aux_inputs=use_aux_inputs,
         )
 
+        train_processed_csv_path = None
+        test_processed_csv_path = None
+
+        if save_processed_dataset_csv:
+            metadata_dir = os.path.join("artifacts", "metadata")
+            os.makedirs(metadata_dir, exist_ok=True)
+
+            train_processed_csv_path = os.path.join(metadata_dir, "train_processed_dataset.csv")
+            test_processed_csv_path = os.path.join(metadata_dir, "test_processed_dataset.csv")
+
+            train_written = TrainModelService._export_selected_rows_to_csv(save_processed_dataset_csv, train_ds, train_processed_csv_path)
+            test_written = TrainModelService._export_selected_rows_to_csv(save_processed_dataset_csv, test_ds, test_processed_csv_path)
+
+            logger and logger.info(
+                "Exported processed datasets to CSV: train=%s rows -> %s | test=%s rows -> %s",
+                train_written,
+                train_processed_csv_path,
+                test_written,
+                test_processed_csv_path,
+            )
+
         # iterate models and build/compile inside device strategy scope if GPU available
         results = {}
         iter_items = (models_dict.items() if models_dict else [("custom", None)])
@@ -6801,6 +6902,12 @@ Notes:
                     mlflow.log_param("use_aux_inputs", bool(use_aux_inputs))
                     mlflow.log_param("aux_col_lengths", aux_col_lengths)
                     mlflow.log_param("per_label_n", int(per_label_n or 0))
+
+                    if save_processed_dataset_csv:
+                        if train_processed_csv_path and os.path.exists(train_processed_csv_path):
+                            mlflow.log_artifact(train_processed_csv_path, artifact_path="metadata")
+                        if test_processed_csv_path and os.path.exists(test_processed_csv_path):
+                            mlflow.log_artifact(test_processed_csv_path, artifact_path="metadata")
 
                     # --- Try normal model.fit path first (graph mode) ---
                     use_manual_loop = False
@@ -7879,6 +7986,7 @@ Notes:
         warmup_epochs: int = 3,
         enable_mixed_precision: bool = True,
         tf_preprocess_fn: Callable = None,
+        save_processed_dataset_csv: bool = True,
     ):
         """
         2-aux-head training pipeline.
@@ -8335,6 +8443,27 @@ Notes:
             use_aux_inputs=use_aux_inputs,
         )
 
+        train_processed_csv_path = None
+        test_processed_csv_path = None
+
+        if save_processed_dataset_csv:
+            metadata_dir = os.path.join("artifacts", "metadata")
+            os.makedirs(metadata_dir, exist_ok=True)
+
+            train_processed_csv_path = os.path.join(metadata_dir, "train_processed_dataset.csv")
+            test_processed_csv_path = os.path.join(metadata_dir, "test_processed_dataset.csv")
+
+            train_written = TrainModelService._export_selected_rows_to_csv(save_processed_dataset_csv, train_ds, train_processed_csv_path)
+            test_written = TrainModelService._export_selected_rows_to_csv(save_processed_dataset_csv, test_ds, test_processed_csv_path)
+
+            logger and logger.info(
+                "Exported processed datasets to CSV: train=%s rows -> %s | test=%s rows -> %s",
+                train_written,
+                train_processed_csv_path,
+                test_written,
+                test_processed_csv_path,
+            )
+
         # ---------------------------------------------------------------------
         # Model build: image backbone + sog/cog CNN branch + timestamp dense branch
         # ---------------------------------------------------------------------
@@ -8491,7 +8620,7 @@ Notes:
                     timestamp_branch = tf.keras.layers.GlobalAveragePooling1D(name="timestamp_gap")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dense(128, activation="relu", name="timestamp_dense")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
-                    timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
+                    timestamp_branch = tf.keras.layers.Dense(32, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
                     merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x, sog_cog_branch, timestamp_branch])
 
@@ -8685,6 +8814,12 @@ Notes:
                     mlflow.log_param("use_aux_inputs", bool(use_aux_inputs))
                     mlflow.log_param("aux_col_lengths", aux_col_lengths)
                     mlflow.log_param("per_label_n", int(per_label_n or 0))
+
+                    if save_processed_dataset_csv:
+                        if train_processed_csv_path and os.path.exists(train_processed_csv_path):
+                            mlflow.log_artifact(train_processed_csv_path, artifact_path="metadata")
+                        if test_processed_csv_path and os.path.exists(test_processed_csv_path):
+                            mlflow.log_artifact(test_processed_csv_path, artifact_path="metadata")
 
                     use_manual_loop = False
                     history_phase1 = None
