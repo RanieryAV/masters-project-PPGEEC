@@ -2085,7 +2085,7 @@ Notes:
         # Place class name and P/R (P and R positioned below the class name)
         # We'll render class name slightly above center, P below center, R further below.
         class_x = 0.02
-        pr_x = 0.62
+        pr_x = 0.50
         for idx, y in enumerate(y_positions[:n_rows]):
             class_name = display_labels[idx] if idx < len(display_labels) else f"lbl_{idx}"
             prec = precision_arr[idx] if idx < len(precision_arr) else 0.0
@@ -2101,7 +2101,7 @@ Notes:
 
             # Precision and Recall lines shown as percentages, below the class name
             ax_pr.text(pr_x, p_y, f"Precisão: {prec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
-            ax_pr.text(pr_x, r_y, f"Recall: {rec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace")
+            ax_pr.text(pr_x, r_y, f"Recall: {rec * 100:.1f}%", ha="center", va="center", fontsize=10, family="monospace", fontstyle="italic")
 
         # Final layout tweaks: ensure enough bottom margin so x ticklabels show fully
         fig.tight_layout()
@@ -8622,7 +8622,43 @@ Notes:
                     timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
-                    merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x, sog_cog_branch, timestamp_branch])
+                    ###########################################################################################################
+                    # Small projection layers for each branch to keep the fusion compact and stable.
+                    image_proj = tf.keras.layers.Dense(64, activation="relu", name=f"{model_key}_image_proj")(x)
+                    image_proj = tf.keras.layers.Dropout(0.1, name=f"{model_key}_image_proj_drop")(image_proj)
+                    image_aux = tf.keras.layers.Dense(32, activation="relu", name=f"{model_key}_image_aux")(image_proj)
+
+                    # A light branch dropout helps prevent one modality from dominating the fusion.
+                    sog_cog_proj = tf.keras.layers.Dense(64, activation="relu", name=f"sog_cog_proj")(sog_cog_branch)
+                    sog_cog_proj = tf.keras.layers.Dropout(0.1, name=f"sog_cog_proj_drop")(sog_cog_proj)
+                    sog_cog_aux = tf.keras.layers.Dense(32, activation="relu", name=f"sog_cog_aux")(sog_cog_proj)
+
+                    # A tiny auxiliary projection for the timestamp branch gives it a compact task-specific representation.
+                    timestamp_proj = tf.keras.layers.Dense(64, activation="relu", name=f"timestamp_proj")(timestamp_branch)
+                    timestamp_proj = tf.keras.layers.Dropout(0.1, name=f"timestamp_proj_drop")(timestamp_proj)
+                    timestamp_aux = tf.keras.layers.Dense(32, activation="relu", name=f"timestamp_aux")(timestamp_proj)
+
+                    # Learned gates let the model decide how much each branch should contribute to the final fusion.
+                    custom_model_gate_inputs = tf.keras.layers.Concatenate(name=f"custom_model_gate_inputs")([image_proj, sog_cog_proj, timestamp_proj])
+                    image_gate = tf.keras.layers.Dense(1, activation="sigmoid", name=f"{model_key}_image_gate")(custom_model_gate_inputs)
+                    sog_cog_gate = tf.keras.layers.Dense(1, activation="sigmoid", name=f"sog_cog_gate")(custom_model_gate_inputs)
+                    timestamp_gate = tf.keras.layers.Dense(1, activation="sigmoid", name=f"timestamp_gate")(custom_model_gate_inputs)
+
+                    image_weighted = tf.keras.layers.Multiply(name=f"{model_key}_image_weighted")([image_gate, image_proj])
+                    sog_cog_weighted = tf.keras.layers.Multiply(name=f"sog_cog_weighted")([sog_cog_gate, sog_cog_proj])
+                    timestamp_weighted = tf.keras.layers.Multiply(name=f"timestamp_weighted")([timestamp_gate, timestamp_proj])
+                    custom_model_fused_modalities = tf.keras.layers.Add(name=f"custom_model_fused_modalities")([image_weighted, sog_cog_weighted, timestamp_weighted])
+
+                    merged_concat = tf.keras.layers.Concatenate(name="head_concat")([
+                        custom_model_fused_modalities,
+                        image_aux,
+                        sog_cog_aux,
+                        timestamp_aux,
+                        x,
+                        sog_cog_branch,
+                        timestamp_branch,
+                    ])
+                    ###########################################################################################################
 
                     head_dense3 = tf.keras.layers.Dense(128, activation="relu", name="head_dense3")
                     head_drop3 = tf.keras.layers.Dropout(0.3, name="head_drop3")
