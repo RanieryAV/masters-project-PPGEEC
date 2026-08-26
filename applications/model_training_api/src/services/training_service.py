@@ -115,7 +115,7 @@ FEATURE_COLUMNS = [
 ]
 
 # Allowed labels
-ALLOWED_LABELS = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+ALLOWED_LABELS = ["LOITERING", "OVER_COAST_SPEED", "STOPPING", "TRANSSHIPMENT"]
 
 class TrainModelService:
 
@@ -3846,7 +3846,7 @@ Notes:
             logger.info("Could not list physical devices; chosen device -> %s", device)
 
         if allowed_labels is None:
-            allowed_labels = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+            allowed_labels = ["LOITERING", "OVER_COAST_SPEED", "STOPPING", "TRANSSHIPMENT"]
 
         base = pathlib.Path(dataset_dir)
         logger.info("Debug: pathing dataset_dir=%s", dataset_dir)
@@ -6194,7 +6194,7 @@ Notes:
         if aux_columns is None:
             aux_columns = ["sog_array", "cog_array", "timestamp_array"]
         if allowed_labels is None:
-            allowed_labels = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+            allowed_labels = ["LOITERING", "OVER_COAST_SPEED", "STOPPING", "TRANSSHIPMENT"]
 
         if not os.path.isdir(dataset_dir):
             return {"error": f"dataset_dir not found or not a directory: {dataset_dir}"}
@@ -8064,7 +8064,7 @@ Notes:
         sog_col, cog_col, timestamp_col = aux_columns[0], aux_columns[1], aux_columns[2]
 
         if allowed_labels is None:
-            allowed_labels = ["LOITERING", "NORMAL", "STOPPING", "TRANSSHIPMENT"]
+            allowed_labels = ["LOITERING", "OVER_COAST_SPEED", "STOPPING", "TRANSSHIPMENT"]
 
         if not os.path.isdir(dataset_dir):
             return {"error": f"dataset_dir not found or not a directory: {dataset_dir}"}
@@ -8623,56 +8623,39 @@ Notes:
                     timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
                     ###########################################################################################################
+                    # Regularização L2 para combater a memorização
+                    reg = tf.keras.regularizers.l2(1e-4)
+                    
                     # =================================================================
-                    # 1. PROJEÇÕES E HEADS AUXILIARES
-                    # Objetivo: Criar um espaço latente (64D) para cada sinal e 
-                    # um classificador auxiliar (32D) para forçar o aprendizado individual.
-                    # =================================================================
-                    with tf.name_scope("Image_Branch"):
-                        image_proj = tf.keras.layers.Dense(64, activation="relu", name=f"{model_key}_image_proj")(x)
-                        image_proj = tf.keras.layers.Dropout(0.1, name=f"{model_key}_image_proj_drop")(image_proj)
-                        image_aux  = tf.keras.layers.Dense(32, activation="relu", name=f"{model_key}_image_aux")(image_proj)
-
-                    with tf.name_scope("SogCog_Branch"):
-                        sog_cog_proj = tf.keras.layers.Dense(64, activation="relu", name="sog_cog_proj")(sog_cog_branch)
-                        sog_cog_proj = tf.keras.layers.Dropout(0.1, name="sog_cog_proj_drop")(sog_cog_proj)
-                        sog_cog_aux  = tf.keras.layers.Dense(32, activation="relu", name="sog_cog_aux")(sog_cog_proj)
-
-                    with tf.name_scope("Timestamp_Branch"):
-                        timestamp_proj = tf.keras.layers.Dense(64, activation="relu", name="timestamp_proj")(timestamp_branch)
-                        timestamp_proj = tf.keras.layers.Dropout(0.1, name="timestamp_proj_drop")(timestamp_proj)
-                        timestamp_aux  = tf.keras.layers.Dense(32, activation="relu", name="timestamp_aux")(timestamp_proj)
-
-
-                    # =================================================================
-                    # 2. MECANISMO DE GATING E INTERAÇÃO CRUZADA
-                    # Objetivo: Avaliar os 3 sinais juntos para decidir a importância 
-                    # de cada um (Gates) e extrair o contexto global (Bottleneck).
+                    # 1. GATING E INTERAÇÃO CRUZADA (Direto nas features de 64D)
+                    # Como x, sog_cog_branch e timestamp_branch já vêm como tensores 
+                    # de 64D do código acima, eliminamos as projeções extras para poupar RAM!
                     # =================================================================
                     with tf.name_scope("Cross_Modal_Gating"):
                         gate_inputs = tf.keras.layers.Concatenate(name="custom_model_gate_inputs")([
-                            image_proj, 
-                            sog_cog_proj, 
-                            timestamp_proj
+                            x, 
+                            sog_cog_branch, 
+                            timestamp_branch
                         ])
                         
-                        # CÉREBRO DA FUSÃO: Cruza matematicamente as 3 modalidades.
-                        gate_bottleneck = tf.keras.layers.Dense(32, activation="relu", name="gate_bottleneck")(gate_inputs)
+                        # REGULARIZAÇÃO L2: Força o modelo a não depender de uma única variável (combate Overfitting)
+                        reg = tf.keras.regularizers.l2(1e-4)
+                        
+                        # O Bottleneck cria a interação cruzada pura
+                        gate_bottleneck = tf.keras.layers.Dense(64, activation="relu", kernel_regularizer=reg, name="gate_bottleneck")(gate_inputs)
 
+                        # Gates decisórios
                         image_gate     = tf.keras.layers.Dense(1, activation="sigmoid", name=f"{model_key}_image_gate")(gate_bottleneck)
                         sog_cog_gate   = tf.keras.layers.Dense(1, activation="sigmoid", name="sog_cog_gate")(gate_bottleneck)
                         timestamp_gate = tf.keras.layers.Dense(1, activation="sigmoid", name="timestamp_gate")(gate_bottleneck)
 
-
                     # =================================================================
-                    # 3. APLICAÇÃO DOS PESOS E FUSÃO LINEAR
-                    # Objetivo: Multiplicar as projeções pelos seus respectivos gates
-                    # e somar o resultado para ter uma representação única e filtrada.
+                    # 2. APLICAÇÃO DE PESOS E FUSÃO
                     # =================================================================
                     with tf.name_scope("Weighted_Fusion"):
-                        image_weighted     = tf.keras.layers.Multiply(name=f"{model_key}_image_weighted")([image_gate, image_proj])
-                        sog_cog_weighted   = tf.keras.layers.Multiply(name="sog_cog_weighted")([sog_cog_gate, sog_cog_proj])
-                        timestamp_weighted = tf.keras.layers.Multiply(name="timestamp_weighted")([timestamp_gate, timestamp_proj])
+                        image_weighted     = tf.keras.layers.Multiply(name=f"{model_key}_image_weighted")([image_gate, x])
+                        sog_cog_weighted   = tf.keras.layers.Multiply(name="sog_cog_weighted")([sog_cog_gate, sog_cog_branch])
+                        timestamp_weighted = tf.keras.layers.Multiply(name="timestamp_weighted")([timestamp_gate, timestamp_branch])
                         
                         fused_modalities = tf.keras.layers.Add(name="custom_model_fused_modalities")([
                             image_weighted, 
@@ -8680,33 +8663,29 @@ Notes:
                             timestamp_weighted
                         ])
 
-
                     # =================================================================
-                    # 4. CONCATENAÇÃO FINAL
-                    # Objetivo: Agregar todas as perspectivas do modelo antes da classificação.
+                    # 3. CONCATENAÇÃO FINAL OTIMIZADA PARA RAM
+                    # Objetivo: Máximo aprendizado com o mínimo de tensores alocados.
                     # =================================================================
                     with tf.name_scope("Final_Feature_Aggregation"):
+                        # Removidos os aux_heads e Dropouts duplicados.
                         merged_concat = tf.keras.layers.Concatenate(name="head_concat")([
-                            # A. Conhecimento Sintetizado
-                            fused_modalities,   # Soma ponderada do que passou pelos gates
-                            gate_bottleneck,    # Interação cruzada pura (O contexto geral)
-                            
-                            # B. Classificadores Específicos
-                            image_aux,          
-                            sog_cog_aux,        
-                            timestamp_aux,      
-                            
-                            # C. Conhecimento Bruto (Skip Connections - essenciais para o fluxo de gradiente)
-                            x,                  
-                            sog_cog_branch,     
-                            timestamp_branch,   
+                            fused_modalities,   # O que os gates consideraram importante (64D)
+                            gate_bottleneck,    # A inteligência cruzada/contexto geral (32D)
+                            x,                  # Conexão residual da imagem bruta (64D)
+                            sog_cog_branch,     # Conexão residual da cinemática bruta (64D)
+                            timestamp_branch,   # Conexão residual do tempo bruto (64D)
                         ])
                     ###########################################################################################################
 
-                    head_dense3 = tf.keras.layers.Dense(128, activation="relu", name="head_dense3")
+                    head_dense3 = tf.keras.layers.Dense(256, activation="relu", name="head_dense3")
                     head_drop3 = tf.keras.layers.Dropout(0.3, name="head_drop3")
+                    head_dense4 = tf.keras.layers.Dense(128, activation="relu", name="head_dense4")
+                    head_drop4 = tf.keras.layers.Dropout(0.3, name="head_drop4")
                     merged = head_dense3(merged_concat)
                     merged = head_drop3(merged)
+                    merged = head_dense4(merged)
+                    merged = head_drop4(merged)
 
                     outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
                     model = tf.keras.Model(
