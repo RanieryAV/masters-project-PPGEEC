@@ -3828,7 +3828,7 @@ Notes:
         **kwargs
     ):
         """
-        Train models for all provided allowed_labels (e.g. ["LOITERING","NORMAL","STOPPING","TRANSSHIPMENT"]).
+        Train models for all provided allowed_labels (e.g. ["LOITERING","OVER_COAST_SPEED","STOPPING","TRANSSHIPMENT"]).
         Ensures CSVs and MLflow use original class names.
         """
         # defensive GPU configuration
@@ -8562,11 +8562,11 @@ Notes:
                     head_dense1 = tf.keras.layers.Dense(192, activation="relu", name="head_dense1")
                     head_drop1 = tf.keras.layers.Dropout(0.2, name="head_drop1")
                     head_dense2 = tf.keras.layers.Dense(64, activation="relu", name="head_dense2")
-                    # head_drop2 = tf.keras.layers.Dropout(0.5, name="head_drop2")
+                    head_drop2 = tf.keras.layers.Dropout(0.3, name="head_drop2")
                     x = head_dense1(x)
                     x = head_drop1(x)
                     x = head_dense2(x)
-                    # x = head_drop2(x)
+                    x = head_drop2(x)
 
                     sog_cog_branch = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same", name="sog_cog_conv1")(sog_cog_input)
                     sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool1")(sog_cog_branch)
@@ -8576,7 +8576,7 @@ Notes:
                     # sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool3")(sog_cog_branch)
                     # sog_cog_branch = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same", name="sog_cog_conv4")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.GlobalAveragePooling2D(name="sog_cog_gap")(sog_cog_branch)
-                    sog_cog_branch = tf.keras.layers.Dense(128, activation="relu", name="sog_cog_dense")(sog_cog_branch)
+                    sog_cog_branch = tf.keras.layers.Dense(192, activation="relu", name="sog_cog_dense")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dropout(0.2, name="sog_cog_drop")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dense(64, activation="relu", name="sog_cog_dense2")(sog_cog_branch)
                     # sog_cog_branch = tf.keras.layers.Dense(32, activation="relu", name="sog_cog_dense3")(sog_cog_branch)

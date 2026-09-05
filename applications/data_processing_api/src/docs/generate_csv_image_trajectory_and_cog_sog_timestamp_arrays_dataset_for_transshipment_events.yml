@@ -16,11 +16,14 @@ parameters:
   - in: "body"
     name: "body"
     description: "No request body required for this endpoint. The endpoint processes a fixed dataset (recognised_CEs.csv) using configuration from environment and server setup."
-    required: false
+    required: true
     schema:
       type: "object"
-      properties: {}
-      example: {}
+      properties:
+        max_rows_per_behavior:
+          type: "integer"
+          description: "Maximum number of rows to process per behavior type. If not provided, defaults to 100."
+          example: 100
 
 responses:
   200:

@@ -3644,7 +3644,7 @@ class ProcessDataService:
         # Config / defaults
         BATCH_ROWS = int(batch_rows)
         if not behavior_types_to_generate_dataset:
-            behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+            behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "OVER_COAST_SPEED", "STOPPING", "LOITERING"]
         TARGET_W, TARGET_H = 120, 120
 
         # JDBC env
@@ -3851,8 +3851,15 @@ class ProcessDataService:
             return row_values
 
         # helper: read a JDBC selection with retries (returns DataFrame or raises)
-        def spark_read_jdbc_with_retries(dbtable_sql: str, max_attempts: int = 3, sleep_base: float = 0.8):
+        def spark_read_jdbc_with_retries(
+            dbtable_sql: str,
+            max_attempts: int = 3,
+            sleep_base: float = 0.8
+        ):
             last_exc = None
+
+            fetchsize = int(os.getenv("CSV_JDBC_FETCHSIZE", "2"))
+
             for attempt in range(1, max_attempts + 1):
                 try:
                     df_local = (
@@ -3863,15 +3870,25 @@ class ProcessDataService:
                         .option("user", pg_user)
                         .option("password", pg_pass)
                         .option("driver", "org.postgresql.Driver")
-                        .option("fetchsize", "200")
+                        .option("fetchsize", str(fetchsize))
                         .load()
                     )
+
                     return df_local
+
                 except Exception as e:
                     last_exc = e
-                    logger.warning("spark.read JDBC attempt %d/%d failed for query [%s]: %s", attempt, max_attempts, dbtable_sql, e)
+
+                    logger.warning(
+                        "spark.read JDBC attempt %d/%d failed for query [%s]: %s",
+                        attempt,
+                        max_attempts,
+                        dbtable_sql,
+                        e
+                    )
+
                     time.sleep(sleep_base * attempt)
-            # final raise
+
             raise last_exc
 
         # Main processing loop
@@ -3933,7 +3950,7 @@ class ProcessDataService:
 
                 # chunk parameters (smaller to reduce pressure)
                 CHUNK_SIZE = int(os.getenv("CSV_JDBC_CHUNK_SIZE", "8"))  # smaller chunks
-                FETCHSIZE = int(os.getenv("CSV_JDBC_FETCHSIZE", "50"))
+                #FETCHSIZE = int(os.getenv("CSV_JDBC_FETCHSIZE", "50"))
 
                 if min_pk is not None and max_pk is not None:
                     try:

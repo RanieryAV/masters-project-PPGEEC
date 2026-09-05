@@ -904,7 +904,13 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
     """
     logger.info("Received request at /generate-csv-image-trajectory-and-cog-sog-timestamp-arrays-dataset-for-transshipment-events")
 
-    behavior_types_to_generate_dataset = ["TRANSSHIPMENT", "NORMAL", "STOPPING", "LOITERING"]
+    data_request = request.get_json()
+    max_rows_per_behavior = data_request.get('max_rows_per_behavior', None)
+
+    if max_rows_per_behavior is None:
+        max_rows_per_behavior = 100  # You can adjust this value as needed
+
+    behavior_types_to_generate_dataset = ["OVER_COAST_SPEED"]#"TRANSSHIPMENT", "OVER_COAST_SPEED", "STOPPING", "LOITERING"]
 
     try:
         spark = SparkSessionInitializer.init_spark_session("Generate_CSV_Image_Trajectory_and_COG_SOG_Timestamp_Arrays_Dataset_[Data_Processing_API]")
@@ -916,9 +922,7 @@ def generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_trans
         else:
             base_output_dir = os.getenv("PROCESSED_OUTPUT_DIR", "/tmp/processed_output")
 
-        max_rows_per_behavior = 200  # You can adjust this value as needed
-
-        output_dir = os.path.join(base_output_dir, f"csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_{max_rows_per_behavior}_rows_per_class")
+        output_dir = os.path.join(base_output_dir, f"csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_over_coast_speed_events_{max_rows_per_behavior}_rows_per_class")
 
         ProcessDataService.generate_csv_image_trajectory_and_cog_sog_timestamp_arrays_dataset_for_transshipment_events_with_spark(
             spark=spark,

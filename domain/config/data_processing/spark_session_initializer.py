@@ -53,9 +53,9 @@ class SparkSessionInitializer:
         # Spark default of 1g per executor. They are read from environment variables so
         # you can override them in docker-compose/.env without changing code.
         spark_cores_max = os.getenv("SPARK_CORES_MAX", "4")                 # total cores allowed for this app
-        spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor
-        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "1g")    # memory per executor
-        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "2g")
+        spark_executor_cores = os.getenv("SPARK_EXECUTOR_CORES", "2")       # cores per executor 
+        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "5g")    # memory per executor
+        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "6g")
         spark_driver_max_result_size = os.getenv("SPARK_DRIVER_MAX_RESULT_SIZE", "2g")
 
         spark_sql_debug_max_to_string_fields = os.getenv("SPARK_SQL_DEBUG_MAX_TO_STRING_FIELDS", "10000")
