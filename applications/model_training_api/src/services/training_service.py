@@ -8559,24 +8559,24 @@ Notes:
                         y = internal_gap(y)
                         x = tf.keras.layers.Dense(128, activation="relu", name="internal_head_dense")(y)
 
-                    head_dense1 = tf.keras.layers.Dense(192, activation="relu", name="head_dense1")
+                    head_dense1 = tf.keras.layers.Dense(256, activation="relu", name="head_dense1")
                     head_drop1 = tf.keras.layers.Dropout(0.2, name="head_drop1")
                     head_dense2 = tf.keras.layers.Dense(64, activation="relu", name="head_dense2")
-                    head_drop2 = tf.keras.layers.Dropout(0.3, name="head_drop2")
+                    # head_drop2 = tf.keras.layers.Dropout(0.5, name="head_drop2")
                     x = head_dense1(x)
                     x = head_drop1(x)
                     x = head_dense2(x)
-                    x = head_drop2(x)
+                    # x = head_drop2(x)
 
                     sog_cog_branch = tf.keras.layers.Conv2D(32, 3, activation="relu", padding="same", name="sog_cog_conv1")(sog_cog_input)
                     sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool1")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same", name="sog_cog_conv2")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool2")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same", name="sog_cog_conv3")(sog_cog_branch)
-                    # sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool3")(sog_cog_branch)
-                    # sog_cog_branch = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same", name="sog_cog_conv4")(sog_cog_branch)
+                    sog_cog_branch = tf.keras.layers.MaxPool2D(name="sog_cog_pool3")(sog_cog_branch)
+                    sog_cog_branch = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same", name="sog_cog_conv4")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.GlobalAveragePooling2D(name="sog_cog_gap")(sog_cog_branch)
-                    sog_cog_branch = tf.keras.layers.Dense(192, activation="relu", name="sog_cog_dense")(sog_cog_branch)
+                    sog_cog_branch = tf.keras.layers.Dense(256, activation="relu", name="sog_cog_dense")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dropout(0.2, name="sog_cog_drop")(sog_cog_branch)
                     sog_cog_branch = tf.keras.layers.Dense(64, activation="relu", name="sog_cog_dense2")(sog_cog_branch)
                     # sog_cog_branch = tf.keras.layers.Dense(32, activation="relu", name="sog_cog_dense3")(sog_cog_branch)
@@ -8622,70 +8622,12 @@ Notes:
                     timestamp_branch = tf.keras.layers.Dropout(0.2, name="timestamp_drop")(timestamp_branch)
                     timestamp_branch = tf.keras.layers.Dense(64, activation="relu", name="timestamp_dense2")(timestamp_branch)
 
-                    ###########################################################################################################
-                    # Regularização L2 para combater a memorização
-                    reg = tf.keras.regularizers.l2(1e-4)
-                    
-                    # =================================================================
-                    # 1. GATING E INTERAÇÃO CRUZADA (Direto nas features de 64D)
-                    # Como x, sog_cog_branch e timestamp_branch já vêm como tensores 
-                    # de 64D do código acima, eliminamos as projeções extras para poupar RAM!
-                    # =================================================================
-                    with tf.name_scope("Cross_Modal_Gating"):
-                        gate_inputs = tf.keras.layers.Concatenate(name="custom_model_gate_inputs")([
-                            x, 
-                            sog_cog_branch, 
-                            timestamp_branch
-                        ])
-                        
-                        # REGULARIZAÇÃO L2: Força o modelo a não depender de uma única variável (combate Overfitting)
-                        reg = tf.keras.regularizers.l2(1e-4)
-                        
-                        # O Bottleneck cria a interação cruzada pura
-                        gate_bottleneck = tf.keras.layers.Dense(64, activation="relu", kernel_regularizer=reg, name="gate_bottleneck")(gate_inputs)
+                    merged_concat = tf.keras.layers.Concatenate(name="head_concat")([x, sog_cog_branch, timestamp_branch])
 
-                        # Gates decisórios
-                        image_gate     = tf.keras.layers.Dense(1, activation="sigmoid", name=f"{model_key}_image_gate")(gate_bottleneck)
-                        sog_cog_gate   = tf.keras.layers.Dense(1, activation="sigmoid", name="sog_cog_gate")(gate_bottleneck)
-                        timestamp_gate = tf.keras.layers.Dense(1, activation="sigmoid", name="timestamp_gate")(gate_bottleneck)
-
-                    # =================================================================
-                    # 2. APLICAÇÃO DE PESOS E FUSÃO
-                    # =================================================================
-                    with tf.name_scope("Weighted_Fusion"):
-                        image_weighted     = tf.keras.layers.Multiply(name=f"{model_key}_image_weighted")([image_gate, x])
-                        sog_cog_weighted   = tf.keras.layers.Multiply(name="sog_cog_weighted")([sog_cog_gate, sog_cog_branch])
-                        timestamp_weighted = tf.keras.layers.Multiply(name="timestamp_weighted")([timestamp_gate, timestamp_branch])
-                        
-                        fused_modalities = tf.keras.layers.Add(name="custom_model_fused_modalities")([
-                            image_weighted, 
-                            sog_cog_weighted, 
-                            timestamp_weighted
-                        ])
-
-                    # =================================================================
-                    # 3. CONCATENAÇÃO FINAL OTIMIZADA PARA RAM
-                    # Objetivo: Máximo aprendizado com o mínimo de tensores alocados.
-                    # =================================================================
-                    with tf.name_scope("Final_Feature_Aggregation"):
-                        # Removidos os aux_heads e Dropouts duplicados.
-                        merged_concat = tf.keras.layers.Concatenate(name="head_concat")([
-                            fused_modalities,   # O que os gates consideraram importante (64D)
-                            gate_bottleneck,    # A inteligência cruzada/contexto geral (32D)
-                            x,                  # Conexão residual da imagem bruta (64D)
-                            sog_cog_branch,     # Conexão residual da cinemática bruta (64D)
-                            timestamp_branch,   # Conexão residual do tempo bruto (64D)
-                        ])
-                    ###########################################################################################################
-
-                    head_dense3 = tf.keras.layers.Dense(256, activation="relu", name="head_dense3")
+                    head_dense3 = tf.keras.layers.Dense(192, activation="relu", name="head_dense3")
                     head_drop3 = tf.keras.layers.Dropout(0.3, name="head_drop3")
-                    head_dense4 = tf.keras.layers.Dense(128, activation="relu", name="head_dense4")
-                    head_drop4 = tf.keras.layers.Dropout(0.3, name="head_drop4")
                     merged = head_dense3(merged_concat)
                     merged = head_drop3(merged)
-                    merged = head_dense4(merged)
-                    merged = head_drop4(merged)
 
                     outputs = tf.keras.layers.Dense(len(le.classes_), activation="softmax", name="predictions")(merged)
                     model = tf.keras.Model(
